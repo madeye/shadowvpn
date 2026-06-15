@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting, lints, and unit tests.
+  check:
+    name: fmt + clippy + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: unit tests
+        run: cargo test --lib
+
+  # Docker-based end-to-end test: real server + client containers, each with a
+  # TUN device, verifying connectivity through the encrypted tunnel for every
+  # supported cipher.
+  e2e:
+    name: docker e2e (${{ matrix.cipher }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cipher:
+          - chacha20-poly1305
+          - aes-256-gcm
+          - aes-128-gcm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the TUN device is available on the runner
+        run: |
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+
+      - name: Run end-to-end tunnel test
+        run: ./docker/run-e2e.sh "${{ matrix.cipher }}"

@@ -151,6 +151,24 @@ Run the test suite (crypto + config unit tests):
 cargo test --lib
 ```
 
+### End-to-end test (Docker)
+
+A full data-path test lives under `docker/`. It builds both binaries, starts a
+**server** and a **client** container — each with its own TUN device — on a
+private bridge network, and then pings the server's in-tunnel address from the
+client. A successful, lossless ping exercises the entire path: TUN → encrypt →
+UDP → server → decrypt → TUN, and the reply all the way back.
+
+```sh
+./docker/run-e2e.sh                 # default cipher (chacha20-poly1305)
+./docker/run-e2e.sh aes-256-gcm     # any supported cipher
+```
+
+The containers need `NET_ADMIN` and `/dev/net/tun` (the compose file requests
+both). The script exits non-zero if connectivity through the tunnel fails, so it
+doubles as the CI gate (see `.github/workflows/ci.yml`, which runs it across all
+three ciphers alongside `fmt` + `clippy` + unit tests).
+
 ---
 
 ## Running
