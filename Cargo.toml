@@ -1,0 +1,54 @@
+[package]
+name = "shadowvpn"
+version = "0.1.0"
+edition = "2021"
+description = "A UDP-based, pre-shared-key (PSK), user-mode VPN using the shadowsocks AEAD UDP wire scheme."
+license = "MIT"
+repository = "https://github.com/madeye/shadowvpn"
+
+[lib]
+name = "shadowvpn"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shadowvpn-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "shadowvpn-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+# Async runtime.
+tokio = { version = "1.52", features = ["full"] }
+
+# Cross-platform async TUN device (macOS utun + Linux). The `async_tokio`
+# feature provides AsyncRead/AsyncWrite + recv/send for the device.
+tun-rs = { version = "2.8", features = ["async_tokio"] }
+
+# AEAD ciphers (RustCrypto). 0.11 line shares the `aead` 0.6 traits.
+# `alloc` enables the `Aead::encrypt`/`decrypt` Vec<u8> convenience methods.
+aead = { version = "0.6", features = ["alloc"] }
+aes-gcm = { version = "0.11.0-rc.4", features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0-rc.3", features = ["alloc"] }
+
+# Key derivation: HKDF-SHA1 subkeys + MD5-based EVP_BytesToKey master key.
+hkdf = "0.13"
+sha1 = "0.11"
+md-5 = "0.11"
+
+# Error handling.
+anyhow = "1.0"
+thiserror = "2.0"
+
+# CLI + config.
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Randomness (per-datagram salt).
+rand = "0.10"
+
+# Logging.
+log = "0.4"
+env_logger = "0.11"
