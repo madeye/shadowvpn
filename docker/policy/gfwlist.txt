@@ -1,0 +1,2 @@
+# gfwlist for the policy-routing E2E test: only blocked.com is tunneled.
+blocked.com

@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+#
+# Image for the policy-routing E2E test. A single image plays every role
+# (vpn server, vpn client, DNS, echo destinations); the compose file picks the
+# role via the command. On top of the binaries it carries the userspace tools
+# policy routing drives — ipset/iptables/ip — plus dnsmasq, socat, and nc for the
+# test harness.
+
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked --bins
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        iproute2 iputils-ping iptables ipset dnsmasq socat netcat-openbsd ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/shadowvpn-server /usr/local/bin/shadowvpn-server
+COPY --from=builder /src/target/release/shadowvpn-client /usr/local/bin/shadowvpn-client
+
+COPY docker/server.json docker/policy-client.json /etc/shadowvpn/
+COPY docker/policy/gfwlist.txt docker/policy/chnroute.txt /etc/shadowvpn/
+COPY docker/run-server.sh docker/run-server-nat.sh docker/run-echo.sh docker/run-dns.sh \
+     docker/test-client-policy.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/run-server.sh /usr/local/bin/run-server-nat.sh \
+        /usr/local/bin/run-echo.sh /usr/local/bin/run-dns.sh \
+        /usr/local/bin/test-client-policy.sh
+
+ENV RUST_LOG=info

@@ -31,10 +31,12 @@
 //! * [`config`] — JSON + CLI configuration for the server and client.
 //! * [`protocol`] — tunnel framing constants and buffer sizing.
 //! * [`tun_device`] — async TUN interface wrapper (macOS utun + Linux).
+//! * [`policy`] — client-side policy routing (gfwlist / chinadns + ipset).
 
 #![warn(missing_docs)]
 
 pub mod config;
 pub mod crypto;
+pub mod policy;
 pub mod protocol;
 pub mod tun_device;

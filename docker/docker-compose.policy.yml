@@ -1,0 +1,84 @@
+# Policy-routing end-to-end test for ShadowVPN.
+#
+# Topology on a fixed /24 bridge:
+#
+#   client (172.30.0.3) ── lan ── vpnserver (172.30.0.2, NAT to lan)
+#                                  dns       (172.30.0.4, dnsmasq)
+#                                  blocked   (172.30.0.5, echo)   <- tunneled
+#                                  direct    (172.30.0.6, echo)   <- direct
+#
+# The client runs policy routing; blocked.com must reach `blocked` through the
+# tunnel (so it is seen as the server's address) while safe.com reaches `direct`
+# straight over the lan (seen as the client's address). MODE selects gfwlist or
+# chinadns; the expected outcome is identical.
+
+x-policy: &policy
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.policy
+  image: shadowvpn-e2e-policy:latest
+
+services:
+  vpnserver:
+    <<: *policy
+    container_name: shadowvpn-policy-server
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    command: ["run-server-nat.sh"]
+    networks:
+      lan:
+        ipv4_address: 172.30.0.2
+
+  dns:
+    <<: *policy
+    container_name: shadowvpn-policy-dns
+    command: ["run-dns.sh"]
+    networks:
+      lan:
+        ipv4_address: 172.30.0.4
+
+  blocked:
+    <<: *policy
+    container_name: shadowvpn-policy-blocked
+    command: ["run-echo.sh"]
+    networks:
+      lan:
+        ipv4_address: 172.30.0.5
+
+  direct:
+    <<: *policy
+    container_name: shadowvpn-policy-direct
+    command: ["run-echo.sh"]
+    networks:
+      lan:
+        ipv4_address: 172.30.0.6
+
+  client:
+    <<: *policy
+    container_name: shadowvpn-policy-client
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      MODE: ${MODE:-gfwlist}
+    depends_on:
+      - vpnserver
+      - dns
+      - blocked
+      - direct
+    command: ["test-client-policy.sh"]
+    networks:
+      lan:
+        ipv4_address: 172.30.0.3
+
+networks:
+  lan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

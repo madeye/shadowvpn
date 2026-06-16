@@ -1,0 +1,6 @@
+# chnroute for the policy-routing E2E test.
+#
+# Marks the "direct" destination (172.30.0.6, returned for safe.com) as a
+# domestic/China address so chinadns mode keeps it on the direct path, while the
+# "blocked" destination (172.30.0.5) is treated as foreign and tunneled.
+172.30.0.6/32

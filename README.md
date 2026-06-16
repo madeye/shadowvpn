@@ -189,6 +189,21 @@ tunnel). It runs on a private bridge network with any host proxy neutralized, so
 QUIC must travel through ShadowVPN rather than around it. In CI this job runs on
 pushes to `main` and on manual dispatch (it depends on external connectivity).
 
+### Policy-routing test (Docker)
+
+Exercises [policy routing](#policy-routing-gfwlist--chinadns--client-linux-only)
+end to end. The topology puts a source-IP echo server behind the tunnel and
+another on the LAN: a tunneled request shows up as the *server's* address, a
+direct one as the *client's*, so the two paths are unambiguous. It verifies that
+both modes tunnel the selected domain and leave the other direct:
+
+```sh
+./docker/run-e2e-policy.sh             # both gfwlist and chinadns
+./docker/run-e2e-policy.sh gfwlist     # one mode
+```
+
+Fully self-contained (no external network), so CI runs it on every PR.
+
 ---
 
 ## Running
@@ -232,6 +247,70 @@ sudo ./target/release/shadowvpn-client \
 
 Once the tunnel is up you can verify connectivity with a ping across the tunnel
 addresses, e.g. from the client `ping 10.9.0.1`.
+
+---
+
+## Policy routing (gfwlist / chinadns) — client, Linux only
+
+By default the client is a *full* tunnel: every packet that reaches the TUN is
+encrypted to the server, and what you route into the TUN is your business (see
+the next section). For the common case of "send only some destinations through
+the tunnel", the client has a built-in **policy-routing** mode that follows the
+classic `dnsmasq` + `ipset` design — no external daemon required.
+
+A small **split-DNS proxy** runs inside the client. For each query it decides
+whether the name should be tunneled, adds the answer's addresses to a kernel
+**ipset**, and a dedicated policy-routing table sends anything in that set
+through the tunnel. Only that table is touched; the main routing table and your
+default route are left alone, and everything is removed again on exit.
+
+Two modes:
+
+| Mode       | Decision                                                            | Needs       |
+|------------|--------------------------------------------------------------------|-------------|
+| `gfwlist`  | tunnel names listed in a gfwlist file; everything else is direct    | `--gfwlist` |
+| `chinadns` | query a domestic + a clean resolver; tunnel anything **not** resolving to an in-China address | `--chnroute` |
+| `full`     | no policy routing (the default)                                     | —           |
+
+```sh
+# gfwlist mode: tunnel only the domains in gfwlist.txt
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode gfwlist --gfwlist /etc/shadowvpn/gfwlist.txt
+
+# chinadns mode: tunnel everything that isn't a China IP
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode chinadns --chnroute /etc/shadowvpn/chnroute.txt
+```
+
+Then point the host's resolver at the proxy (it logs the exact line at startup):
+
+```sh
+echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf   # proxy default: 127.0.0.1:5353
+```
+
+Relevant config / flags (all client-only; CLI overrides JSON):
+
+| JSON field    | CLI flag        | Meaning                                                    | Default              |
+|---------------|-----------------|-----------------------------------------------------------|----------------------|
+| `mode`        | `--mode`        | `full` \| `gfwlist` \| `chinadns`                          | `full`               |
+| `dns_listen`  | `--dns-listen`  | address the split-DNS proxy listens on                    | `127.0.0.1:5353`     |
+| `dns_local`   | `--dns-local`   | domestic / direct DNS upstream                            | `114.114.114.114:53` |
+| `dns_remote`  | `--dns-remote`  | clean DNS upstream (reached through the tunnel)           | `8.8.8.8:53`         |
+| `gfwlist`     | `--gfwlist`     | domain-suffix file (gfwlist mode)                         | —                    |
+| `chnroute`    | `--chnroute`    | China CIDR file (chinadns mode)                           | —                    |
+| `ipset_name`  | `--ipset`       | name of the ipset holding tunnel-routed addresses        | `shadowvpn`          |
+| `route_table` | `--route-table` | routing table id for the tunnel default route            | `9011` (`0x2333`)    |
+| `fwmark`      | `--fwmark`      | firewall mark linking the ipset to the routing table     | `9011` (`0x2333`)    |
+
+* **gfwlist file** — one domain per line; `#`/`!` comments and a leading `*.`/`.`
+  are accepted (the plain list produced by `gfwlist2dnsmasq`, not the base64
+  blob). A name matches if it equals or is a subdomain of a listed suffix.
+* **chnroute file** — one `a.b.c.d/len` per line (the classic APNIC-derived
+  `chnroute.txt`).
+
+This needs root and the `ipset`/`iptables`/`ip` tools, and is **Linux only**; on
+other platforms a non-`full` mode is rejected at startup. The
+`docker/run-e2e-policy.sh` test exercises both modes end to end.
 
 ---
 
@@ -307,8 +386,15 @@ src/
   protocol.rs     tunnel framing constants and buffer sizing
   config.rs       JSON file + clap CLI config, merge/validate
   tun_device.rs   async TUN wrapper (tun-rs, macOS utun + Linux)
+  policy/         client policy routing (gfwlist / chinadns + ipset)
+    mod.rs        Mode, PolicyConfig, Linux orchestration
+    gfwlist.rs    domain-suffix matching
+    chnroute.rs   China IP range lookup
+    dns.rs        minimal DNS wire parsing
+    proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
+    setup.rs      ipset/ip/iptables wiring (Linux)
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
-  bin/client.rs   client binary: TUN<->UDP relay loops + keepalive
+  bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
 ```
 
 ---

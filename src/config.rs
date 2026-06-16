@@ -22,13 +22,15 @@
 //! }
 //! ```
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::Cipher;
+use crate::policy::{Mode, PolicyConfig};
 use crate::protocol::DEFAULT_TUN_MTU;
 
 /// Default cipher used when none is specified.
@@ -36,6 +38,24 @@ pub const DEFAULT_CIPHER: &str = "chacha20-poly1305";
 
 /// Default TUN netmask (a /24).
 pub const DEFAULT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+
+/// Default address the split-DNS proxy listens on.
+pub const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:5353";
+
+/// Default domestic / direct DNS upstream (114DNS).
+pub const DEFAULT_DNS_LOCAL: &str = "114.114.114.114:53";
+
+/// Default clean DNS upstream, reached through the tunnel (Google DNS).
+pub const DEFAULT_DNS_REMOTE: &str = "8.8.8.8:53";
+
+/// Default ipset name holding tunnel-routed addresses.
+pub const DEFAULT_IPSET_NAME: &str = "shadowvpn";
+
+/// Default routing table id / firewall mark for policy routing (0x2333).
+pub const DEFAULT_ROUTE_TABLE: u32 = 0x2333;
+
+/// Default per-query DNS upstream timeout, in milliseconds.
+pub const DEFAULT_DNS_TIMEOUT_MS: u64 = 3000;
 
 /// Errors raised while loading or validating configuration.
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +87,10 @@ pub enum ConfigError {
     /// The cipher name was not recognized.
     #[error(transparent)]
     Cipher(#[from] crate::crypto::CryptoError),
+
+    /// A policy-routing value was invalid (e.g. an unknown mode).
+    #[error(transparent)]
+    Policy(#[from] crate::policy::PolicyError),
 
     /// A field had an invalid value (e.g. an unparsable socket address).
     #[error("invalid value for {field}: {message}")]
@@ -111,6 +135,37 @@ pub struct FileConfig {
 
     /// TUN interface MTU.
     pub mtu: Option<u16>,
+
+    // --- Client-only policy routing (ignored by the server) ----------------
+    /// Policy-routing mode: `full` (default), `gfwlist`, or `chinadns`.
+    pub mode: Option<String>,
+
+    /// Address the split-DNS proxy listens on.
+    pub dns_listen: Option<String>,
+
+    /// Domestic / direct DNS upstream.
+    pub dns_local: Option<String>,
+
+    /// Clean DNS upstream (reached through the tunnel).
+    pub dns_remote: Option<String>,
+
+    /// Path to the gfwlist domain file (gfwlist mode).
+    pub gfwlist: Option<PathBuf>,
+
+    /// Path to the China route (CIDR) file (chinadns mode).
+    pub chnroute: Option<PathBuf>,
+
+    /// Name of the ipset holding tunnel-routed addresses.
+    pub ipset_name: Option<String>,
+
+    /// Routing table id used for the tunnel default route.
+    pub route_table: Option<u32>,
+
+    /// Firewall mark linking the ipset to the routing table.
+    pub fwmark: Option<u32>,
+
+    /// Per-query DNS upstream timeout, in milliseconds.
+    pub dns_timeout_ms: Option<u64>,
 }
 
 impl FileConfig {
@@ -167,6 +222,8 @@ pub struct ClientConfig {
     pub master_key: Vec<u8>,
     /// TUN interface settings.
     pub tun: TunConfig,
+    /// Policy-routing settings (mode `full` means no policy routing).
+    pub policy: PolicyConfig,
 }
 
 /// Command-line arguments for `shadowvpn-server`.
@@ -259,6 +316,42 @@ pub struct ClientArgs {
     /// TUN interface MTU.
     #[arg(long = "mtu")]
     pub mtu: Option<u16>,
+
+    /// Policy-routing mode: full | gfwlist | chinadns.
+    #[arg(long = "mode")]
+    pub mode: Option<String>,
+
+    /// Address for the split-DNS proxy to listen on.
+    #[arg(long = "dns-listen")]
+    pub dns_listen: Option<String>,
+
+    /// Domestic / direct DNS upstream.
+    #[arg(long = "dns-local")]
+    pub dns_local: Option<String>,
+
+    /// Clean DNS upstream (reached through the tunnel).
+    #[arg(long = "dns-remote")]
+    pub dns_remote: Option<String>,
+
+    /// Path to the gfwlist domain file (gfwlist mode).
+    #[arg(long = "gfwlist")]
+    pub gfwlist: Option<PathBuf>,
+
+    /// Path to the China route (CIDR) file (chinadns mode).
+    #[arg(long = "chnroute")]
+    pub chnroute: Option<PathBuf>,
+
+    /// Name of the ipset holding tunnel-routed addresses.
+    #[arg(long = "ipset")]
+    pub ipset_name: Option<String>,
+
+    /// Routing table id used for the tunnel default route.
+    #[arg(long = "route-table")]
+    pub route_table: Option<u32>,
+
+    /// Firewall mark linking the ipset to the routing table.
+    #[arg(long = "fwmark")]
+    pub fwmark: Option<u32>,
 }
 
 /// Load the optional file config referenced by a `--config` path.
@@ -280,6 +373,87 @@ fn resolve_crypto(
     let password = password.ok_or(ConfigError::Missing("password"))?;
     let master_key = crate::crypto::evp_bytes_to_key(password.as_bytes(), cipher.key_len());
     Ok((cipher, master_key))
+}
+
+/// Parse a DNS endpoint that may be `ip:port` or a bare `ip` (defaulting the
+/// port to `default_port`).
+fn parse_dns_addr(
+    field: &'static str,
+    value: &str,
+    default_port: u16,
+) -> Result<SocketAddr, ConfigError> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+    Err(ConfigError::Invalid {
+        field,
+        message: format!("`{value}` is not an `ip` or `ip:port` address"),
+    })
+}
+
+/// Build the validated [`PolicyConfig`] from merged file + CLI values, applying
+/// defaults and validating that the active mode has the data file it needs.
+fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, ConfigError> {
+    let mode = match args.mode.clone().or_else(|| file.mode.clone()) {
+        Some(name) => Mode::from_name(&name)?,
+        None => Mode::Full,
+    };
+
+    let pick = |a: &Option<String>, f: &Option<String>, default: &str| -> String {
+        a.clone()
+            .or_else(|| f.clone())
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    let dns_listen = parse_dns_addr(
+        "dns_listen",
+        &pick(&args.dns_listen, &file.dns_listen, DEFAULT_DNS_LISTEN),
+        53,
+    )?;
+    let dns_local = parse_dns_addr(
+        "dns_local",
+        &pick(&args.dns_local, &file.dns_local, DEFAULT_DNS_LOCAL),
+        53,
+    )?;
+    let dns_remote = parse_dns_addr(
+        "dns_remote",
+        &pick(&args.dns_remote, &file.dns_remote, DEFAULT_DNS_REMOTE),
+        53,
+    )?;
+
+    let gfwlist = args.gfwlist.clone().or_else(|| file.gfwlist.clone());
+    let chnroute = args.chnroute.clone().or_else(|| file.chnroute.clone());
+
+    // Fail fast if the chosen mode is missing its data file.
+    if matches!(mode, Mode::GfwList) && gfwlist.is_none() {
+        return Err(ConfigError::Missing("gfwlist (required by gfwlist mode)"));
+    }
+    if matches!(mode, Mode::ChinaDns) && chnroute.is_none() {
+        return Err(ConfigError::Missing("chnroute (required by chinadns mode)"));
+    }
+
+    Ok(PolicyConfig {
+        mode,
+        dns_listen,
+        dns_local,
+        dns_remote,
+        gfwlist,
+        chnroute,
+        ipset_name: args
+            .ipset_name
+            .clone()
+            .or_else(|| file.ipset_name.clone())
+            .unwrap_or_else(|| DEFAULT_IPSET_NAME.to_string()),
+        route_table: args
+            .route_table
+            .or(file.route_table)
+            .unwrap_or(DEFAULT_ROUTE_TABLE),
+        fwmark: args.fwmark.or(file.fwmark).unwrap_or(DEFAULT_ROUTE_TABLE),
+        dns_timeout: Duration::from_millis(file.dns_timeout_ms.unwrap_or(DEFAULT_DNS_TIMEOUT_MS)),
+    })
 }
 
 /// Build the validated [`TunConfig`] from merged file + CLI values.
@@ -337,6 +511,10 @@ impl ClientArgs {
     pub fn resolve(self) -> Result<ClientConfig, ConfigError> {
         let file = load_file(&self.config)?;
 
+        // Resolve policy first: it borrows `self`/`file`, which the moves below
+        // would otherwise partially consume.
+        let policy = resolve_policy(&self, &file)?;
+
         let server = self
             .server
             .or(file.server)
@@ -358,6 +536,7 @@ impl ClientArgs {
             cipher,
             master_key,
             tun,
+            policy,
         })
     }
 }
@@ -365,6 +544,33 @@ impl ClientArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ClientArgs {
+        /// All-`None` client args, for building test cases with struct update
+        /// syntax (`..ClientArgs::empty()`).
+        fn empty() -> Self {
+            ClientArgs {
+                config: None,
+                server: None,
+                password: None,
+                cipher: None,
+                tun_name: None,
+                tun_ip: None,
+                tun_netmask: None,
+                peer_ip: None,
+                mtu: None,
+                mode: None,
+                dns_listen: None,
+                dns_local: None,
+                dns_remote: None,
+                gfwlist: None,
+                chnroute: None,
+                ipset_name: None,
+                route_table: None,
+                fwmark: None,
+            }
+        }
+    }
 
     #[test]
     fn cli_overrides_file_and_resolves() {
@@ -401,11 +607,50 @@ mod tests {
             tun_netmask: None,
             peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
             mtu: None,
+            ..ClientArgs::empty()
         };
         assert!(matches!(
             args.resolve(),
             Err(ConfigError::Missing("password"))
         ));
+    }
+
+    #[test]
+    fn policy_defaults_to_full_and_validates() {
+        // Default mode is full; no DNS/gfwlist needed.
+        let base = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+        let cfg = base.clone().resolve().expect("resolve full");
+        assert_eq!(cfg.policy.mode, Mode::Full);
+        assert_eq!(cfg.policy.dns_listen.to_string(), "127.0.0.1:5353");
+        assert_eq!(cfg.policy.ipset_name, "shadowvpn");
+
+        // gfwlist mode without a gfwlist file is rejected.
+        let mut g = base.clone();
+        g.mode = Some("gfwlist".to_string());
+        assert!(matches!(g.resolve(), Err(ConfigError::Missing(_))));
+
+        // chinadns mode without a chnroute file is rejected.
+        let mut c = base.clone();
+        c.mode = Some("chinadns".to_string());
+        assert!(matches!(c.resolve(), Err(ConfigError::Missing(_))));
+
+        // A bare DNS IP gets the default port; bad mode is an error.
+        let mut d = base.clone();
+        d.dns_local = Some("1.2.3.4".to_string());
+        assert_eq!(
+            d.resolve().unwrap().policy.dns_local.to_string(),
+            "1.2.3.4:53"
+        );
+        let mut m = base;
+        m.mode = Some("bogus".to_string());
+        assert!(matches!(m.resolve(), Err(ConfigError::Policy(_))));
     }
 
     #[test]
