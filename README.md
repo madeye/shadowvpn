@@ -151,6 +151,44 @@ Run the test suite (crypto + config unit tests):
 cargo test --lib
 ```
 
+### End-to-end test (Docker)
+
+A full data-path test lives under `docker/`. It builds both binaries, starts a
+**server** and a **client** container — each with its own TUN device — on a
+private bridge network, and then pings the server's in-tunnel address from the
+client. A successful, lossless ping exercises the entire path: TUN → encrypt →
+UDP → server → decrypt → TUN, and the reply all the way back.
+
+```sh
+./docker/run-e2e.sh                 # default cipher (chacha20-poly1305)
+./docker/run-e2e.sh aes-256-gcm     # any supported cipher
+```
+
+The containers need `NET_ADMIN` and `/dev/net/tun` (the compose file requests
+both). The script exits non-zero if connectivity through the tunnel fails, so it
+doubles as the CI gate (see `.github/workflows/ci.yml`, which runs it across all
+three ciphers alongside `fmt` + `clippy` + unit tests).
+
+### HTTP/3-over-tunnel test (Docker)
+
+A second, more demanding test proves ShadowVPN carries arbitrary UDP traffic by
+running **real HTTP/3 (QUIC)** through the tunnel. The server enables IP
+forwarding and masquerades the tunnel subnet to the internet; the client routes
+**all** egress through the tunnel (its default route is deleted, so the only way
+out is via ShadowVPN) and fetches a QUIC site with an HTTP/3-only `curl`:
+
+```sh
+./docker/run-e2e-http3.sh                       # default: https://www.cloudflare-quic.com/
+TARGET_URL=https://cloudflare-quic.com/ ./docker/run-e2e-http3.sh aes-256-gcm
+```
+
+The test passes when the response is delivered over **HTTP/3** (`http_version=3`);
+the application status code is irrelevant (Cloudflare may bot-block with `403` —
+the point is that the QUIC handshake and HTTP/3 exchange completed over the
+tunnel). It runs on a private bridge network with any host proxy neutralized, so
+QUIC must travel through ShadowVPN rather than around it. In CI this job runs on
+pushes to `main` and on manual dispatch (it depends on external connectivity).
+
 ---
 
 ## Running

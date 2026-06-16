@@ -1,0 +1,39 @@
+# Docker-based end-to-end test for ShadowVPN.
+#
+# Spins up a server and a client container on a private bridge network, each
+# with its own TUN device, and lets the client probe connectivity through the
+# encrypted tunnel. Run it with docker/run-e2e.sh, or directly:
+#
+#   docker compose -f docker/docker-compose.yml up --build \
+#       --abort-on-container-exit --exit-code-from client
+#
+# Both containers need NET_ADMIN (to configure the TUN interface) and access to
+# /dev/net/tun (to create it).
+
+# Shared definition for both roles: same image, same TUN privileges, same
+# cipher (overridable from the environment for matrix runs).
+x-shadowvpn: &shadowvpn
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: shadowvpn-e2e:latest
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun
+  environment:
+    CIPHER: ${CIPHER:-chacha20-poly1305}
+    RUST_LOG: ${RUST_LOG:-info}
+
+services:
+  server:
+    <<: *shadowvpn
+    container_name: shadowvpn-server
+    command: ["run-server.sh"]
+
+  client:
+    <<: *shadowvpn
+    container_name: shadowvpn-client
+    depends_on:
+      - server
+    command: ["test-client.sh"]
