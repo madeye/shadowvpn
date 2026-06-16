@@ -19,6 +19,7 @@
 
 pub mod chnroute;
 pub mod dns;
+pub mod geoip;
 pub mod gfwlist;
 pub mod proxy;
 #[cfg(target_os = "linux")]
@@ -89,8 +90,13 @@ pub struct PolicyConfig {
     pub dns_remote: SocketAddr,
     /// gfwlist domain file (required in gfwlist mode).
     pub gfwlist: Option<PathBuf>,
-    /// China route (CIDR) file (required in chinadns mode).
+    /// China route (CIDR) file (one source for chinadns mode).
     pub chnroute: Option<PathBuf>,
+    /// GeoLite2/GeoIP2 country database; when set, chinadns mode builds the
+    /// China set from it (takes precedence over `chnroute`).
+    pub geoip: Option<PathBuf>,
+    /// ISO 3166-1 alpha-2 country code selected from the GeoIP database.
+    pub geoip_country: String,
     /// Name of the kernel ipset holding tunnel-routed addresses.
     pub ipset_name: String,
     /// Routing table id used for the tunnel default route.
@@ -140,14 +146,32 @@ pub async fn spawn(
     };
 
     let chnroute = if matches!(cfg.mode, Mode::ChinaDns) {
-        let p = cfg
-            .chnroute
-            .as_ref()
-            .context("chinadns mode requires a chnroute file")?;
-        let routes = chnroute::ChnRoute::load(p)
-            .with_context(|| format!("loading chnroute from {}", p.display()))?;
-        log::info!("loaded {} china routes from {}", routes.len(), p.display());
-        routes
+        // GeoIP, when provided, takes precedence over a plain CIDR file.
+        if let Some(db) = cfg.geoip.as_ref() {
+            let routes = geoip::load_country_routes(db, &cfg.geoip_country).with_context(|| {
+                format!(
+                    "building {} routes from {}",
+                    cfg.geoip_country,
+                    db.display()
+                )
+            })?;
+            log::info!(
+                "loaded {} {} routes from GeoIP database {}",
+                routes.len(),
+                cfg.geoip_country,
+                db.display()
+            );
+            routes
+        } else {
+            let p = cfg
+                .chnroute
+                .as_ref()
+                .context("chinadns mode requires a chnroute file or a geoip database")?;
+            let routes = chnroute::ChnRoute::load(p)
+                .with_context(|| format!("loading chnroute from {}", p.display()))?;
+            log::info!("loaded {} china routes from {}", routes.len(), p.display());
+            routes
+        }
     } else {
         chnroute::ChnRoute::default()
     };

@@ -269,7 +269,7 @@ Two modes:
 | Mode       | Decision                                                            | Needs       |
 |------------|--------------------------------------------------------------------|-------------|
 | `gfwlist`  | tunnel names listed in a gfwlist file; everything else is direct    | `--gfwlist` |
-| `chinadns` | query a domestic + a clean resolver; tunnel anything **not** resolving to an in-China address | `--chnroute` |
+| `chinadns` | query a domestic + a clean resolver; tunnel anything **not** resolving to an in-China address | `--chnroute` or `--geoip` |
 | `full`     | no policy routing (the default)                                     | —           |
 
 ```sh
@@ -277,9 +277,13 @@ Two modes:
 sudo ./target/release/shadowvpn-client -c client.json \
   --mode gfwlist --gfwlist /etc/shadowvpn/gfwlist.txt
 
-# chinadns mode: tunnel everything that isn't a China IP
+# chinadns mode: tunnel everything that isn't a China IP (CIDR file)
 sudo ./target/release/shadowvpn-client -c client.json \
   --mode chinadns --chnroute /etc/shadowvpn/chnroute.txt
+
+# chinadns mode: derive the China set from a GeoLite2 database instead
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode chinadns --geoip /etc/shadowvpn/GeoLite2-Country.mmdb
 ```
 
 Then point the host's resolver at the proxy (it logs the exact line at startup):
@@ -298,6 +302,8 @@ Relevant config / flags (all client-only; CLI overrides JSON):
 | `dns_remote`  | `--dns-remote`  | clean DNS upstream (reached through the tunnel)           | `8.8.8.8:53`         |
 | `gfwlist`     | `--gfwlist`     | domain-suffix file (gfwlist mode)                         | —                    |
 | `chnroute`    | `--chnroute`    | China CIDR file (chinadns mode)                           | —                    |
+| `geoip`       | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it     | —                    |
+| `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database    | `CN`                 |
 | `ipset_name`  | `--ipset`       | name of the ipset holding tunnel-routed addresses        | `shadowvpn`          |
 | `route_table` | `--route-table` | routing table id for the tunnel default route            | `9011` (`0x2333`)    |
 | `fwmark`      | `--fwmark`      | firewall mark linking the ipset to the routing table     | `9011` (`0x2333`)    |
@@ -307,6 +313,10 @@ Relevant config / flags (all client-only; CLI overrides JSON):
   blob). A name matches if it equals or is a subdomain of a listed suffix.
 * **chnroute file** — one `a.b.c.d/len` per line (the classic APNIC-derived
   `chnroute.txt`).
+* **geoip database** — a MaxMind `GeoLite2-Country.mmdb` (or paid GeoIP2). On
+  startup every IPv4 network whose country is `--geoip-country` (default `CN`) is
+  enumerated and merged into the China set, so you don't have to maintain a CIDR
+  file. Takes precedence over `--chnroute` when both are given.
 
 This needs root and the `ipset`/`iptables`/`ip` tools, and is **Linux only**; on
 other platforms a non-`full` mode is rejected at startup. The
@@ -390,6 +400,7 @@ src/
     mod.rs        Mode, PolicyConfig, Linux orchestration
     gfwlist.rs    domain-suffix matching
     chnroute.rs   China IP range lookup
+    geoip.rs      build the China set from a GeoLite2 .mmdb
     dns.rs        minimal DNS wire parsing
     proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
     setup.rs      ipset/ip/iptables wiring (Linux)
