@@ -84,9 +84,9 @@ jobs:
         run: ./docker/run-e2e-http3.sh || ./docker/run-e2e-http3.sh
 
   # Policy-routing test: a source-IP echo topology proves that, in both gfwlist
-  # and chinadns mode, the client's split-DNS proxy + ipset routes the selected
-  # domain through the tunnel while leaving the other on the direct path. Fully
-  # self-contained (no external network), so it runs on every PR.
+  # and chinadns mode, the client's split-DNS proxy + user-mode per-destination
+  # routes send the selected domain through the tunnel while leaving the other on
+  # the direct path. Fully self-contained (no external network); runs on every PR.
   e2e-policy:
     name: docker e2e policy (${{ matrix.mode }})
     runs-on: ubuntu-latest
@@ -99,10 +99,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure TUN + ipset are available on the runner
+      - name: Ensure the TUN device is available on the runner
         run: |
           sudo modprobe tun || true
-          sudo modprobe ip_set || true
           test -c /dev/net/tun
 
       - name: Verify policy routing

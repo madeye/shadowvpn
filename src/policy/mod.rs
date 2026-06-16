@@ -2,17 +2,20 @@
 //!
 //! Instead of pushing *all* traffic through the tunnel, policy routing sends
 //! only selected destinations through it and leaves the rest on the direct path.
-//! It follows the well-worn dnsmasq + ipset design: a small split-DNS
-//! [`proxy`] decides, per query, whether a name should be tunneled, adds the
-//! resolved addresses to a kernel ipset, and a dedicated policy-routing table
-//! ([`setup`], Linux only) routes anything in that set through the tunnel.
+//! A small split-DNS [`proxy`] decides, per query, whether a name should be
+//! tunneled and hands the resolved addresses to a user-mode [`route`]r, which
+//! programs a host route for each one into the tun device using the OS's native
+//! routing socket (rtnetlink on Linux, `PF_ROUTE` on macOS). There is no
+//! dependency on `ipset`, `iptables`/nft, or `fwmark`, so it runs on **Linux and
+//! macOS** alike; direct traffic stays on the normal kernel path.
 //!
 //! Two modes are offered (see [`Mode`]):
 //!
 //! * **gfwlist** — tunnel names listed in a [`gfwlist`] file; everything else
 //!   resolves and routes directly.
 //! * **chinadns** — query a domestic and a clean resolver in parallel and tunnel
-//!   anything that does not resolve to an in-China address ([`chnroute`]).
+//!   anything that does not resolve to an in-China address ([`chnroute`], which
+//!   can also be built from a GeoIP database via [`geoip`]).
 //!
 //! [`Mode::Full`] disables all of this (the historical behavior: the whole TUN
 //! is the tunnel and routing is the operator's job).
@@ -22,8 +25,7 @@ pub mod dns;
 pub mod geoip;
 pub mod gfwlist;
 pub mod proxy;
-#[cfg(target_os = "linux")]
-pub mod setup;
+pub mod route;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -97,36 +99,29 @@ pub struct PolicyConfig {
     pub geoip: Option<PathBuf>,
     /// ISO 3166-1 alpha-2 country code selected from the GeoIP database.
     pub geoip_country: String,
-    /// Name of the kernel ipset holding tunnel-routed addresses.
-    pub ipset_name: String,
-    /// Routing table id used for the tunnel default route.
-    pub route_table: u32,
-    /// Firewall mark linking the ipset to the routing table.
-    pub fwmark: u32,
     /// Per-query upstream timeout.
     pub dns_timeout: Duration,
 }
 
-/// A running policy-routing setup: the DNS proxy task plus a guard that tears
-/// down the ipset/routing when dropped.
-#[cfg(target_os = "linux")]
+/// A running policy-routing setup: the DNS proxy task plus a guard that removes
+/// the installed routes when dropped.
 pub struct PolicyHandle {
     /// The DNS proxy serve loop; resolves only on a fatal socket error.
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
-    _routing: setup::PolicyRouting,
+    _guard: route::RouteGuard,
 }
 
-/// Install policy routing and start the DNS proxy (Linux only).
+/// Start policy routing and the split-DNS proxy.
 ///
-/// Loads the mode's data file, installs the ipset + routing table (seeding the
-/// clean DNS upstream into the tunnel), and spawns the proxy on `dns_listen`.
-/// The returned [`PolicyHandle`] owns the teardown guard, so keep it alive for
-/// as long as policy routing should remain in effect.
-#[cfg(target_os = "linux")]
+/// Loads the mode's data file, builds the [`route::TunRouter`] (seeding a route
+/// for the clean DNS upstream so it is reached through the tunnel), and spawns
+/// the proxy on `dns_listen`. The returned [`PolicyHandle`] owns the teardown
+/// guard, so keep it alive for as long as policy routing should remain in
+/// effect. Works on Linux and macOS.
 pub async fn spawn(
     cfg: &PolicyConfig,
     tun_name: &str,
-    peer_ip: std::net::Ipv4Addr,
+    tun_ip: std::net::Ipv4Addr,
 ) -> anyhow::Result<PolicyHandle> {
     use anyhow::Context;
     use std::net::IpAddr;
@@ -176,23 +171,21 @@ pub async fn spawn(
         chnroute::ChnRoute::default()
     };
 
-    // The clean upstream must itself be reached through the tunnel, so seed it
-    // into the ipset up front.
-    let extra: Vec<std::net::Ipv4Addr> = match cfg.dns_remote.ip() {
-        IpAddr::V4(v4) => vec![v4],
-        IpAddr::V6(_) => vec![],
-    };
+    // Build the router that programs per-destination routes into the tun.
+    let router = Arc::new(
+        route::TunRouter::new(tun_name, tun_ip)
+            .with_context(|| format!("setting up routing for tun device {tun_name}"))?,
+    );
 
-    let routing = setup::PolicyRouting::install(
-        &cfg.ipset_name,
-        cfg.route_table,
-        cfg.fwmark,
-        tun_name,
-        peer_ip,
-        &extra,
-    )?;
+    // The clean upstream must itself be reached through the tunnel, so route it
+    // there up front (before any query is forwarded to it).
+    if let IpAddr::V4(v4) = cfg.dns_remote.ip() {
+        router
+            .add_route(v4)
+            .with_context(|| format!("routing clean DNS upstream {v4} through the tunnel"))?;
+    }
 
-    let sink: Arc<dyn IpSink> = Arc::new(setup::CommandIpSet::new(cfg.ipset_name.clone()));
+    let sink: Arc<dyn IpSink> = router.clone();
     let resolver = Arc::new(Resolver::new(
         cfg.mode,
         gfwlist,
@@ -220,7 +213,7 @@ pub async fn spawn(
     let task = tokio::spawn(proxy::serve(listener, resolver));
     Ok(PolicyHandle {
         task,
-        _routing: routing,
+        _guard: route::RouteGuard::new(router),
     })
 }
 

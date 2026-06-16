@@ -250,19 +250,22 @@ addresses, e.g. from the client `ping 10.9.0.1`.
 
 ---
 
-## Policy routing (gfwlist / chinadns) — client, Linux only
+## Policy routing (gfwlist / chinadns) — client, Linux + macOS
 
 By default the client is a *full* tunnel: every packet that reaches the TUN is
 encrypted to the server, and what you route into the TUN is your business (see
 the next section). For the common case of "send only some destinations through
-the tunnel", the client has a built-in **policy-routing** mode that follows the
-classic `dnsmasq` + `ipset` design — no external daemon required.
+the tunnel", the client has a built-in **policy-routing** mode — no external
+daemon, and no `ipset`/`iptables`/`nft` required.
 
 A small **split-DNS proxy** runs inside the client. For each query it decides
-whether the name should be tunneled, adds the answer's addresses to a kernel
-**ipset**, and a dedicated policy-routing table sends anything in that set
-through the tunnel. Only that table is touched; the main routing table and your
-default route are left alone, and everything is removed again on exit.
+whether the name should be tunneled and, for those that should be, programs a
+per-destination host route (`<ip>/32`) into the tun device using the OS's native
+routing socket — **rtnetlink on Linux, `PF_ROUTE` on macOS** — so the work is
+done entirely in user mode. The route's source is the tun address, so the
+server's masquerade matches with no client-side NAT. Direct (non-tunneled)
+traffic stays on the normal kernel path untouched, and every route added is
+removed again on exit.
 
 Two modes:
 
@@ -304,9 +307,6 @@ Relevant config / flags (all client-only; CLI overrides JSON):
 | `chnroute`    | `--chnroute`    | China CIDR file (chinadns mode)                           | —                    |
 | `geoip`       | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it     | —                    |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database    | `CN`                 |
-| `ipset_name`  | `--ipset`       | name of the ipset holding tunnel-routed addresses        | `shadowvpn`          |
-| `route_table` | `--route-table` | routing table id for the tunnel default route            | `9011` (`0x2333`)    |
-| `fwmark`      | `--fwmark`      | firewall mark linking the ipset to the routing table     | `9011` (`0x2333`)    |
 
 * **gfwlist file** — one domain per line; `#`/`!` comments and a leading `*.`/`.`
   are accepted (the plain list produced by `gfwlist2dnsmasq`, not the base64
@@ -318,9 +318,11 @@ Relevant config / flags (all client-only; CLI overrides JSON):
   enumerated and merged into the China set, so you don't have to maintain a CIDR
   file. Takes precedence over `--chnroute` when both are given.
 
-This needs root and the `ipset`/`iptables`/`ip` tools, and is **Linux only**; on
-other platforms a non-`full` mode is rejected at startup. The
-`docker/run-e2e-policy.sh` test exercises both modes end to end.
+This needs root (to create the tun and edit the routing table) and runs on
+**Linux and macOS**; routes are programmed directly via the routing socket, so no
+`ipset`/`iptables` binaries are involved. The `docker/run-e2e-policy.sh` test
+exercises both modes end to end. (The server still needs forwarding + NAT so
+tunneled traffic can egress — see below.)
 
 ---
 
@@ -396,14 +398,14 @@ src/
   protocol.rs     tunnel framing constants and buffer sizing
   config.rs       JSON file + clap CLI config, merge/validate
   tun_device.rs   async TUN wrapper (tun-rs, macOS utun + Linux)
-  policy/         client policy routing (gfwlist / chinadns + ipset)
-    mod.rs        Mode, PolicyConfig, Linux orchestration
+  policy/         client policy routing (gfwlist / chinadns, user-mode)
+    mod.rs        Mode, PolicyConfig, orchestration
     gfwlist.rs    domain-suffix matching
     chnroute.rs   China IP range lookup
     geoip.rs      build the China set from a GeoLite2 .mmdb
     dns.rs        minimal DNS wire parsing
     proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
-    setup.rs      ipset/ip/iptables wiring (Linux)
+    route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE)
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
   bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
 ```

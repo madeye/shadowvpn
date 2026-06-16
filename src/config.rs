@@ -48,12 +48,6 @@ pub const DEFAULT_DNS_LOCAL: &str = "114.114.114.114:53";
 /// Default clean DNS upstream, reached through the tunnel (Google DNS).
 pub const DEFAULT_DNS_REMOTE: &str = "8.8.8.8:53";
 
-/// Default ipset name holding tunnel-routed addresses.
-pub const DEFAULT_IPSET_NAME: &str = "shadowvpn";
-
-/// Default routing table id / firewall mark for policy routing (0x2333).
-pub const DEFAULT_ROUTE_TABLE: u32 = 0x2333;
-
 /// Default GeoIP country code selected for the China set.
 pub const DEFAULT_GEOIP_COUNTRY: &str = "CN";
 
@@ -164,15 +158,6 @@ pub struct FileConfig {
 
     /// ISO 3166-1 alpha-2 country code to select from the GeoIP database.
     pub geoip_country: Option<String>,
-
-    /// Name of the ipset holding tunnel-routed addresses.
-    pub ipset_name: Option<String>,
-
-    /// Routing table id used for the tunnel default route.
-    pub route_table: Option<u32>,
-
-    /// Firewall mark linking the ipset to the routing table.
-    pub fwmark: Option<u32>,
 
     /// Per-query DNS upstream timeout, in milliseconds.
     pub dns_timeout_ms: Option<u64>,
@@ -358,18 +343,6 @@ pub struct ClientArgs {
     /// ISO country code to select from the GeoIP database (default CN).
     #[arg(long = "geoip-country")]
     pub geoip_country: Option<String>,
-
-    /// Name of the ipset holding tunnel-routed addresses.
-    #[arg(long = "ipset")]
-    pub ipset_name: Option<String>,
-
-    /// Routing table id used for the tunnel default route.
-    #[arg(long = "route-table")]
-    pub route_table: Option<u32>,
-
-    /// Firewall mark linking the ipset to the routing table.
-    #[arg(long = "fwmark")]
-    pub fwmark: Option<u32>,
 }
 
 /// Load the optional file config referenced by a `--config` path.
@@ -469,16 +442,6 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
             .clone()
             .or_else(|| file.geoip_country.clone())
             .unwrap_or_else(|| DEFAULT_GEOIP_COUNTRY.to_string()),
-        ipset_name: args
-            .ipset_name
-            .clone()
-            .or_else(|| file.ipset_name.clone())
-            .unwrap_or_else(|| DEFAULT_IPSET_NAME.to_string()),
-        route_table: args
-            .route_table
-            .or(file.route_table)
-            .unwrap_or(DEFAULT_ROUTE_TABLE),
-        fwmark: args.fwmark.or(file.fwmark).unwrap_or(DEFAULT_ROUTE_TABLE),
         dns_timeout: Duration::from_millis(file.dns_timeout_ms.unwrap_or(DEFAULT_DNS_TIMEOUT_MS)),
     })
 }
@@ -594,9 +557,6 @@ mod tests {
                 chnroute: None,
                 geoip: None,
                 geoip_country: None,
-                ipset_name: None,
-                route_table: None,
-                fwmark: None,
             }
         }
     }
@@ -658,7 +618,6 @@ mod tests {
         let cfg = base.clone().resolve().expect("resolve full");
         assert_eq!(cfg.policy.mode, Mode::Full);
         assert_eq!(cfg.policy.dns_listen.to_string(), "127.0.0.1:5353");
-        assert_eq!(cfg.policy.ipset_name, "shadowvpn");
 
         // gfwlist mode without a gfwlist file is rejected.
         let mut g = base.clone();

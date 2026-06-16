@@ -2,9 +2,9 @@
 #
 # Image for the policy-routing E2E test. A single image plays every role
 # (vpn server, vpn client, DNS, echo destinations); the compose file picks the
-# role via the command. On top of the binaries it carries the userspace tools
-# policy routing drives — ipset/iptables/ip — plus dnsmasq, socat, and nc for the
-# test harness.
+# role via the command. The client programs routes itself via the kernel routing
+# socket (no ipset/iptables needed); iptables is only here for the server's NAT,
+# iproute2 lets the test display the routes, and dnsmasq/socat/nc are the harness.
 
 FROM rust:1-bookworm AS builder
 WORKDIR /src
@@ -15,7 +15,7 @@ RUN cargo build --release --locked --bins
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        iproute2 iputils-ping iptables ipset dnsmasq socat netcat-openbsd ca-certificates \
+        iproute2 iputils-ping iptables dnsmasq socat netcat-openbsd ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/shadowvpn-server /usr/local/bin/shadowvpn-server
