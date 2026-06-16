@@ -254,9 +254,8 @@ mod imp {
         buf.extend_from_slice(&(len as u16).to_ne_bytes());
         buf.extend_from_slice(&atype.to_ne_bytes());
         buf.extend_from_slice(data);
-        while buf.len() % 4 != 0 {
-            buf.push(0);
-        }
+        let padded = buf.len().div_ceil(4) * 4;
+        buf.resize(padded, 0);
     }
 
     #[cfg(test)]

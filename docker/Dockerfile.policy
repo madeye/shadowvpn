@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # Image for the policy-routing E2E test. A single image plays every role
 # (vpn server, vpn client, DNS, echo destinations); the compose file picks the
 # role via the command. The client programs routes itself via the kernel routing
