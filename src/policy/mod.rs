@@ -22,6 +22,7 @@
 
 pub mod chnroute;
 pub mod dns;
+pub mod dnsconf;
 pub mod geoip;
 pub mod gfwlist;
 pub mod proxy;
@@ -99,6 +100,9 @@ pub struct PolicyConfig {
     pub geoip: Option<PathBuf>,
     /// ISO 3166-1 alpha-2 country code selected from the GeoIP database.
     pub geoip_country: String,
+    /// Whether to point the system resolver at the proxy automatically (and
+    /// restore it on exit). Only effective when `dns_listen` uses port 53.
+    pub set_dns: bool,
     /// Per-query upstream timeout.
     pub dns_timeout: Duration,
 }
@@ -109,6 +113,8 @@ pub struct PolicyHandle {
     /// The DNS proxy serve loop; resolves only on a fatal socket error.
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
     _guard: route::RouteGuard,
+    /// Restores the system resolver on drop (when auto-DNS was applied).
+    _dns_guard: Option<dnsconf::DnsGuard>,
 }
 
 /// Start policy routing and the split-DNS proxy.
@@ -204,16 +210,26 @@ pub async fn spawn(
         cfg.mode.name(),
         cfg.dns_listen
     );
-    log::info!(
-        "point this host's resolver at {} (e.g. nameserver {}) to use policy routing",
-        cfg.dns_listen,
-        cfg.dns_listen.ip()
-    );
+
+    // Point the system resolver at the proxy (and restore it on exit) unless the
+    // operator opted out; otherwise just tell them how to do it themselves.
+    let dns_guard = if cfg.set_dns {
+        dnsconf::apply(cfg.dns_listen.ip(), cfg.dns_listen.port())
+            .context("configuring the system resolver")?
+    } else {
+        log::info!(
+            "point this host's resolver at {} (e.g. nameserver {}) to use policy routing",
+            cfg.dns_listen,
+            cfg.dns_listen.ip()
+        );
+        None
+    };
 
     let task = tokio::spawn(proxy::serve(listener, resolver));
     Ok(PolicyHandle {
         task,
         _guard: route::RouteGuard::new(router),
+        _dns_guard: dns_guard,
     })
 }
 

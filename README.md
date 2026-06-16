@@ -305,24 +305,29 @@ sudo ./target/release/shadowvpn-client -c client.json \
   --mode chinadns --geoip /etc/shadowvpn/GeoLite2-Country.mmdb
 ```
 
-Then point the host's resolver at the proxy (it logs the exact line at startup):
-
-```sh
-echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf   # proxy default: 127.0.0.1:5353
-```
+Policy routing only takes effect for names resolved **through** the proxy (that's
+what installs the routes), so the system resolver must point at it. By default
+the client does this for you: on startup it points the OS resolver at the proxy
+(`networksetup` on macOS, `/etc/resolv.conf` on Linux) and **restores the
+previous setting on exit** — including on Ctrl-C / `SIGTERM`, which it handles for
+a clean shutdown. Pass `--no-set-dns` to manage DNS yourself instead. Automatic
+setup only applies when `dns_listen` uses port 53 (the OS resolver can't target a
+custom port) — which is the default, so it works out of the box; if you move the
+proxy to another port, point your resolver at it manually.
 
 Relevant config / flags (all client-only; CLI overrides JSON):
 
 | JSON field    | CLI flag        | Meaning                                                    | Default              |
 |---------------|-----------------|-----------------------------------------------------------|----------------------|
 | `mode`        | `--mode`        | `full` \| `gfwlist` \| `chinadns`                          | `full`               |
-| `dns_listen`  | `--dns-listen`  | address the split-DNS proxy listens on                    | `127.0.0.1:5353`     |
+| `dns_listen`  | `--dns-listen`  | address the split-DNS proxy listens on                    | `127.0.0.1:53`       |
 | `dns_local`   | `--dns-local`   | domestic / direct DNS upstream                            | `114.114.114.114:53` |
 | `dns_remote`  | `--dns-remote`  | clean DNS upstream (reached through the tunnel)           | `8.8.8.8:53`         |
 | `gfwlist`     | `--gfwlist`     | domain-suffix file (gfwlist mode)                         | —                    |
 | `chnroute`    | `--chnroute`    | China CIDR file (chinadns mode)                           | —                    |
 | `geoip`       | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it     | —                    |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database    | `CN`                 |
+| `set_dns`     | `--set-dns` / `--no-set-dns` | point the system resolver at the proxy (auto-restored on exit) | `true` (needs `dns_listen` port 53) |
 
 * **gfwlist file** — one domain per line; `#`/`!` comments and a leading `*.`/`.`
   are accepted (the plain list produced by `gfwlist2dnsmasq`, not the base64
@@ -422,6 +427,7 @@ src/
     dns.rs        minimal DNS wire parsing
     proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
     route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE)
+    dnsconf.rs    point the system resolver at the proxy (networksetup / resolv.conf)
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
   bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
 docs/

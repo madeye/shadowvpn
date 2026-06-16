@@ -174,14 +174,23 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     };
     tokio::pin!(policy_fut);
 
-    // Whichever loop returns first ends the client (a returning relay loop means
-    // a fatal IO error; the keepalive loop only returns on a fatal send error;
-    // the policy loop only returns on a fatal DNS-proxy error).
+    // Catch termination signals so we exit the run loop *gracefully*: returning
+    // from `run` drops the policy handle, whose guards restore the system DNS and
+    // remove the tunnel routes. A bare process kill would skip that cleanup.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+
+    // Whichever arm fires first ends the client (a returning relay loop means a
+    // fatal IO error; the keepalive loop only returns on a fatal send error; the
+    // policy loop only returns on a fatal DNS-proxy error; a signal is a clean
+    // shutdown request).
     tokio::select! {
         r = up => propagate("tun->net", r),
         r = down => propagate("net->tun", r),
         r = keepalive => propagate("keepalive", r),
         r = &mut policy_fut => r,
+        _ = tokio::signal::ctrl_c() => { info!("received interrupt; shutting down"); Ok(()) }
+        _ = sigterm.recv() => { info!("received SIGTERM; shutting down"); Ok(()) }
     }
 }
 

@@ -44,10 +44,16 @@ ping -c 1 -W 1 10.9.0.1 >/dev/null 2>&1 || {
     exit 1
 }
 
-# Route name resolution through the split-DNS proxy. getaddrinfo re-reads this
-# file per lookup, so overwriting it is enough.
-echo "nameserver 127.0.0.1" >/etc/resolv.conf
+# The client points the system resolver at its split-DNS proxy automatically
+# (set_dns defaults on). Verify it actually rewrote /etc/resolv.conf rather than
+# doing it ourselves — this exercises the auto-DNS feature end to end.
 sleep 1
+echo "[client] /etc/resolv.conf after client startup:"
+sed 's/^/[client]   /' /etc/resolv.conf
+grep -q '^nameserver[[:space:]]\+127\.0\.0\.1' /etc/resolv.conf || {
+    echo "[client] FAIL: client did not point the resolver at its proxy" >&2
+    exit 1
+}
 
 probe() {
     # $1 = hostname; print the source address the echo server observed.
