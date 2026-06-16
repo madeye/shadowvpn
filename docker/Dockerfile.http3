@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+#
+# Image for the HTTP/3-over-tunnel end-to-end test. On top of the plain E2E
+# image it adds:
+#   * iptables  - the server masquerades client traffic out to the internet
+#   * a static HTTP/3-capable curl (stunnel/static-curl, built with ngtcp2 +
+#     nghttp3) - the client fetches a real QUIC site *through* the tunnel
+#
+# The same image runs as both roles; the compose file selects via the command.
+
+# --- Build stage (identical to the plain E2E image) -------------------------
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked --bins
+
+# --- Runtime stage ----------------------------------------------------------
+FROM debian:bookworm-slim
+
+# iproute2/ping: tunnel setup + probing. iptables: NAT on the server.
+# curl/xz-utils/ca-certificates: fetch + unpack the static HTTP/3 curl below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        iproute2 iputils-ping iptables curl xz-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install a static curl with HTTP/3 support over the distro curl (earlier in
+# PATH at /usr/local/bin). Detect the arch with uname so this works on both the
+# BuildKit and the legacy docker builder (the latter doesn't set TARGETARCH).
+ARG CURL_VERSION=8.20.0
+RUN set -eux; \
+    case "$(uname -m)" in \
+        x86_64) arch=x86_64 ;; \
+        aarch64|arm64) arch=aarch64 ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/stunnel/static-curl/releases/download/${CURL_VERSION}/curl-linux-${arch}-glibc-${CURL_VERSION}.tar.xz"; \
+    curl -fsSL -o /tmp/curl.tar.xz "$url"; \
+    tar -xf /tmp/curl.tar.xz -C /usr/local/bin curl; \
+    rm /tmp/curl.tar.xz; \
+    /usr/local/bin/curl --version | grep -qi ngtcp2
+
+COPY --from=builder /src/target/release/shadowvpn-server /usr/local/bin/shadowvpn-server
+COPY --from=builder /src/target/release/shadowvpn-client /usr/local/bin/shadowvpn-client
+
+COPY docker/server.json docker/client.json /etc/shadowvpn/
+COPY docker/run-server.sh docker/run-server-nat.sh docker/test-client-http3.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/run-server.sh /usr/local/bin/run-server-nat.sh \
+        /usr/local/bin/test-client-http3.sh
+
+ENV RUST_LOG=info

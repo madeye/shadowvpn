@@ -1,0 +1,49 @@
+# HTTP/3-over-tunnel end-to-end test for ShadowVPN.
+#
+# The server masquerades tunnel traffic out to the internet; the client routes
+# all egress through the tunnel and fetches a real QUIC site over HTTP/3. Runs on
+# a private bridge network (NOT host networking) and neutralizes any host proxy,
+# so QUIC/UDP must travel through ShadowVPN.
+#
+#   docker compose -f docker/docker-compose.http3.yml up --build \
+#       --abort-on-container-exit --exit-code-from client
+
+x-shadowvpn-http3: &shadowvpn-http3
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.http3
+  image: shadowvpn-e2e-http3:latest
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun
+  # Bridge networking (compose default) + an explicitly empty proxy env so the
+  # in-container curl talks QUIC directly through the tunnel, never via a host
+  # proxy (QUIC is unsupported over HTTP proxies anyway).
+  environment:
+    CIPHER: ${CIPHER:-chacha20-poly1305}
+    RUST_LOG: ${RUST_LOG:-info}
+    TARGET_URL: ${TARGET_URL:-https://www.cloudflare-quic.com/}
+    http_proxy: ""
+    https_proxy: ""
+    all_proxy: ""
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    ALL_PROXY: ""
+    no_proxy: "*"
+    NO_PROXY: "*"
+
+services:
+  server:
+    <<: *shadowvpn-http3
+    container_name: shadowvpn-http3-server
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    command: ["run-server-nat.sh"]
+
+  client:
+    <<: *shadowvpn-http3
+    container_name: shadowvpn-http3-client
+    depends_on:
+      - server
+    command: ["test-client-http3.sh"]

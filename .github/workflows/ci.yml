@@ -62,3 +62,23 @@ jobs:
 
       - name: Run end-to-end tunnel test
         run: ./docker/run-e2e.sh "${{ matrix.cipher }}"
+
+  # HTTP/3-over-tunnel test: the client routes all egress through the tunnel
+  # (server NATs to the internet) and fetches a real QUIC site over HTTP/3,
+  # proving ShadowVPN carries arbitrary UDP traffic. This depends on external
+  # connectivity (and UDP/443 egress), so it runs on main + manual dispatch
+  # rather than on every PR, and retries once to absorb transient blips.
+  e2e-http3:
+    name: docker e2e http3 (cloudflare-quic)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the TUN device is available on the runner
+        run: |
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+
+      - name: Verify HTTP/3 through the tunnel
+        run: ./docker/run-e2e-http3.sh || ./docker/run-e2e-http3.sh
