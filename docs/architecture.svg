@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 340" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-label="ShadowVPN end-to-end data flow">
+  <defs>
+    <marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#8b949e"/>
+    </marker>
+    <marker id="ahr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#6e7681"/>
+    </marker>
+    <style>
+      .panel{fill:#0d1117}
+      .band{fill:#11161d;stroke:#21262d;stroke-width:1;rx:14}
+      .bandlbl{fill:#8b949e;font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+      .box{fill:#161b22;stroke:#30363d;stroke-width:1.5}
+      .box.acc{stroke:#58a6ff}
+      .box.enc{stroke:#d29922}
+      .box.net{stroke:#3fb950}
+      .t{fill:#e6edf3;font-size:16px;font-weight:600}
+      .s{fill:#8b949e;font-size:12.5px}
+      .wire{fill:#d29922;font-size:13px;font-weight:600}
+      .flow{stroke:#8b949e;stroke-width:2;fill:none}
+      .ret{stroke:#6e7681;stroke-width:1.6;fill:none;stroke-dasharray:5 5}
+      .title{fill:#e6edf3;font-size:20px;font-weight:700}
+    </style>
+  </defs>
+
+  <rect class="panel" x="0" y="0" width="1320" height="340" rx="16"/>
+  <text class="title" x="28" y="40">ShadowVPN — encrypted UDP tunnel</text>
+
+  <!-- host bands -->
+  <rect class="band" x="14" y="64" width="536" height="196" rx="14"/>
+  <text class="bandlbl" x="34" y="88">Client host</text>
+  <rect class="band" x="636" y="64" width="540" height="196" rx="14"/>
+  <text class="bandlbl" x="656" y="88">Server host</text>
+
+  <!-- client boxes -->
+  <g>
+    <rect class="box" x="28" y="120" width="140" height="84" rx="10"/>
+    <text class="t" x="98" y="156" text-anchor="middle">Apps</text>
+    <text class="s" x="98" y="178" text-anchor="middle">browser, etc.</text>
+  </g>
+  <g>
+    <rect class="box acc" x="208" y="120" width="140" height="84" rx="10"/>
+    <text class="t" x="278" y="150" text-anchor="middle">TUN</text>
+    <text class="s" x="278" y="171" text-anchor="middle">tun0 / utun</text>
+    <text class="s" x="278" y="188" text-anchor="middle">raw IP packets</text>
+  </g>
+  <g>
+    <rect class="box enc" x="388" y="120" width="148" height="84" rx="10"/>
+    <text class="t" x="462" y="150" text-anchor="middle">Client</text>
+    <text class="s" x="462" y="171" text-anchor="middle">AEAD encrypt</text>
+    <text class="s" x="462" y="188" text-anchor="middle">+ UDP send</text>
+  </g>
+
+  <!-- server boxes -->
+  <g>
+    <rect class="box enc" x="650" y="120" width="148" height="84" rx="10"/>
+    <text class="t" x="724" y="150" text-anchor="middle">Server</text>
+    <text class="s" x="724" y="171" text-anchor="middle">AEAD decrypt</text>
+    <text class="s" x="724" y="188" text-anchor="middle">+ route</text>
+  </g>
+  <g>
+    <rect class="box acc" x="838" y="120" width="140" height="84" rx="10"/>
+    <text class="t" x="908" y="150" text-anchor="middle">TUN</text>
+    <text class="s" x="908" y="171" text-anchor="middle">tun0</text>
+    <text class="s" x="908" y="188" text-anchor="middle">raw IP packets</text>
+  </g>
+  <g>
+    <rect class="box net" x="1018" y="120" width="140" height="84" rx="10"/>
+    <text class="t" x="1088" y="156" text-anchor="middle">NAT</text>
+    <text class="s" x="1088" y="178" text-anchor="middle">forward + masq.</text>
+  </g>
+
+  <!-- internet -->
+  <g>
+    <ellipse cx="1255" cy="162" rx="48" ry="40" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+    <text class="t" x="1255" y="167" text-anchor="middle" font-size="14">Internet</text>
+  </g>
+
+  <!-- forward flow arrows -->
+  <path class="flow" d="M168,162 L204,162" marker-end="url(#ah)"/>
+  <path class="flow" d="M348,162 L384,162" marker-end="url(#ah)"/>
+  <path class="flow" d="M536,162 L646,162" marker-end="url(#ah)"/>
+  <path class="flow" d="M798,162 L834,162" marker-end="url(#ah)"/>
+  <path class="flow" d="M978,162 L1014,162" marker-end="url(#ah)"/>
+  <path class="flow" d="M1158,162 L1203,162" marker-end="url(#ah)"/>
+
+  <!-- wire label -->
+  <text class="wire" x="591" y="146" text-anchor="middle">encrypted</text>
+  <text class="wire" x="591" y="192" text-anchor="middle">UDP</text>
+  <text class="s" x="591" y="116" text-anchor="middle" fill="#6e7681">PSK · ss-AEAD</text>
+
+  <!-- return path -->
+  <path class="ret" d="M1255,202 L1255,300 L98,300 L98,204" marker-end="url(#ahr)"/>
+  <text class="s" x="676" y="320" text-anchor="middle">return traffic — server looks up client by inner tunnel IP, re-encrypts, sends back</text>
+</svg>

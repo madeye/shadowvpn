@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShadowVPN — UDP PSK user-mode VPN in Rust</title>
+<meta name="description" content="ShadowVPN is a UDP-based, pre-shared-key, user-mode VPN written in Rust. shadowsocks AEAD wire format, cross-platform TUN, and user-mode policy routing (gfwlist / chinadns).">
+<meta property="og:title" content="ShadowVPN">
+<meta property="og:description" content="A UDP-based, pre-shared-key, user-mode VPN written in Rust.">
+<meta property="og:type" content="website">
+<style>
+  :root{
+    --bg:#0d1117; --bg2:#11161d; --card:#161b22; --border:#21262d;
+    --text:#e6edf3; --muted:#8b949e; --faint:#6e7681;
+    --blue:#58a6ff; --green:#3fb950; --amber:#d29922; --purple:#a371f7;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--blue); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,kbd,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .wrap{max-width:1000px; margin:0 auto; padding:0 24px}
+
+  /* hero */
+  header.hero{
+    position:relative; overflow:hidden;
+    border-bottom:1px solid var(--border);
+    background:
+      radial-gradient(1100px 420px at 80% -10%, rgba(88,166,255,.16), transparent 60%),
+      radial-gradient(900px 360px at 0% 0%, rgba(63,185,80,.12), transparent 55%);
+  }
+  .hero .wrap{padding-top:86px; padding-bottom:72px}
+  .eyebrow{
+    display:inline-block; font-size:13px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--muted); border:1px solid var(--border); border-radius:999px;
+    padding:5px 14px; margin-bottom:22px; background:var(--bg2);
+  }
+  h1.brand{
+    font-size:clamp(44px,8vw,84px); line-height:1.02; margin:0 0 18px; letter-spacing:-.02em;
+    background:linear-gradient(100deg,#7cc4ff,#58a6ff 35%,#56d364); -webkit-background-clip:text;
+    background-clip:text; color:transparent; font-weight:800;
+  }
+  .tagline{font-size:clamp(18px,2.6vw,23px); color:#c9d1d9; max-width:640px; margin:0 0 14px}
+  .subtle{color:var(--muted); max-width:660px; margin:0 0 30px}
+  .cta{display:flex; gap:14px; flex-wrap:wrap}
+  .btn{
+    display:inline-flex; align-items:center; gap:9px; padding:12px 20px; border-radius:10px;
+    font-weight:600; font-size:15px; border:1px solid var(--border); cursor:pointer;
+  }
+  .btn.primary{background:var(--blue); color:#08111f; border-color:transparent}
+  .btn.primary:hover{background:#79c0ff; text-decoration:none}
+  .btn.ghost{background:var(--bg2); color:var(--text)}
+  .btn.ghost:hover{border-color:var(--faint); text-decoration:none}
+  .badges{margin-top:34px; display:flex; gap:8px; flex-wrap:wrap}
+  .badge{font-size:12.5px; color:var(--muted); background:var(--bg2); border:1px solid var(--border);
+    border-radius:7px; padding:5px 11px}
+  .badge b{color:var(--text); font-weight:600}
+
+  /* sections */
+  section{padding:64px 0; border-bottom:1px solid var(--border)}
+  h2{font-size:clamp(26px,4vw,34px); margin:0 0 10px; letter-spacing:-.01em}
+  h2 .num{color:var(--faint); font-weight:600; font-size:.62em; margin-right:12px}
+  .lede{color:var(--muted); max-width:720px; margin:0 0 28px; font-size:17px}
+  h3{font-size:18px; margin:30px 0 8px}
+
+  /* feature grid */
+  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:16px}
+  .feat{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:22px}
+  .feat .ic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;margin-bottom:14px;
+    background:rgba(88,166,255,.12); color:var(--blue); font-size:18px; border:1px solid rgba(88,166,255,.25)}
+  .feat h3{margin:0 0 6px; font-size:16px}
+  .feat p{margin:0; color:var(--muted); font-size:14.5px}
+
+  /* diagram */
+  figure{margin:8px 0 4px}
+  .diagram{width:100%; height:auto; display:block; border:1px solid var(--border); border-radius:14px;
+    background:var(--bg); box-shadow:0 1px 0 rgba(255,255,255,.02)}
+  figcaption{color:var(--faint); font-size:13px; margin-top:10px; text-align:center}
+
+  /* code */
+  pre{background:#0b0f15; border:1px solid var(--border); border-radius:12px; padding:18px 20px;
+    overflow-x:auto; font-size:13.5px; line-height:1.6; margin:14px 0}
+  pre code{color:#d6dee8}
+  .c{color:var(--faint)}            /* comment */
+  .k{color:var(--amber)}            /* command/keyword */
+  .v{color:var(--green)}            /* value */
+  p code,li code{background:var(--bg2); border:1px solid var(--border); border-radius:6px;
+    padding:1px 6px; font-size:13px}
+  ul.clean{padding-left:20px; color:var(--muted)} ul.clean li{margin:6px 0}
+  ul.clean b{color:var(--text)}
+
+  .two{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  table.modes{width:100%; border-collapse:collapse; margin-top:8px; font-size:14.5px}
+  table.modes th,table.modes td{border:1px solid var(--border); padding:10px 13px; text-align:left; vertical-align:top}
+  table.modes th{background:var(--bg2); color:var(--text); font-weight:600}
+  table.modes td{color:var(--muted)}
+  table.modes code{color:var(--amber)}
+
+  footer{padding:46px 0 70px; color:var(--muted)}
+  footer .wrap{display:flex; justify-content:space-between; gap:18px; flex-wrap:wrap; align-items:center}
+
+  @media (max-width:820px){
+    .grid{grid-template-columns:1fr 1fr}
+    .two{grid-template-columns:1fr}
+  }
+  @media (max-width:560px){ .grid{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">UDP · PSK · user-mode VPN · Rust</span>
+    <h1 class="brand">ShadowVPN</h1>
+    <p class="tagline">A UDP-based, pre-shared-key, user-mode VPN written in Rust on Tokio.</p>
+    <p class="subtle">A fixed point-to-point / multi-client tunnel whose on-wire crypto matches the
+      shadowsocks AEAD UDP scheme byte-for-byte. Runs on Linux and macOS, with optional
+      user-mode policy routing (gfwlist / chinadns) and no kernel ipset or nft rules.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/madeye/shadowvpn">★ View on GitHub</a>
+      <a class="btn ghost" href="#quickstart">Quick start →</a>
+    </div>
+    <div class="badges">
+      <span class="badge"><b>Wire:</b> shadowsocks AEAD (UDP)</span>
+      <span class="badge"><b>Ciphers:</b> AES-128/256-GCM · ChaCha20-Poly1305</span>
+      <span class="badge"><b>Platforms:</b> Linux · macOS</span>
+      <span class="badge"><b>License:</b> MIT</span>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section id="overview">
+  <div class="wrap">
+    <h2><span class="num">01</span>Why ShadowVPN</h2>
+    <p class="lede">A TUN-based client reads IP packets from a virtual interface, encrypts each as a
+      single UDP datagram, and sends it to the server; the server decrypts, routes, and tunnels
+      return traffic back. Small, spec-correct, and entirely in user space.</p>
+    <div class="grid">
+      <div class="feat"><div class="ic">🔒</div><h3>Spec-correct crypto</h3>
+        <p>Per-datagram random salt, HKDF-SHA1 <code>ss-subkey</code>, zero nonce, AEAD tag — the
+          shadowsocks UDP scheme exactly, interoperable by construction.</p></div>
+      <div class="feat"><div class="ic">📦</div><h3>One packet, one datagram</h3>
+        <p>No length prefix, no SOCKS header, no multiplexing. The plaintext is the raw IP packet —
+          UDP boundaries are the frame boundaries.</p></div>
+      <div class="feat"><div class="ic">🖧</div><h3>User-mode TUN</h3>
+        <p>Async TUN on Tokio via <code>tun-rs</code> — Linux <code>tun0</code> and macOS
+          <code>utun</code>. Two relay loops plus a keepalive.</p></div>
+      <div class="feat"><div class="ic">🧭</div><h3>Policy routing</h3>
+        <p>Optional split-tunnel: send only selected destinations through the tunnel, decided in
+          user space — no ipset, no nft.</p></div>
+      <div class="feat"><div class="ic">🌏</div><h3>gfwlist · chinadns</h3>
+        <p>Tunnel a domain list, or everything that isn't a China IP. Build the China set from a
+          plain CIDR file or a GeoLite2 database.</p></div>
+      <div class="feat"><div class="ic">🦀</div><h3>Lean Rust</h3>
+        <p>Tokio + RustCrypto, a tiny dependency set, and a Docker end-to-end test suite covering
+          the tunnel, HTTP/3, and policy routing.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <h2><span class="num">02</span>Architecture</h2>
+    <p class="lede">The client encrypts every TUN packet to the server over UDP; the server decrypts,
+      writes to its own TUN, and (with forwarding + NAT) lets traffic egress. Return traffic is
+      matched back to the client by its inner tunnel IP and re-encrypted.</p>
+    <figure>
+      <img class="diagram" src="architecture.svg" alt="ShadowVPN end-to-end data flow: apps to TUN to client encrypt, encrypted UDP to server decrypt, server TUN, NAT, Internet, and the return path.">
+      <figcaption>End-to-end data flow between a client host and a server host.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="wire">
+  <div class="wrap">
+    <h2><span class="num">03</span>Wire protocol</h2>
+    <p class="lede">Each datagram is <code>salt ++ AEAD(ciphertext ++ tag)</code>. A fresh random salt
+      per datagram yields a unique subkey, so the all-zero nonce is never reused.</p>
+    <figure>
+      <img class="diagram" src="wire.svg" alt="On-wire datagram layout: salt, AEAD ciphertext of the raw IP packet, and a 16-byte tag, with subkey and key derivation notes.">
+      <figcaption>One datagram = one encrypted IP packet.</figcaption>
+    </figure>
+    <p class="subtle" style="margin-top:18px"><b style="color:var(--text)">Deviation from ss-proxy:</b>
+      standard shadowsocks UDP relays prepend a SOCKS target address; ShadowVPN does not. This is a
+      fixed tunnel, so the plaintext is exactly the raw IP packet — everything else matches the AEAD
+      scheme byte-for-byte.</p>
+  </div>
+</section>
+
+<section id="policy">
+  <div class="wrap">
+    <h2><span class="num">04</span>Policy routing</h2>
+    <p class="lede">Instead of pushing all traffic through the tunnel, the client can route only
+      selected destinations. A built-in split-DNS proxy decides per query, then programs a
+      per-destination route into the tun via the OS routing socket — rtnetlink on Linux,
+      <code>PF_ROUTE</code> on macOS. Direct traffic stays on the normal kernel path.</p>
+    <figure>
+      <img class="diagram" src="policy-routing.svg" alt="Client policy routing: control plane where the split-DNS proxy decides and installs a per-destination route; data plane where the routing table sends tunneled IPs through the tunnel and everything else direct.">
+      <figcaption>Control plane installs routes; the routing table picks the path. No ipset / nft.</figcaption>
+    </figure>
+    <table class="modes">
+      <tr><th>Mode</th><th>Decision</th><th>Needs</th></tr>
+      <tr><td><code>gfwlist</code></td><td>tunnel names listed in a gfwlist file; everything else is direct</td><td><code>--gfwlist</code></td></tr>
+      <tr><td><code>chinadns</code></td><td>query a domestic + a clean resolver; tunnel anything that does <b>not</b> resolve to an in-China address</td><td><code>--chnroute</code> or <code>--geoip</code></td></tr>
+      <tr><td><code>full</code></td><td>no policy routing — the whole TUN is the tunnel (default)</td><td>—</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2><span class="num">05</span>Quick start</h2>
+    <p class="lede">Build the two binaries, then run the server and client. Creating a TUN device
+      needs root / <code>sudo</code>.</p>
+
+    <h3>Build</h3>
+<pre><code><span class="k">cargo</span> build --release
+<span class="c"># produces target/release/shadowvpn-server and shadowvpn-client</span></code></pre>
+
+    <div class="two">
+      <div>
+        <h3>Server</h3>
+<pre><code><span class="k">sudo</span> ./shadowvpn-server \
+  --listen <span class="v">0.0.0.0:8388</span> \
+  --password <span class="v">"correct horse battery staple"</span> \
+  --cipher <span class="v">chacha20-poly1305</span> \
+  --tun-ip <span class="v">10.9.0.1</span> --peer-ip <span class="v">10.9.0.2</span></code></pre>
+      </div>
+      <div>
+        <h3>Client</h3>
+<pre><code><span class="k">sudo</span> ./shadowvpn-client \
+  --server <span class="v">vpn.example.com:8388</span> \
+  --password <span class="v">"correct horse battery staple"</span> \
+  --cipher <span class="v">chacha20-poly1305</span> \
+  --tun-ip <span class="v">10.9.0.2</span> --peer-ip <span class="v">10.9.0.1</span></code></pre>
+      </div>
+    </div>
+
+    <h3>Split tunnel (policy routing)</h3>
+<pre><code><span class="c"># tunnel only the domains in a gfwlist</span>
+<span class="k">sudo</span> ./shadowvpn-client -c client.json --mode <span class="v">gfwlist</span> --gfwlist <span class="v">/etc/shadowvpn/gfwlist.txt</span>
+
+<span class="c"># or: tunnel everything that isn't a China IP, from a GeoLite2 database</span>
+<span class="k">sudo</span> ./shadowvpn-client -c client.json --mode <span class="v">chinadns</span> --geoip <span class="v">/etc/shadowvpn/GeoLite2-Country.mmdb</span>
+
+<span class="c"># then point the host resolver at the built-in split-DNS proxy</span>
+<span class="k">echo</span> <span class="v">"nameserver 127.0.0.1"</span> | sudo tee /etc/resolv.conf   <span class="c"># proxy default: 127.0.0.1:5353</span></code></pre>
+
+    <p class="subtle">Configuration can come from a JSON file, CLI flags, or both (CLI wins). See the
+      <a href="https://github.com/madeye/shadowvpn#configuration">full configuration reference</a> and the
+      <a href="https://github.com/madeye/shadowvpn#policy-routing-gfwlist--chinadns--client-linux--macos">policy-routing guide</a>
+      in the README.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>ShadowVPN — UDP PSK user-mode VPN in Rust · MIT licensed</div>
+    <div><a href="https://github.com/madeye/shadowvpn">github.com/madeye/shadowvpn</a></div>
+  </div>
+</footer>
+
+</body>
+</html>
