@@ -12,6 +12,14 @@ The on-wire crypto matches the **shadowsocks.org AEAD UDP scheme** exactly, so
 the construction is spec-correct and interoperable, with one deliberate,
 documented deviation (no SOCKS address header — see below).
 
+> **Landing page:** a visual overview lives at
+> [**madeye.github.io/shadowvpn**](https://madeye.github.io/shadowvpn/)
+> (source in [`docs/`](docs/)).
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="ShadowVPN end-to-end data flow" width="100%">
+</p>
+
 ---
 
 ## Wire protocol
@@ -21,6 +29,10 @@ Each UDP datagram on the wire is:
 ```text
 [ salt (salt_len bytes) ] ++ [ AEAD ciphertext ++ tag (16 bytes) ]
 ```
+
+<p align="center">
+  <img src="docs/wire.svg" alt="ShadowVPN on-wire datagram format" width="100%">
+</p>
 
 * **`salt_len == key_len`** of the cipher: 16 bytes for `aes-128-gcm`,
   32 bytes for `aes-256-gcm` and `chacha20-poly1305`. A fresh random salt is
@@ -267,6 +279,10 @@ server's masquerade matches with no client-side NAT. Direct (non-tunneled)
 traffic stays on the normal kernel path untouched, and every route added is
 removed again on exit.
 
+<p align="center">
+  <img src="docs/policy-routing.svg" alt="ShadowVPN client policy routing — control and data plane" width="100%">
+</p>
+
 Two modes:
 
 | Mode       | Decision                                                            | Needs       |
@@ -408,6 +424,9 @@ src/
     route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE)
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
   bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
+docs/
+  index.html      landing page (GitHub Pages)
+  architecture.svg, wire.svg, policy-routing.svg   diagrams
 ```
 
 ---

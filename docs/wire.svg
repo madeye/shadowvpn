@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 320" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-label="ShadowVPN on-wire datagram format">
+  <defs>
+    <style>
+      .panel{fill:#0d1117}
+      .title{fill:#e6edf3;font-size:20px;font-weight:700}
+      .seg{stroke-width:1.5}
+      .salt{fill:#3a2d12;stroke:#d29922}
+      .ct{fill:#102338;stroke:#58a6ff}
+      .tag{fill:#0f2c1a;stroke:#3fb950}
+      .seglbl{fill:#e6edf3;font-size:16px;font-weight:600}
+      .segsub{font-size:12.5px}
+      .cap{fill:#8b949e;font-size:13px}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+      .k{fill:#e6edf3;font-size:13.5px}
+      .tick{stroke:#6e7681;stroke-width:1}
+    </style>
+  </defs>
+
+  <rect class="panel" x="0" y="0" width="1000" height="320" rx="16"/>
+  <text class="title" x="28" y="42">On-wire datagram — shadowsocks AEAD (UDP)</text>
+
+  <!-- segments -->
+  <rect class="seg salt" x="60" y="92" width="180" height="70" rx="8"/>
+  <text class="seglbl" x="150" y="124" text-anchor="middle" fill="#f0c674">salt</text>
+  <text class="segsub salt" x="150" y="145" text-anchor="middle" fill="#d29922">salt_len bytes</text>
+
+  <rect class="seg ct" x="240" y="92" width="560" height="70" rx="8"/>
+  <text class="seglbl" x="520" y="120" text-anchor="middle" fill="#79c0ff">AEAD ciphertext</text>
+  <text class="segsub ct" x="520" y="141" text-anchor="middle" fill="#58a6ff">= encrypted raw IP packet (one packet per datagram)</text>
+
+  <rect class="seg tag" x="800" y="92" width="140" height="70" rx="8"/>
+  <text class="seglbl" x="870" y="124" text-anchor="middle" fill="#56d364">tag</text>
+  <text class="segsub tag" x="870" y="145" text-anchor="middle" fill="#3fb950">16 bytes</text>
+
+  <!-- caption ticks -->
+  <line class="tick" x1="60" y1="170" x2="60" y2="182"/>
+  <line class="tick" x1="940" y1="170" x2="940" y2="182"/>
+  <line class="tick" x1="60" y1="182" x2="940" y2="182"/>
+  <text class="cap" x="500" y="201" text-anchor="middle">one UDP datagram — datagram boundaries are the frame boundaries (no length prefix, no SOCKS header)</text>
+
+  <!-- derivations -->
+  <text class="k" x="28" y="240"><tspan fill="#8b949e">salt_len</tspan>  = key_len (16 B for aes-128-gcm; 32 B for aes-256-gcm / chacha20-poly1305) — fresh random per datagram</text>
+  <text class="k" x="28" y="266"><tspan fill="#8b949e">subkey</tspan>   = <tspan class="mono">HKDF-SHA1(master_key, salt, "ss-subkey")</tspan>      <tspan fill="#8b949e">nonce</tspan> = 12 zero bytes (safe: unique salt ⇒ unique subkey)</text>
+  <text class="k" x="28" y="292"><tspan fill="#8b949e">master_key</tspan> = <tspan class="mono">EVP_BytesToKey(password)</tspan> — the pre-shared key both ends derive identically</text>
+</svg>
