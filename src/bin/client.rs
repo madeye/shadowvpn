@@ -111,9 +111,40 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     info!("UDP socket {local_addr} connected to server {}", cfg.server);
     let socket = Arc::new(socket);
 
-    // Tell the user how to actually route traffic through the tunnel; we never
-    // mutate the routing table ourselves.
-    print_routing_hint(&cfg.tun, &cfg.server);
+    // --- Policy routing (optional, Linux only) -----------------------------
+    // In `gfwlist`/`chinadns` mode the client runs a split-DNS proxy and
+    // installs an ipset-backed policy route so that only selected destinations
+    // go through the tunnel. In `full` mode (the default) we touch nothing and
+    // just print the manual routing hint, preserving the historical behavior.
+    #[cfg(target_os = "linux")]
+    let mut policy_handle = if cfg.policy.mode.is_enabled() {
+        Some(
+            shadowvpn::policy::spawn(&cfg.policy, &iface_name, cfg.tun.peer_ip)
+                .await
+                .context("failed to start policy routing")?,
+        )
+    } else {
+        None
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    if cfg.policy.mode.is_enabled() {
+        anyhow::bail!(
+            "policy routing (mode={}) is only supported on Linux",
+            cfg.policy.mode.name()
+        );
+    }
+
+    if cfg.policy.mode.is_enabled() {
+        info!(
+            "policy routing mode = {}; only matched destinations are tunneled",
+            cfg.policy.mode.name()
+        );
+    } else {
+        // Tell the user how to actually route traffic through the tunnel; in
+        // full mode we never mutate the routing table ourselves.
+        print_routing_hint(&cfg.tun, &cfg.server);
+    }
 
     // --- Relay + keepalive tasks -------------------------------------------
     // Loop A: TUN -> net (read IP packet, encrypt, send UDP).
@@ -140,12 +171,30 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         Arc::clone(&master_key),
     ));
 
+    // The DNS-proxy task, when policy routing is active. When it is not (or on
+    // non-Linux), this future stays pending forever so it never wins the select.
+    // Keeping `policy_handle` owned here also keeps the teardown guard alive for
+    // the lifetime of the client.
+    let policy_fut = async {
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = policy_handle.as_mut() {
+            return match (&mut handle.task).await {
+                Ok(inner) => inner.context("DNS proxy loop failed"),
+                Err(join) => Err(anyhow::Error::new(join).context("DNS proxy task panicked")),
+            };
+        }
+        std::future::pending::<Result<()>>().await
+    };
+    tokio::pin!(policy_fut);
+
     // Whichever loop returns first ends the client (a returning relay loop means
-    // a fatal IO error; the keepalive loop only returns on a fatal send error).
+    // a fatal IO error; the keepalive loop only returns on a fatal send error;
+    // the policy loop only returns on a fatal DNS-proxy error).
     tokio::select! {
         r = up => propagate("tun->net", r),
         r = down => propagate("net->tun", r),
         r = keepalive => propagate("keepalive", r),
+        r = &mut policy_fut => r,
     }
 }
 

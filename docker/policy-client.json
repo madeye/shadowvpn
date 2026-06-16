@@ -1,0 +1,10 @@
+{
+  "server": "172.30.0.2:8388",
+  "password": "shadowvpn-e2e-password",
+  "cipher": "chacha20-poly1305",
+  "tun_name": "tun0",
+  "tun_ip": "10.9.0.2",
+  "tun_netmask": "255.255.255.0",
+  "peer_ip": "10.9.0.1",
+  "mtu": 1400
+}
