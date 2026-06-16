@@ -59,8 +59,8 @@ blocked="$(probe blocked.com)"
 echo "[client] probing safe.com    (expect direct   -> $CLIENT_IP)"
 safe="$(probe safe.com)"
 
-echo "[client] ipset contents:"
-ipset list shadowvpn 2>/dev/null | sed 's/^/[client]   /' || true
+echo "[client] tunnel routes programmed into tun0:"
+ip route show 2>/dev/null | grep -w tun0 | sed 's/^/[client]   /' || true
 
 echo "[client] result: blocked.com seen-as=${blocked:-<none>}  safe.com seen-as=${safe:-<none>}"
 

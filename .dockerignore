@@ -1,0 +1,7 @@
+# Keep the Docker build context small and reproducible: the image builds the
+# binaries from source inside the builder stage, so none of these are needed
+# (and shipping target/ can be hundreds of MB).
+target/
+.git/
+.github/
+*.md

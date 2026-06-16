@@ -1165,6 +1165,7 @@ dependencies = [
  "env_logger",
  "hkdf",
  "ipnetwork",
+ "libc",
  "log",
  "maxminddb",
  "md-5",
