@@ -250,8 +250,8 @@
 <span class="c"># or: tunnel everything that isn't a China IP, from a GeoLite2 database</span>
 <span class="k">sudo</span> ./shadowvpn-client -c client.json --mode <span class="v">chinadns</span> --geoip <span class="v">/etc/shadowvpn/GeoLite2-Country.mmdb</span>
 
-<span class="c"># then point the host resolver at the built-in split-DNS proxy</span>
-<span class="k">echo</span> <span class="v">"nameserver 127.0.0.1"</span> | sudo tee /etc/resolv.conf   <span class="c"># proxy default: 127.0.0.1:5353</span></code></pre>
+<span class="c"># the client points the system resolver at its split-DNS proxy automatically</span>
+<span class="c"># (restored on exit); pass --no-set-dns to manage DNS yourself.</span></code></pre>
 
     <p class="subtle">Configuration can come from a JSON file, CLI flags, or both (CLI wins). See the
       <a href="https://github.com/madeye/shadowvpn#configuration">full configuration reference</a> and the

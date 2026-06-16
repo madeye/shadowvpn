@@ -39,8 +39,10 @@ pub const DEFAULT_CIPHER: &str = "chacha20-poly1305";
 /// Default TUN netmask (a /24).
 pub const DEFAULT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
-/// Default address the split-DNS proxy listens on.
-pub const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:5353";
+/// Default address the split-DNS proxy listens on. Port 53 so the client can
+/// point the system resolver at it automatically (the client needs root for the
+/// TUN anyway, and nothing else binds `127.0.0.1:53` by default).
+pub const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:53";
 
 /// Default domestic / direct DNS upstream (114DNS).
 pub const DEFAULT_DNS_LOCAL: &str = "114.114.114.114:53";
@@ -158,6 +160,10 @@ pub struct FileConfig {
 
     /// ISO 3166-1 alpha-2 country code to select from the GeoIP database.
     pub geoip_country: Option<String>,
+
+    /// Whether to point the system resolver at the proxy automatically
+    /// (default `true` in gfwlist/chinadns mode).
+    pub set_dns: Option<bool>,
 
     /// Per-query DNS upstream timeout, in milliseconds.
     pub dns_timeout_ms: Option<u64>,
@@ -343,6 +349,15 @@ pub struct ClientArgs {
     /// ISO country code to select from the GeoIP database (default CN).
     #[arg(long = "geoip-country")]
     pub geoip_country: Option<String>,
+
+    /// Point the system resolver at the split-DNS proxy (the default in
+    /// gfwlist/chinadns mode).
+    #[arg(long = "set-dns")]
+    pub set_dns: bool,
+
+    /// Do NOT modify the system resolver; configure DNS yourself.
+    #[arg(long = "no-set-dns")]
+    pub no_set_dns: bool,
 }
 
 /// Load the optional file config referenced by a `--config` path.
@@ -419,6 +434,15 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
     let chnroute = args.chnroute.clone().or_else(|| file.chnroute.clone());
     let geoip = args.geoip.clone().or_else(|| file.geoip.clone());
 
+    // `--no-set-dns` wins over `--set-dns`; otherwise file value; default on.
+    let set_dns = if args.no_set_dns {
+        false
+    } else if args.set_dns {
+        true
+    } else {
+        file.set_dns.unwrap_or(true)
+    };
+
     // Fail fast if the chosen mode is missing its data file.
     if matches!(mode, Mode::GfwList) && gfwlist.is_none() {
         return Err(ConfigError::Missing("gfwlist (required by gfwlist mode)"));
@@ -442,6 +466,7 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
             .clone()
             .or_else(|| file.geoip_country.clone())
             .unwrap_or_else(|| DEFAULT_GEOIP_COUNTRY.to_string()),
+        set_dns,
         dns_timeout: Duration::from_millis(file.dns_timeout_ms.unwrap_or(DEFAULT_DNS_TIMEOUT_MS)),
     })
 }
@@ -557,6 +582,8 @@ mod tests {
                 chnroute: None,
                 geoip: None,
                 geoip_country: None,
+                set_dns: false,
+                no_set_dns: false,
             }
         }
     }
@@ -617,7 +644,16 @@ mod tests {
         };
         let cfg = base.clone().resolve().expect("resolve full");
         assert_eq!(cfg.policy.mode, Mode::Full);
-        assert_eq!(cfg.policy.dns_listen.to_string(), "127.0.0.1:5353");
+        assert_eq!(cfg.policy.dns_listen.to_string(), "127.0.0.1:53");
+        assert!(cfg.policy.set_dns, "set_dns defaults to on");
+
+        // --no-set-dns wins; --set-dns forces on.
+        let mut nd = base.clone();
+        nd.no_set_dns = true;
+        assert!(!nd.resolve().unwrap().policy.set_dns);
+        let mut sd = base.clone();
+        sd.set_dns = true;
+        assert!(sd.resolve().unwrap().policy.set_dns);
 
         // gfwlist mode without a gfwlist file is rejected.
         let mut g = base.clone();
