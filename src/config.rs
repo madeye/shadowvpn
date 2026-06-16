@@ -54,6 +54,9 @@ pub const DEFAULT_IPSET_NAME: &str = "shadowvpn";
 /// Default routing table id / firewall mark for policy routing (0x2333).
 pub const DEFAULT_ROUTE_TABLE: u32 = 0x2333;
 
+/// Default GeoIP country code selected for the China set.
+pub const DEFAULT_GEOIP_COUNTRY: &str = "CN";
+
 /// Default per-query DNS upstream timeout, in milliseconds.
 pub const DEFAULT_DNS_TIMEOUT_MS: u64 = 3000;
 
@@ -154,6 +157,13 @@ pub struct FileConfig {
 
     /// Path to the China route (CIDR) file (chinadns mode).
     pub chnroute: Option<PathBuf>,
+
+    /// Path to a GeoLite2/GeoIP2 country database (chinadns mode); when set, the
+    /// China set is built from it instead of `chnroute`.
+    pub geoip: Option<PathBuf>,
+
+    /// ISO 3166-1 alpha-2 country code to select from the GeoIP database.
+    pub geoip_country: Option<String>,
 
     /// Name of the ipset holding tunnel-routed addresses.
     pub ipset_name: Option<String>,
@@ -341,6 +351,14 @@ pub struct ClientArgs {
     #[arg(long = "chnroute")]
     pub chnroute: Option<PathBuf>,
 
+    /// Path to a GeoLite2/GeoIP2 country database (chinadns mode).
+    #[arg(long = "geoip")]
+    pub geoip: Option<PathBuf>,
+
+    /// ISO country code to select from the GeoIP database (default CN).
+    #[arg(long = "geoip-country")]
+    pub geoip_country: Option<String>,
+
     /// Name of the ipset holding tunnel-routed addresses.
     #[arg(long = "ipset")]
     pub ipset_name: Option<String>,
@@ -426,13 +444,16 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
 
     let gfwlist = args.gfwlist.clone().or_else(|| file.gfwlist.clone());
     let chnroute = args.chnroute.clone().or_else(|| file.chnroute.clone());
+    let geoip = args.geoip.clone().or_else(|| file.geoip.clone());
 
     // Fail fast if the chosen mode is missing its data file.
     if matches!(mode, Mode::GfwList) && gfwlist.is_none() {
         return Err(ConfigError::Missing("gfwlist (required by gfwlist mode)"));
     }
-    if matches!(mode, Mode::ChinaDns) && chnroute.is_none() {
-        return Err(ConfigError::Missing("chnroute (required by chinadns mode)"));
+    if matches!(mode, Mode::ChinaDns) && chnroute.is_none() && geoip.is_none() {
+        return Err(ConfigError::Missing(
+            "chnroute or geoip (required by chinadns mode)",
+        ));
     }
 
     Ok(PolicyConfig {
@@ -442,6 +463,12 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
         dns_remote,
         gfwlist,
         chnroute,
+        geoip,
+        geoip_country: args
+            .geoip_country
+            .clone()
+            .or_else(|| file.geoip_country.clone())
+            .unwrap_or_else(|| DEFAULT_GEOIP_COUNTRY.to_string()),
         ipset_name: args
             .ipset_name
             .clone()
@@ -565,6 +592,8 @@ mod tests {
                 dns_remote: None,
                 gfwlist: None,
                 chnroute: None,
+                geoip: None,
+                geoip_country: None,
                 ipset_name: None,
                 route_table: None,
                 fwmark: None,
@@ -636,10 +665,18 @@ mod tests {
         g.mode = Some("gfwlist".to_string());
         assert!(matches!(g.resolve(), Err(ConfigError::Missing(_))));
 
-        // chinadns mode without a chnroute file is rejected.
+        // chinadns mode without a chnroute file or geoip database is rejected.
         let mut c = base.clone();
         c.mode = Some("chinadns".to_string());
         assert!(matches!(c.resolve(), Err(ConfigError::Missing(_))));
+
+        // chinadns mode is satisfied by a geoip database alone (default CN).
+        let mut cg = base.clone();
+        cg.mode = Some("chinadns".to_string());
+        cg.geoip = Some(PathBuf::from("/tmp/GeoLite2-Country.mmdb"));
+        let cfg = cg.resolve().expect("resolve chinadns+geoip");
+        assert_eq!(cfg.policy.mode, Mode::ChinaDns);
+        assert_eq!(cfg.policy.geoip_country, "CN");
 
         // A bare DNS IP gets the default port; bad mode is an error.
         let mut d = base.clone();

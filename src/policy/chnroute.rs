@@ -50,6 +50,14 @@ impl ChnRoute {
         Ok(Self::from_lines(text.lines()))
     }
 
+    /// Build a route table directly from inclusive `[start, end]` `u32` ranges
+    /// (used by the GeoIP loader). Ranges are sorted and merged.
+    pub fn from_ranges(ranges: Vec<(u32, u32)>) -> Self {
+        Self {
+            ranges: merge(ranges),
+        }
+    }
+
     /// Number of merged ranges.
     pub fn len(&self) -> usize {
         self.ranges.len()
@@ -146,6 +154,21 @@ mod tests {
         assert!(!r.contains(ip("8.8.8.8"))); // Google DNS: not in China
         assert!(!r.contains(ip("0.0.0.0")));
         assert!(!r.contains(ip("255.255.255.255")));
+    }
+
+    #[test]
+    fn from_ranges_merges_and_looks_up() {
+        // Two adjacent ranges merge; lookups still work.
+        let r = ChnRoute::from_ranges(vec![
+            (u32::from(ip("1.0.0.0")), u32::from(ip("1.0.0.255"))),
+            (u32::from(ip("1.0.1.0")), u32::from(ip("1.0.1.255"))),
+            (u32::from(ip("8.8.8.0")), u32::from(ip("8.8.8.255"))),
+        ]);
+        assert_eq!(r.len(), 2);
+        assert!(r.contains(ip("1.0.0.7")));
+        assert!(r.contains(ip("1.0.1.7")));
+        assert!(r.contains(ip("8.8.8.8")));
+        assert!(!r.contains(ip("1.0.2.0")));
     }
 
     #[test]
