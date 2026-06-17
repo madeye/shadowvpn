@@ -34,6 +34,57 @@ pub fn question_name(msg: &[u8]) -> Option<String> {
     Some(name)
 }
 
+/// Extract the first question as `(name, qtype, qclass)` — the natural cache
+/// key for a query. Returns `None` if there is no question or it is malformed.
+pub fn question(msg: &[u8]) -> Option<(String, u16, u16)> {
+    if msg.len() < HEADER_LEN {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
+    if qdcount == 0 {
+        return None;
+    }
+    let (name, pos) = read_name(msg, HEADER_LEN)?;
+    if pos + 4 > msg.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+    let qclass = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]);
+    Some((name, qtype, qclass))
+}
+
+/// The smallest TTL across the answer section, or `None` if there are no
+/// answer records (used to bound how long a response may be cached).
+pub fn min_ttl(msg: &[u8]) -> Option<u32> {
+    if msg.len() < HEADER_LEN {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
+    let ancount = u16::from_be_bytes([msg[6], msg[7]]);
+
+    let mut pos = HEADER_LEN;
+    for _ in 0..qdcount {
+        pos = skip_name(msg, pos)?;
+        pos += 4;
+        if pos > msg.len() {
+            return None;
+        }
+    }
+
+    let mut min: Option<u32> = None;
+    for _ in 0..ancount {
+        pos = skip_name(msg, pos)?;
+        if pos + 10 > msg.len() {
+            break;
+        }
+        let ttl = u32::from_be_bytes([msg[pos + 4], msg[pos + 5], msg[pos + 6], msg[pos + 7]]);
+        let rdlength = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
+        pos += 10 + rdlength;
+        min = Some(min.map_or(ttl, |m| m.min(ttl)));
+    }
+    min
+}
+
 /// Extract every IPv4 address from the answer section of a DNS response.
 ///
 /// Returns an empty vector for a query, an answer with no `A` records, or any
@@ -199,6 +250,42 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(question_name(b"short"), None);
+    }
+
+    /// Build a response to `q` with the given (ip, ttl) A records.
+    fn response_with(q: &[u8], records: &[([u8; 4], u32)]) -> Vec<u8> {
+        let mut m = q.to_vec();
+        m[2] = 0x81;
+        m[3] = 0x80;
+        m[6] = (records.len() >> 8) as u8;
+        m[7] = records.len() as u8;
+        for (ip, ttl) in records {
+            m.extend_from_slice(&[0xC0, 0x0C]); // name pointer
+            m.extend_from_slice(&TYPE_A.to_be_bytes());
+            m.extend_from_slice(&CLASS_IN.to_be_bytes());
+            m.extend_from_slice(&ttl.to_be_bytes());
+            m.extend_from_slice(&4u16.to_be_bytes());
+            m.extend_from_slice(ip);
+        }
+        m
+    }
+
+    #[test]
+    fn reads_question_tuple() {
+        let (name, qtype, qclass) = question(&query("a.b.example.com")).unwrap();
+        assert_eq!(name, "a.b.example.com");
+        assert_eq!((qtype, qclass), (TYPE_A, CLASS_IN));
+        assert!(question(b"short").is_none());
+    }
+
+    #[test]
+    fn min_ttl_picks_smallest() {
+        let m = response_with(
+            &query("example.com"),
+            &[([1, 2, 3, 4], 300), ([5, 6, 7, 8], 60)],
+        );
+        assert_eq!(min_ttl(&m), Some(60));
+        assert_eq!(min_ttl(&query("example.com")), None); // a query has no answers
     }
 
     #[test]

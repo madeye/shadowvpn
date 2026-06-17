@@ -279,6 +279,12 @@ server's masquerade matches with no client-side NAT. Direct (non-tunneled)
 traffic stays on the normal kernel path untouched, and every route added is
 removed again on exit.
 
+The proxy is built for low latency: answers are **cached** (TTL-respecting, like
+`dnsmasq`) so repeat lookups skip the upstream round-trip, and in chinadns mode
+the local and clean resolvers are queried concurrently but a **domestic answer
+returns immediately** rather than waiting for the slower tunneled upstream — so
+China sites resolve at local-DNS speed.
+
 <p align="center">
   <img src="docs/policy-routing.svg" alt="ShadowVPN client policy routing — control and data plane" width="100%">
 </p>
@@ -425,6 +431,7 @@ src/
     chnroute.rs   China IP range lookup
     geoip.rs      build the China set from a GeoLite2 .mmdb
     dns.rs        minimal DNS wire parsing
+    cache.rs      TTL-respecting DNS answer cache
     proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
     route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE)
     dnsconf.rs    point the system resolver at the proxy (networksetup / resolv.conf)
