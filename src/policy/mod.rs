@@ -5,9 +5,10 @@
 //! A small split-DNS [`proxy`] decides, per query, whether a name should be
 //! tunneled and hands the resolved addresses to a user-mode [`route`]r, which
 //! programs a host route for each one into the tun device using the OS's native
-//! routing socket (rtnetlink on Linux, `PF_ROUTE` on macOS). There is no
-//! dependency on `ipset`, `iptables`/nft, or `fwmark`, so it runs on **Linux and
-//! macOS** alike; direct traffic stays on the normal kernel path.
+//! routing interface (rtnetlink on Linux, `PF_ROUTE` on macOS, the IP Helper API
+//! on Windows). There is no dependency on `ipset`, `iptables`/nft, or `fwmark`,
+//! so it runs on **Linux, macOS, and Windows** alike; direct traffic stays on
+//! the normal kernel path.
 //!
 //! Two modes are offered (see [`Mode`]):
 //!
@@ -176,11 +177,12 @@ impl Drop for CacheGuard {
 /// for the clean DNS upstream so it is reached through the tunnel), and spawns
 /// the proxy on `dns_listen`. The returned [`PolicyHandle`] owns the teardown
 /// guard, so keep it alive for as long as policy routing should remain in
-/// effect. Works on Linux and macOS.
+/// effect. Works on Linux, macOS, and Windows.
 pub async fn spawn(
     cfg: &PolicyConfig,
     tun_name: &str,
     tun_ip: std::net::Ipv4Addr,
+    direct_src: std::net::IpAddr,
 ) -> anyhow::Result<PolicyHandle> {
     use anyhow::Context;
     use std::net::IpAddr;
@@ -250,8 +252,15 @@ pub async fn spawn(
         dns_cache.load(path);
     }
 
+    // Source addresses to bind upstream DNS queries to. On Windows, with the tun
+    // up, the OS otherwise mis-selects the tun as the source for the direct
+    // (domestic) query — sending it through the tunnel so the domestic resolver
+    // sees the server's foreign IP and returns foreign answers. Pinning the
+    // direct query to the physical source and the tunneled query to the tun
+    // address makes each path deterministic. Other platforms select correctly on
+    // their own, so they keep the unspecified defaults.
     let sink: Arc<dyn IpSink> = router.clone();
-    let resolver = Arc::new(Resolver::new(
+    let resolver = Resolver::new(
         cfg.mode,
         gfwlist,
         chnroute,
@@ -260,7 +269,10 @@ pub async fn spawn(
         cfg.dns_timeout,
         sink,
         Arc::clone(&dns_cache),
-    ));
+    );
+    #[cfg(windows)]
+    let resolver = resolver.with_bind_sources(direct_src, IpAddr::V4(tun_ip));
+    let resolver = Arc::new(resolver);
 
     let listener = tokio::net::UdpSocket::bind(cfg.dns_listen)
         .await
@@ -274,7 +286,7 @@ pub async fn spawn(
     // Point the system resolver at the proxy (and restore it on exit) unless the
     // operator opted out; otherwise just tell them how to do it themselves.
     let dns_guard = if cfg.set_dns {
-        dnsconf::apply(cfg.dns_listen.ip(), cfg.dns_listen.port())
+        dnsconf::apply(cfg.dns_listen.ip(), cfg.dns_listen.port(), direct_src)
             .context("configuring the system resolver")?
     } else {
         log::info!(

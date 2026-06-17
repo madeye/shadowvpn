@@ -55,3 +55,13 @@ env_logger = "0.11"
 maxminddb = "0.28.1"
 ipnetwork = "0.21.1"
 libc = "0.2.186"
+
+# Windows policy routing: program per-destination routes via the IP Helper API
+# (CreateIpForwardEntry2) and resolve the tun interface index — no `route.exe`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }

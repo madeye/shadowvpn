@@ -72,6 +72,38 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     let cipher = cfg.cipher;
     let master_key: Arc<[u8]> = Arc::from(cfg.master_key.into_boxed_slice());
 
+    // --- UDP socket ---------------------------------------------------------
+    // Bind to an ephemeral local port on the unspecified address, then
+    // `connect()` to the server so we can use send/recv (no per-call addr) and
+    // benefit from kernel-side source-address selection + ICMP error reporting.
+    //
+    // This MUST happen *before* the TUN device is brought up. On Windows the
+    // freshly-created Wintun adapter perturbs source-address selection, and a
+    // `connect()` issued while it is up fails with `WSAEHOSTUNREACH` even though
+    // the physical default route is unchanged. Connecting first resolves the
+    // route against the pristine table and pins the socket to the physical
+    // 5-tuple, so the tunnel coming up afterwards no longer affects it.
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind local UDP socket")?;
+    socket
+        .connect(&cfg.server)
+        .await
+        .with_context(|| format!("failed to connect UDP socket to server {}", cfg.server))?;
+    // The physical source address the OS chose to reach the server. Policy
+    // routing binds direct (domestic) DNS queries to it on Windows so they don't
+    // get mis-routed into the tunnel once it is up.
+    let direct_src = socket
+        .local_addr()
+        .map(|a| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let local_addr = socket
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    info!("UDP socket {local_addr} connected to server {}", cfg.server);
+    let socket = Arc::new(socket);
+
     // --- TUN device ---------------------------------------------------------
     let tun = TunDevice::create(&cfg.tun).with_context(|| {
         format!(
@@ -93,24 +125,6 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         cfg.tun.ip, cfg.tun.peer_ip, cfg.tun.netmask, cfg.tun.mtu
     );
 
-    // --- UDP socket ---------------------------------------------------------
-    // Bind to an ephemeral local port on the unspecified address, then
-    // `connect()` to the server so we can use send/recv (no per-call addr) and
-    // benefit from kernel-side source-address selection + ICMP error reporting.
-    let socket = UdpSocket::bind(("0.0.0.0", 0))
-        .await
-        .context("failed to bind local UDP socket")?;
-    socket
-        .connect(&cfg.server)
-        .await
-        .with_context(|| format!("failed to connect UDP socket to server {}", cfg.server))?;
-    let local_addr = socket
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-    info!("UDP socket {local_addr} connected to server {}", cfg.server);
-    let socket = Arc::new(socket);
-
     // --- Policy routing (optional) -----------------------------------------
     // In `gfwlist`/`chinadns` mode the client runs a split-DNS proxy and
     // programs per-destination routes into the tun (user-mode, via the OS
@@ -123,7 +137,7 @@ async fn run(cfg: ClientConfig) -> Result<()> {
             cfg.policy.mode.name()
         );
         Some(
-            shadowvpn::policy::spawn(&cfg.policy, &iface_name, cfg.tun.ip)
+            shadowvpn::policy::spawn(&cfg.policy, &iface_name, cfg.tun.ip, direct_src)
                 .await
                 .context("failed to start policy routing")?,
         )
@@ -396,7 +410,22 @@ fn print_routing_hint(tun: &TunConfig, server: &str) {
         info!("  sudo route -n add -net 128.0.0.0/1 {peer}");
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        info!("Windows (run in an elevated prompt):");
+        if let Some(ip) = server_ip {
+            info!("  :: keep the server reachable over your real link (replace GW):");
+            info!("  route add {ip} mask 255.255.255.255 <YOUR_DEFAULT_GW>");
+        } else {
+            info!("  :: first add a host route for the server's resolved IP via your real");
+            info!("  :: gateway, so encrypted UDP does not re-enter the tunnel.");
+        }
+        info!("  :: then route everything through the tunnel peer:");
+        info!("  route add 0.0.0.0 mask 128.0.0.0 {peer}");
+        info!("  route add 128.0.0.0 mask 128.0.0.0 {peer}");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = server_ip;
         info!("Add a host route to the server via your real gateway, then route the");
