@@ -18,7 +18,6 @@
 //! the [`RouteGuard`] is dropped.
 
 use std::collections::HashSet;
-use std::ffi::CString;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
@@ -40,13 +39,7 @@ pub struct TunRouter {
 impl TunRouter {
     /// Resolve the tun interface index and build a router for it.
     pub fn new(tun_name: &str, tun_ip: Ipv4Addr) -> io::Result<Self> {
-        let cname = CString::new(tun_name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tun name has a NUL byte"))?;
-        // SAFETY: `cname` is a valid NUL-terminated C string for the call.
-        let ifindex = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-        if ifindex == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let ifindex = imp::interface_index(tun_name)?;
         Ok(Self {
             ifindex,
             tun_ip,
@@ -116,6 +109,19 @@ impl Drop for RouteGuard {
 mod imp {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// Resolve an interface name to its kernel index.
+    pub fn interface_index(name: &str) -> io::Result<u32> {
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tun name has a NUL byte"))?;
+        // SAFETY: `cname` is a valid NUL-terminated C string for the call.
+        let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if idx == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(idx)
+        }
+    }
 
     // rtnetlink message-type and flag constants (from <linux/netlink.h> and
     // <linux/rtnetlink.h>); taken via libc where available.
@@ -319,6 +325,19 @@ mod imp {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    /// Resolve an interface name to its kernel index.
+    pub fn interface_index(name: &str) -> io::Result<u32> {
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tun name has a NUL byte"))?;
+        // SAFETY: `cname` is a valid NUL-terminated C string for the call.
+        let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if idx == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(idx)
+        }
+    }
+
     /// Add (or delete) a host route to `dst` via the tun interface.
     pub fn modify_route(
         ifindex: u32,
@@ -450,6 +469,13 @@ mod imp {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
 mod imp {
     use super::*;
+
+    pub fn interface_index(_name: &str) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "policy routing is not supported on this platform",
+        ))
+    }
 
     pub fn modify_route(
         _ifindex: u32,

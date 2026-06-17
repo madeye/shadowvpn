@@ -6,7 +6,9 @@ A UDP-based, pre-shared-key (PSK), user-mode VPN written in Rust on the
 ShadowVPN is a fixed point-to-point / multi-client tunnel. A TUN-based **client**
 reads IP packets from a virtual interface, encrypts each as a single UDP
 datagram, and sends it to the **server**; the server decrypts, routes, and
-tunnels return traffic back. It runs on macOS (utun) and Linux.
+tunnels return traffic back. It runs on macOS (utun) and Linux, and the client
+also builds on Windows (TUN via [Wintun](https://www.wintun.net/)) as a
+full-tunnel client — policy routing (below) is Linux/macOS only.
 
 The on-wire crypto matches the **shadowsocks.org AEAD UDP scheme** exactly, so
 the construction is spec-correct and interoperable, with one deliberate,

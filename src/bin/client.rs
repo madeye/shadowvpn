@@ -174,23 +174,49 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     };
     tokio::pin!(policy_fut);
 
-    // Catch termination signals so we exit the run loop *gracefully*: returning
-    // from `run` drops the policy handle, whose guards restore the system DNS and
-    // remove the tunnel routes. A bare process kill would skip that cleanup.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("installing SIGTERM handler")?;
-
     // Whichever arm fires first ends the client (a returning relay loop means a
     // fatal IO error; the keepalive loop only returns on a fatal send error; the
     // policy loop only returns on a fatal DNS-proxy error; a signal is a clean
-    // shutdown request).
+    // shutdown request). Exiting gracefully drops the policy handle, whose guards
+    // restore the system DNS, remove the tunnel routes, and save the cache.
     tokio::select! {
         r = up => propagate("tun->net", r),
         r = down => propagate("net->tun", r),
         r = keepalive => propagate("keepalive", r),
         r = &mut policy_fut => r,
-        _ = tokio::signal::ctrl_c() => { info!("received interrupt; shutting down"); Ok(()) }
-        _ = sigterm.recv() => { info!("received SIGTERM; shutting down"); Ok(()) }
+        _ = shutdown_signal() => { info!("received shutdown signal; shutting down"); Ok(()) }
+    }
+}
+
+/// Resolve when the OS asks the process to terminate (Ctrl-C / SIGTERM on Unix,
+/// Ctrl-C / close / shutdown on Windows), so the run loop can exit gracefully.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// See the Unix variant; on Windows there is no SIGTERM, so we watch the console
+/// control events instead.
+#[cfg(windows)]
+async fn shutdown_signal() {
+    use tokio::signal::windows;
+    let mut close = windows::ctrl_close().expect("install ctrl-close handler");
+    let mut shutdown = windows::ctrl_shutdown().expect("install ctrl-shutdown handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = close.recv() => {}
+        _ = shutdown.recv() => {}
     }
 }
 
