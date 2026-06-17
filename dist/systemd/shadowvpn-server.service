@@ -1,0 +1,30 @@
+# ShadowVPN server — systemd unit (Linux).
+#
+# Install:
+#   sudo install -Dm755 target/release/shadowvpn-server /usr/local/bin/shadowvpn-server
+#   sudo install -Dm600 server.json /etc/shadowvpn/server.json
+#   sudo cp dist/systemd/shadowvpn-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now shadowvpn-server
+#
+# Adjust the WAN interface (eth0) and tunnel subnet (10.9.0.0/24) below to match
+# your server.json. The ExecStartPre lines enable forwarding + NAT so tunneled
+# clients can reach the internet; they are idempotent and re-applied on boot.
+
+[Unit]
+Description=ShadowVPN server (UDP PSK user-mode VPN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+ExecStartPre=/sbin/sysctl -q -w net.ipv4.ip_forward=1
+ExecStartPre=/bin/sh -c 'iptables -t nat -C POSTROUTING -s 10.9.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o eth0 -j MASQUERADE'
+ExecStartPre=/bin/sh -c 'iptables -C FORWARD -s 10.9.0.0/24 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 10.9.0.0/24 -j ACCEPT'
+ExecStartPre=/bin/sh -c 'iptables -C FORWARD -d 10.9.0.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 10.9.0.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
+ExecStart=/usr/local/bin/shadowvpn-server -c /etc/shadowvpn/server.json
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

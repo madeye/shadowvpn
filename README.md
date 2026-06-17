@@ -260,6 +260,14 @@ sudo ./target/release/shadowvpn-client \
 Once the tunnel is up you can verify connectivity with a ping across the tunnel
 addresses, e.g. from the client `ping 10.9.0.1`.
 
+### Running as a service
+
+Example service definitions live in [`dist/`](dist/): **systemd** units for the
+Linux server and client, and a **launchd** daemon for the macOS client. See
+[`dist/README.md`](dist/README.md) for install steps. Stopping the client service
+is graceful — it restores the system resolver, removes the tunnel routes, and
+saves the DNS cache.
+
 ---
 
 ## Policy routing (gfwlist / chinadns) — client, Linux + macOS
@@ -450,6 +458,9 @@ src/
 docs/
   index.html      landing page (GitHub Pages)
   architecture.svg, wire.svg, policy-routing.svg   diagrams
+dist/
+  systemd/        Linux service units (server + client)
+  launchd/        macOS client daemon
 ```
 
 ---

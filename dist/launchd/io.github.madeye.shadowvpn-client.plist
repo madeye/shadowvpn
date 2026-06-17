@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ShadowVPN client - launchd daemon (macOS).
+
+  Runs as root (required to create the utun device and edit the routing table).
+
+  Install:
+    sudo install -Dm755 target/release/shadowvpn-client /usr/local/bin/shadowvpn-client
+    sudo mkdir -p /etc/shadowvpn && sudo cp client.json /etc/shadowvpn/client.json
+    sudo cp dist/launchd/io.github.madeye.shadowvpn-client.plist /Library/LaunchDaemons/
+    sudo launchctl load -w /Library/LaunchDaemons/io.github.madeye.shadowvpn-client.plist
+
+  Stop / uninstall (graceful: restores DNS, removes routes, saves the cache):
+    sudo launchctl unload -w /Library/LaunchDaemons/io.github.madeye.shadowvpn-client.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.madeye.shadowvpn-client</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/shadowvpn-client</string>
+        <string>-c</string>
+        <string>/etc/shadowvpn/client.json</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/shadowvpn-client.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/shadowvpn-client.log</string>
+</dict>
+</plist>
