@@ -1,0 +1,29 @@
+# ShadowVPN client — systemd unit (Linux).
+#
+# Install:
+#   sudo install -Dm755 target/release/shadowvpn-client /usr/local/bin/shadowvpn-client
+#   sudo install -Dm600 client.json /etc/shadowvpn/client.json
+#   sudo cp dist/systemd/shadowvpn-client.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now shadowvpn-client
+#
+# In gfwlist/chinadns mode the client points the system resolver at its split-DNS
+# proxy and installs per-destination routes; on stop it restores both. systemd's
+# default stop signal is SIGTERM, which the client handles for a clean shutdown
+# (DNS restored, routes removed, cache saved) — so `systemctl stop` is graceful.
+
+[Unit]
+Description=ShadowVPN client (policy routing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/shadowvpn-client -c /etc/shadowvpn/client.json
+Restart=on-failure
+RestartSec=2
+# Give the graceful shutdown (DNS/route restore, cache save) time to run.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
