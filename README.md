@@ -7,8 +7,8 @@ ShadowVPN is a fixed point-to-point / multi-client tunnel. A TUN-based **client*
 reads IP packets from a virtual interface, encrypts each as a single UDP
 datagram, and sends it to the **server**; the server decrypts, routes, and
 tunnels return traffic back. It runs on macOS (utun) and Linux, and the client
-also builds on Windows (TUN via [Wintun](https://www.wintun.net/)) as a
-full-tunnel client — policy routing (below) is Linux/macOS only.
+also runs on Windows (TUN via [Wintun](https://www.wintun.net/)), including
+policy routing (below).
 
 The on-wire crypto matches the **shadowsocks.org AEAD UDP scheme** exactly, so
 the construction is spec-correct and interoperable, with one deliberate,
@@ -205,7 +205,7 @@ pushes to `main` and on manual dispatch (it depends on external connectivity).
 
 ### Policy-routing test (Docker)
 
-Exercises [policy routing](#policy-routing-gfwlist--chinadns--client-linux-only)
+Exercises [policy routing](#policy-routing-gfwlist--chinadns--client-linux--macos--windows)
 end to end. The topology puts a source-IP echo server behind the tunnel and
 another on the LAN: a tunneled request shows up as the *server's* address, a
 direct one as the *client's*, so the two paths are unambiguous. It verifies that
@@ -272,7 +272,7 @@ saves the DNS cache.
 
 ---
 
-## Policy routing (gfwlist / chinadns) — client, Linux + macOS
+## Policy routing (gfwlist / chinadns) — client, Linux + macOS + Windows
 
 By default the client is a *full* tunnel: every packet that reaches the TUN is
 encrypted to the server, and what you route into the TUN is your business (see
@@ -365,11 +365,12 @@ Relevant config / flags (all client-only; CLI overrides JSON):
   enumerated and merged into the China set, so you don't have to maintain a CIDR
   file. Takes precedence over `--chnroute` when both are given.
 
-This needs root (to create the tun and edit the routing table) and runs on
-**Linux and macOS**; routes are programmed directly via the routing socket, so no
-`ipset`/`iptables` binaries are involved. The `docker/run-e2e-policy.sh` test
-exercises both modes end to end. (The server still needs forwarding + NAT so
-tunneled traffic can egress — see below.)
+This needs root / Administrator (to create the tun and edit the routing table)
+and runs on **Linux, macOS, and Windows**; routes are programmed directly via the
+OS routing interface (rtnetlink, `PF_ROUTE`, or the Windows IP Helper API), so no
+`ipset`/`iptables`/`route`/`netsh` binaries are involved for routing. The
+`docker/run-e2e-policy.sh` test exercises both modes end to end. (The server still
+needs forwarding + NAT so tunneled traffic can egress — see below.)
 
 ---
 

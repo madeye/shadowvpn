@@ -12,10 +12,11 @@
 //! path, so no user-mode NAT or packet capture is needed. Only the routing table
 //! is modified, and only for addresses we explicitly tunnel.
 //!
-//! Routes are programmed with the OS's native routing socket — `rtnetlink` on
-//! Linux, `PF_ROUTE` on macOS/BSD — so there is no dependency on `ip`, `ipset`,
-//! `iptables`, or `route`. Every address added is tracked and removed again when
-//! the [`RouteGuard`] is dropped.
+//! Routes are programmed with the OS's native routing interface — `rtnetlink`
+//! on Linux, `PF_ROUTE` on macOS/BSD, and the IP Helper API
+//! (`CreateIpForwardEntry2`) on Windows — so there is no dependency on `ip`,
+//! `ipset`, `iptables`, or `route`/`netsh`. Every address added is tracked and
+//! removed again when the [`RouteGuard`] is dropped.
 
 use std::collections::HashSet;
 use std::io;
@@ -464,9 +465,101 @@ mod imp {
 }
 
 // ---------------------------------------------------------------------------
+// Windows: per-destination routes via the IP Helper API (CreateIpForwardEntry2).
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+mod imp {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
+        DeleteIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    /// Resolve a Windows interface alias (e.g. `tun0`) to its interface index.
+    pub fn interface_index(name: &str) -> io::Result<u32> {
+        // The IP Helper API takes the alias as a NUL-terminated UTF-16 string.
+        let wide: Vec<u16> = std::ffi::OsStr::new(name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: `wide` is a valid NUL-terminated wide string; `luid` is a
+        // writable, properly-aligned out-parameter for the duration of the call.
+        let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+        let rc = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) };
+        if rc != NO_ERROR {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+
+        // SAFETY: `luid` is initialized above; `index` is a writable out-param.
+        let mut index: u32 = 0;
+        let rc = unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) };
+        if rc != NO_ERROR {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        Ok(index)
+    }
+
+    /// Add (or delete) an on-link host route to `dst` via the tun interface.
+    ///
+    /// The route's next hop is left as `0.0.0.0` (on-link), so Windows sends
+    /// matching traffic straight out the tun device and selects the tun's own
+    /// address as the source — mirroring the Linux/macOS interface routes.
+    pub fn modify_route(
+        ifindex: u32,
+        tun_ip: Ipv4Addr,
+        dst: Ipv4Addr,
+        add: bool,
+    ) -> io::Result<()> {
+        let _ = tun_ip; // on-link route: Windows picks the tun's source itself
+
+        // SAFETY: an all-zero MIB_IPFORWARD_ROW2 is a valid (if empty) row;
+        // InitializeIpForwardEntry then fills in the documented field defaults.
+        let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+        unsafe { InitializeIpForwardEntry(&mut row) };
+
+        row.InterfaceIndex = ifindex;
+        row.DestinationPrefix.PrefixLength = 32;
+        row.Metric = 0;
+
+        // SAFETY: we write the IPv4 arm of the `SOCKADDR_INET` unions for both
+        // the destination prefix and the (on-link, all-zero) next hop. The
+        // structs are local and fully owned here.
+        unsafe {
+            let dest = &mut row.DestinationPrefix.Prefix.Ipv4;
+            dest.sin_family = AF_INET;
+            dest.sin_addr.S_un.S_addr = u32::from_ne_bytes(dst.octets());
+            row.NextHop.Ipv4.sin_family = AF_INET;
+        }
+
+        // SAFETY: `row` is a fully-initialized MIB_IPFORWARD_ROW2; the API only
+        // reads from it. The returned WIN32_ERROR is inspected below.
+        let rc = if add {
+            unsafe { CreateIpForwardEntry2(&row) }
+        } else {
+            unsafe { DeleteIpForwardEntry2(&row) }
+        };
+
+        match rc {
+            NO_ERROR => Ok(()),
+            // Re-adding an existing route / deleting a missing one is benign,
+            // matching the macOS EEXIST/ESRCH handling.
+            ERROR_OBJECT_ALREADY_EXISTS if add => Ok(()),
+            ERROR_NOT_FOUND if !add => Ok(()),
+            other => Err(io::Error::from_raw_os_error(other as i32)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Other platforms: policy routing is unsupported.
 // ---------------------------------------------------------------------------
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 mod imp {
     use super::*;
 

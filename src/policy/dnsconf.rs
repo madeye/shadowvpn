@@ -9,6 +9,9 @@
 //!   remembering and restoring the service's previous servers.
 //! * **Linux** — rewrite `/etc/resolv.conf` to `nameserver <proxy-ip>`,
 //!   remembering the previous file (or symlink) and restoring it.
+//! * **Windows** — `netsh interface ipv4 set dnsservers <primary-iface> static
+//!   <proxy-ip>`, remembering whether the interface used DHCP or a static list
+//!   and restoring it.
 //!
 //! The OS resolver can only point at an address, not a port, so this is only
 //! applied when the proxy listens on port 53; otherwise it is skipped with a
@@ -33,10 +36,14 @@ impl Drop for DnsGuard {
 
 /// Point the system resolver at `proxy` (the proxy's listen address).
 ///
+/// `direct_src` is the host's physical source address (the local IP of the
+/// socket connected to the server); on Windows it identifies the interface whose
+/// DNS to reconfigure. Ignored on other platforms.
+///
 /// Returns `Ok(None)` (with a warning) if the port is not 53, since the OS
 /// resolver cannot target a custom port. On success the returned guard restores
 /// the prior configuration on drop.
-pub fn apply(proxy: IpAddr, port: u16) -> Result<Option<DnsGuard>> {
+pub fn apply(proxy: IpAddr, port: u16, direct_src: IpAddr) -> Result<Option<DnsGuard>> {
     if port != 53 {
         warn!(
             "not setting the system resolver automatically: proxy port is {port}, but the OS \
@@ -45,7 +52,7 @@ pub fn apply(proxy: IpAddr, port: u16) -> Result<Option<DnsGuard>> {
         );
         return Ok(None);
     }
-    let restore = imp::apply(proxy)?;
+    let restore = imp::apply(proxy, direct_src)?;
     info!("system resolver pointed at {proxy} (restored automatically on exit)");
     Ok(Some(DnsGuard { restore }))
 }
@@ -65,7 +72,8 @@ mod imp {
         prev: Vec<String>,
     }
 
-    pub fn apply(proxy: IpAddr) -> Result<Restore> {
+    pub fn apply(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
+        let _ = direct_src; // macOS finds the primary service via the route table
         let service = primary_service()
             .context("could not determine the primary network service to configure DNS on")?;
         let prev = get_dns(&service);
@@ -195,7 +203,8 @@ mod imp {
         Absent,
     }
 
-    pub fn apply(proxy: IpAddr) -> Result<Restore> {
+    pub fn apply(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
+        let _ = direct_src; // Linux rewrites the global /etc/resolv.conf
         let restore = match fs::symlink_metadata(PATH) {
             Ok(m) if m.file_type().is_symlink() => {
                 let target = fs::read_link(PATH).context("reading resolv.conf symlink")?;
@@ -229,15 +238,208 @@ mod imp {
 }
 
 // ---------------------------------------------------------------------------
+// Windows: point the primary interface's resolver at the proxy via `netsh`.
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+mod imp {
+    use super::*;
+    use anyhow::{bail, Context};
+    use std::io;
+    use std::process::Command;
+
+    /// What to put back when we exit: either the interface used DHCP-assigned
+    /// DNS, or it had this explicit list of static servers.
+    pub enum Restore {
+        Dhcp { alias: String },
+        Static { alias: String, servers: Vec<String> },
+    }
+
+    pub fn apply(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
+        let alias = primary_alias(direct_src)
+            .context("could not determine the primary network interface to configure DNS on")?;
+        let restore = read_current(&alias);
+        set_static(&alias, &[proxy.to_string()])?;
+        flush();
+        Ok(restore)
+    }
+
+    pub fn restore(r: &Restore) {
+        match r {
+            Restore::Dhcp { alias } => {
+                let _ = netsh(&[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "dnsservers",
+                    &name_arg(alias),
+                    "dhcp",
+                ]);
+            }
+            Restore::Static { alias, servers } => {
+                let _ = set_static(alias, servers);
+            }
+        }
+        flush();
+    }
+
+    /// The alias of the interface to reconfigure DNS on.
+    ///
+    /// Preferred: the interface that owns `direct_src` (the physical source
+    /// address used to reach the server) — deterministic and unaffected by the
+    /// route-table churn that accompanies the tun coming up. Falls back to the
+    /// interface carrying the default route if `direct_src` can't be matched.
+    fn primary_alias(direct_src: IpAddr) -> Option<String> {
+        if !direct_src.is_unspecified() {
+            if let Some(alias) = interface_for_ip(direct_src) {
+                return Some(alias);
+            }
+        }
+        default_route_alias()
+    }
+
+    /// Find the interface whose configured address is `ip` by scanning
+    /// `netsh interface ipv4 show addresses` (no PowerShell dependency). Output:
+    ///   Configuration for interface "Ethernet"
+    ///       IP Address:                           192.168.0.109
+    fn interface_for_ip(ip: IpAddr) -> Option<String> {
+        let out = netsh(&["interface", "ipv4", "show", "addresses"]).ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let want = ip.to_string();
+        let mut current: Option<String> = None;
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("Configuration for interface ") {
+                current = Some(rest.trim().trim_matches('"').to_string());
+            } else if t.split_whitespace().any(|tok| tok == want) {
+                if let Some(name) = current.as_ref() {
+                    return Some(name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// The alias of the interface carrying the (lowest-metric) default route.
+    fn default_route_alias() -> Option<String> {
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | \
+                 Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty InterfaceAlias",
+            ])
+            .output()
+            .ok()?;
+        let alias = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if alias.is_empty() {
+            None
+        } else {
+            Some(alias)
+        }
+    }
+
+    /// Inspect an interface's current IPv4 DNS configuration so it can be
+    /// restored later: DHCP, or a static list of servers.
+    fn read_current(alias: &str) -> Restore {
+        let out = netsh(&["interface", "ipv4", "show", "dnsservers", &name_arg(alias)]);
+        let text = out
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+
+        // netsh prints "DNS servers configured through DHCP" for DHCP, or
+        // "Statically Configured DNS Servers". The first server shares the label
+        // line and the rest are indented one per line, so scan every whitespace
+        // token for IPs rather than parsing whole lines.
+        if text.contains("through DHCP") {
+            return Restore::Dhcp {
+                alias: alias.to_string(),
+            };
+        }
+        let servers: Vec<String> = text
+            .split_whitespace()
+            .filter_map(|tok| tok.parse::<IpAddr>().ok().map(|ip| ip.to_string()))
+            .collect();
+        if servers.is_empty() {
+            // No static servers and not flagged DHCP: safest is to clear to DHCP.
+            Restore::Dhcp {
+                alias: alias.to_string(),
+            }
+        } else {
+            Restore::Static {
+                alias: alias.to_string(),
+                servers,
+            }
+        }
+    }
+
+    /// Replace an interface's IPv4 DNS servers with `servers` (first = primary).
+    fn set_static(alias: &str, servers: &[String]) -> Result<()> {
+        let (first, rest) = servers
+            .split_first()
+            .context("refusing to set an empty DNS server list")?;
+        run_checked(&[
+            "interface",
+            "ipv4",
+            "set",
+            "dnsservers",
+            &name_arg(alias),
+            "static",
+            first,
+            "primary",
+            "validate=no",
+        ])?;
+        for (i, srv) in rest.iter().enumerate() {
+            run_checked(&[
+                "interface",
+                "ipv4",
+                "add",
+                "dnsservers",
+                &name_arg(alias),
+                srv,
+                &format!("index={}", i + 2),
+                "validate=no",
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// `name="<alias>"` argument for netsh (quoting handled by the OS, not a shell).
+    fn name_arg(alias: &str) -> String {
+        format!("name={alias}")
+    }
+
+    fn netsh(args: &[&str]) -> io::Result<std::process::Output> {
+        Command::new("netsh").args(args).output()
+    }
+
+    fn run_checked(args: &[&str]) -> Result<()> {
+        let out = netsh(args).context("running netsh")?;
+        if !out.status.success() {
+            bail!(
+                "netsh {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn flush() {
+        let _ = Command::new("ipconfig").arg("/flushdns").status();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Other platforms: unsupported.
 // ---------------------------------------------------------------------------
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 mod imp {
     use super::*;
 
     pub struct Restore;
 
-    pub fn apply(_proxy: IpAddr) -> Result<Restore> {
+    pub fn apply(_proxy: IpAddr, _direct_src: IpAddr) -> Result<Restore> {
         anyhow::bail!("automatic DNS configuration is not supported on this platform")
     }
 

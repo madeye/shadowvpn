@@ -42,7 +42,7 @@ jobs:
   # Windows build (x86_64-pc-windows-msvc): the client/server compile and the
   # unit tests pass. Confirms portability; full runtime testing on Windows is
   # done separately. The TUN layer uses Wintun (tun-rs); policy routing is
-  # Linux/macOS only and compiles to an "unsupported" stub on Windows.
+  # supported on Windows too (routes via the IP Helper API, DNS via netsh).
   build-windows:
     name: windows build
     runs-on: windows-latest

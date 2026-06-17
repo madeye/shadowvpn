@@ -22,7 +22,7 @@
 //! Adding addresses to the route set is abstracted behind [`IpSink`] so the
 //! routing logic can be unit-tested without root.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,6 +86,14 @@ pub struct Resolver {
     timeout: Duration,
     sink: Arc<dyn IpSink>,
     cache: Arc<cache::DnsCache>,
+    /// Source address to bind direct (local-upstream) queries to, and the source
+    /// for tunneled (remote-upstream) queries. Defaults to unspecified, letting
+    /// the OS choose. On Windows these are pinned to the physical and tun
+    /// addresses respectively, because with the tun up the OS otherwise
+    /// mis-selects the tun as the source for the direct query (sending the
+    /// domestic lookup through the tunnel, so it returns foreign answers).
+    local_bind: IpAddr,
+    remote_bind: IpAddr,
 }
 
 impl Resolver {
@@ -112,7 +120,19 @@ impl Resolver {
             timeout,
             sink,
             cache,
+            local_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            remote_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         }
+    }
+
+    /// Pin the source addresses used for direct (`local`) and tunneled (`remote`)
+    /// upstream queries. Needed on Windows so the direct query egresses the
+    /// physical link rather than being mis-routed through the tun; elsewhere the
+    /// defaults (unspecified) let the OS choose.
+    pub fn with_bind_sources(mut self, local_bind: IpAddr, remote_bind: IpAddr) -> Self {
+        self.local_bind = local_bind;
+        self.remote_bind = remote_bind;
+        self
     }
 
     /// Resolve one raw DNS query, returning the raw response to relay back, or
@@ -150,7 +170,12 @@ impl Resolver {
     async fn decide_gfwlist(&self, query: &[u8], name: Option<&str>) -> Option<Decided> {
         let tunnel = name.map(|n| self.gfwlist.matches(n)).unwrap_or(false);
         let upstream = if tunnel { self.remote } else { self.local };
-        let response = match query_upstream(upstream, query, self.timeout).await {
+        let bind = if tunnel {
+            self.remote_bind
+        } else {
+            self.local_bind
+        };
+        let response = match query_upstream(upstream, query, self.timeout, bind).await {
             Ok(r) => r,
             Err(e) => {
                 debug!("gfwlist: upstream {upstream} failed for {name:?}: {e}");
@@ -177,11 +202,17 @@ impl Resolver {
         // local query, but don't block on it unless we actually need it.
         let remote_query = query.to_vec();
         let remote = self.remote;
+        let remote_bind = self.remote_bind;
         let timeout = self.timeout;
-        let remote_task =
-            tokio::spawn(async move { query_upstream(remote, &remote_query, timeout).await.ok() });
+        let remote_task = tokio::spawn(async move {
+            query_upstream(remote, &remote_query, timeout, remote_bind)
+                .await
+                .ok()
+        });
 
-        let local_res = query_upstream(self.local, query, self.timeout).await.ok();
+        let local_res = query_upstream(self.local, query, self.timeout, self.local_bind)
+            .await
+            .ok();
         let local_ips = local_res.as_deref().map(dns::a_records).unwrap_or_default();
 
         // Domestic: trust the local answer and drop the in-flight clean query.
@@ -215,8 +246,13 @@ impl Resolver {
 
 /// Send a query to one upstream over a fresh ephemeral UDP socket and return the
 /// raw response, bounded by `timeout`.
-async fn query_upstream(server: SocketAddr, query: &[u8], timeout: Duration) -> Result<Vec<u8>> {
-    let bind: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
+async fn query_upstream(
+    server: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+    bind_src: IpAddr,
+) -> Result<Vec<u8>> {
+    let bind: SocketAddr = (bind_src, 0).into();
     let sock = UdpSocket::bind(bind)
         .await
         .context("bind upstream DNS socket")?;
@@ -234,18 +270,66 @@ async fn query_upstream(server: SocketAddr, query: &[u8], timeout: Duration) -> 
     Ok(buf)
 }
 
+/// Clear the Windows `SIO_UDP_CONNRESET` behavior on a UDP socket.
+///
+/// By default Windows reports a previously-sent datagram's ICMP "port
+/// unreachable" as a `WSAECONNRESET` error on the socket's next receive. For a
+/// DNS server socket that talks to many short-lived clients this is spurious and
+/// would otherwise kill the receive loop. Best-effort: failure is non-fatal
+/// because the receive loop also tolerates the error.
+#[cfg(windows)]
+fn disable_udp_conn_reset(sock: &UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::WSAIoctl;
+
+    // SIO_UDP_CONNRESET (0x9800000C) takes a 4-byte BOOL: FALSE disables it.
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    let disable: u32 = 0;
+    let mut returned: u32 = 0;
+
+    // SAFETY: `sock` is a valid bound UDP socket for the duration of the call;
+    // the control code reads a 4-byte input and writes no output buffer.
+    let ret = unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as _,
+            SIO_UDP_CONNRESET,
+            &disable as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if ret != 0 {
+        debug!("WSAIoctl(SIO_UDP_CONNRESET) failed; relying on recv-loop fallback");
+    }
+}
+
 /// Run the proxy: receive queries on `listener` and answer each with `resolver`.
 ///
 /// Each query is handled in its own task so a slow upstream never blocks others.
 /// Returns only on a fatal error reading the listening socket.
 pub async fn serve(listener: UdpSocket, resolver: Arc<Resolver>) -> Result<()> {
     let listener = Arc::new(listener);
+    // On Windows a UDP socket otherwise surfaces a prior ICMP port-unreachable as
+    // a fatal connection-reset on the *next* recv; suppress that for the listener.
+    #[cfg(windows)]
+    disable_udp_conn_reset(&listener);
     let mut buf = vec![0u8; MAX_DNS_MSG];
     loop {
-        let (n, client) = listener
-            .recv_from(&mut buf)
-            .await
-            .context("DNS proxy recv_from failed")?;
+        let (n, client) = match listener.recv_from(&mut buf).await {
+            Ok(v) => v,
+            // Defensive fallback in case a connection-reset slips through (see
+            // `disable_udp_conn_reset`): it is spurious for a UDP listener, so
+            // log and keep serving rather than tearing the proxy down.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                debug!("DNS proxy: ignoring spurious connection-reset on recv");
+                continue;
+            }
+            Err(e) => return Err(e).context("DNS proxy recv_from failed"),
+        };
         let query = buf[..n].to_vec();
         let resolver = Arc::clone(&resolver);
         let listener = Arc::clone(&listener);
