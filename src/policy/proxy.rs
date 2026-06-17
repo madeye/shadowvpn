@@ -85,12 +85,14 @@ pub struct Resolver {
     remote: SocketAddr,
     timeout: Duration,
     sink: Arc<dyn IpSink>,
-    cache: cache::DnsCache,
+    cache: Arc<cache::DnsCache>,
 }
 
 impl Resolver {
     /// Build a resolver. `gfwlist` is only consulted in gfwlist mode and
     /// `chnroute` only in chinadns mode; pass empty defaults for the unused one.
+    /// `cache` is shared so it can be pre-loaded and persisted by the caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mode: Mode,
         gfwlist: GfwList,
@@ -99,6 +101,7 @@ impl Resolver {
         remote: SocketAddr,
         timeout: Duration,
         sink: Arc<dyn IpSink>,
+        cache: Arc<cache::DnsCache>,
     ) -> Self {
         Self {
             mode,
@@ -108,7 +111,7 @@ impl Resolver {
             remote,
             timeout,
             sink,
-            cache: cache::DnsCache::new(),
+            cache,
         }
     }
 
@@ -259,6 +262,27 @@ pub async fn serve(listener: UdpSocket, resolver: Arc<Resolver>) -> Result<()> {
     }
 }
 
+/// Resolve `domains` through `resolver` to pre-fill the cache (and pre-install
+/// routes for tunneled ones) so the first real lookup of a common domain is hot.
+///
+/// Runs in small concurrent batches and ignores individual failures; intended to
+/// be spawned in the background at startup.
+pub async fn prewarm(resolver: Arc<Resolver>, domains: Vec<String>) {
+    let total = domains.len();
+    for batch in domains.chunks(8) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for (i, domain) in batch.iter().enumerate() {
+            let resolver = Arc::clone(&resolver);
+            let query = dns::build_query(i as u16 + 1, domain);
+            handles.push(tokio::spawn(async move { resolver.resolve(&query).await }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+    debug!("pre-warmed {total} domains into the DNS cache");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +358,7 @@ mod tests {
             remote,
             Duration::from_secs(2),
             sink.clone(),
+            Arc::new(cache::DnsCache::new()),
         );
 
         // Matched: goes to remote, address tunneled.
@@ -366,6 +391,7 @@ mod tests {
             mock_upstream(vec![real_ip]).await,
             Duration::from_secs(2),
             sink.clone(),
+            Arc::new(cache::DnsCache::new()),
         );
         let resp = r_dom.resolve(&query("baidu.cn")).await.unwrap();
         assert_eq!(dns::a_records(&resp), vec![china_ip]);
@@ -380,6 +406,7 @@ mod tests {
             mock_upstream(vec![real_ip]).await,
             Duration::from_secs(2),
             sink.clone(),
+            Arc::new(cache::DnsCache::new()),
         );
         let resp = r_blk.resolve(&query("blocked.com")).await.unwrap();
         assert_eq!(dns::a_records(&resp), vec![real_ip]);
@@ -416,6 +443,7 @@ mod tests {
             remote,
             Duration::from_secs(2),
             sink.clone(),
+            Arc::new(cache::DnsCache::new()),
         );
         // First lookup hits the (counting) upstream -> 10.0.0.1.
         let first = r.resolve(&query("www.blocked.com")).await.unwrap();
@@ -440,6 +468,7 @@ mod tests {
             dead,
             Duration::from_secs(30), // long: proves we don't block on `dead`
             sink.clone(),
+            Arc::new(cache::DnsCache::new()),
         );
         // If the resolver wrongly waited for the dead remote it would take ~30s;
         // a 2s bound proves the early return on a domestic answer.

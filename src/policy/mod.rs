@@ -81,6 +81,40 @@ pub enum PolicyError {
     UnknownMode(String),
 }
 
+/// Common (mostly outside-China) domains pre-resolved on startup so their first
+/// real lookup is served from cache and their routes are pre-installed.
+pub const DEFAULT_PREWARM: &[&str] = &[
+    "google.com",
+    "www.google.com",
+    "www.gstatic.com",
+    "fonts.gstatic.com",
+    "ssl.gstatic.com",
+    "www.googleapis.com",
+    "ajax.googleapis.com",
+    "accounts.google.com",
+    "www.youtube.com",
+    "youtube.com",
+    "i.ytimg.com",
+    "googlevideo.com",
+    "twitter.com",
+    "x.com",
+    "abs.twimg.com",
+    "pbs.twimg.com",
+    "www.facebook.com",
+    "static.xx.fbcdn.net",
+    "www.instagram.com",
+    "www.wikipedia.org",
+    "en.wikipedia.org",
+    "upload.wikimedia.org",
+    "github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "telegram.org",
+    "web.telegram.org",
+    "www.reddit.com",
+    "duckduckgo.com",
+];
+
 /// Fully resolved policy-routing configuration for the client.
 #[derive(Debug, Clone)]
 pub struct PolicyConfig {
@@ -104,6 +138,10 @@ pub struct PolicyConfig {
     /// Whether to point the system resolver at the proxy automatically (and
     /// restore it on exit). Only effective when `dns_listen` uses port 53.
     pub set_dns: bool,
+    /// Domains to pre-resolve into the cache on startup (empty = disabled).
+    pub prewarm: Vec<String>,
+    /// Where to persist the DNS cache across restarts (`None` = don't persist).
+    pub cache_file: Option<PathBuf>,
     /// Per-query upstream timeout.
     pub dns_timeout: Duration,
 }
@@ -116,6 +154,20 @@ pub struct PolicyHandle {
     _guard: route::RouteGuard,
     /// Restores the system resolver on drop (when auto-DNS was applied).
     _dns_guard: Option<dnsconf::DnsGuard>,
+    /// Persists the DNS cache to disk on drop (when a cache file is configured).
+    _cache_guard: Option<CacheGuard>,
+}
+
+/// Saves the shared DNS cache to disk when dropped.
+struct CacheGuard {
+    cache: std::sync::Arc<cache::DnsCache>,
+    path: PathBuf,
+}
+
+impl Drop for CacheGuard {
+    fn drop(&mut self) {
+        self.cache.save(&self.path);
+    }
 }
 
 /// Start policy routing and the split-DNS proxy.
@@ -192,6 +244,12 @@ pub async fn spawn(
             .with_context(|| format!("routing clean DNS upstream {v4} through the tunnel"))?;
     }
 
+    // Shared DNS cache, pre-loaded from disk if persistence is enabled.
+    let dns_cache = Arc::new(cache::DnsCache::new());
+    if let Some(path) = cfg.cache_file.as_ref() {
+        dns_cache.load(path);
+    }
+
     let sink: Arc<dyn IpSink> = router.clone();
     let resolver = Arc::new(Resolver::new(
         cfg.mode,
@@ -201,6 +259,7 @@ pub async fn spawn(
         cfg.dns_remote,
         cfg.dns_timeout,
         sink,
+        Arc::clone(&dns_cache),
     ));
 
     let listener = tokio::net::UdpSocket::bind(cfg.dns_listen)
@@ -226,11 +285,23 @@ pub async fn spawn(
         None
     };
 
+    // Pre-warm common domains in the background so their first real lookup is hot.
+    if !cfg.prewarm.is_empty() {
+        log::info!("pre-warming {} common domains", cfg.prewarm.len());
+        tokio::spawn(proxy::prewarm(Arc::clone(&resolver), cfg.prewarm.clone()));
+    }
+
+    let cache_guard = cfg.cache_file.as_ref().map(|path| CacheGuard {
+        cache: Arc::clone(&dns_cache),
+        path: path.clone(),
+    });
+
     let task = tokio::spawn(proxy::serve(listener, resolver));
     Ok(PolicyHandle {
         task,
         _guard: route::RouteGuard::new(router),
         _dns_guard: dns_guard,
+        _cache_guard: cache_guard,
     })
 }
 
