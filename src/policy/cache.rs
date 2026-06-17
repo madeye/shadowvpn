@@ -13,8 +13,12 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use log::{debug, info, warn};
+use serde::{Deserialize, Serialize};
 
 use super::dns;
 
@@ -31,6 +35,19 @@ struct Entry {
     response: Vec<u8>,
     tunnel_ips: Vec<Ipv4Addr>,
     expires: Instant,
+}
+
+/// One cache entry as written to / read from the on-disk snapshot. Expiry is
+/// stored as remaining seconds (wall-clock) since `Instant` is not portable
+/// across process restarts.
+#[derive(Serialize, Deserialize)]
+struct SnapEntry {
+    name: String,
+    qtype: u16,
+    qclass: u16,
+    response: Vec<u8>,
+    tunnel_ips: Vec<Ipv4Addr>,
+    ttl: u64,
 }
 
 /// A thread-safe DNS answer cache.
@@ -94,6 +111,91 @@ impl DnsCache {
             },
         );
     }
+
+    /// Load entries from a JSON snapshot file, dropping any that have already
+    /// expired. Returns the number of live entries loaded. A missing or
+    /// unreadable file is not an error (returns 0).
+    pub fn load(&self, path: impl AsRef<Path>) -> usize {
+        let path = path.as_ref();
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("no DNS cache to load from {}: {e}", path.display());
+                return 0;
+            }
+        };
+        let snapshot: Vec<SnapEntry> = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("ignoring corrupt DNS cache {}: {e}", path.display());
+                return 0;
+            }
+        };
+        let now = Instant::now();
+        let mut map = self.map.lock().unwrap();
+        let mut loaded = 0;
+        for e in snapshot {
+            if e.ttl == 0 {
+                continue;
+            }
+            map.insert(
+                (e.name, e.qtype, e.qclass),
+                Entry {
+                    response: e.response,
+                    tunnel_ips: e.tunnel_ips,
+                    expires: now + Duration::from_secs(e.ttl),
+                },
+            );
+            loaded += 1;
+        }
+        if loaded > 0 {
+            info!("loaded {loaded} cached DNS answers from {}", path.display());
+        }
+        loaded
+    }
+
+    /// Write all unexpired entries to `path` as a JSON snapshot (creating parent
+    /// directories as needed). Best-effort: logs on failure.
+    pub fn save(&self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let now = Instant::now();
+        let snapshot: Vec<SnapEntry> = {
+            let map = self.map.lock().unwrap();
+            map.iter()
+                .filter_map(|((name, qtype, qclass), e)| {
+                    let ttl = e.expires.saturating_duration_since(now).as_secs();
+                    if ttl == 0 {
+                        return None;
+                    }
+                    Some(SnapEntry {
+                        name: name.clone(),
+                        qtype: *qtype,
+                        qclass: *qclass,
+                        response: e.response.clone(),
+                        tunnel_ips: e.tunnel_ips.clone(),
+                        ttl,
+                    })
+                })
+                .collect()
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    warn!("failed to save DNS cache to {}: {e}", path.display());
+                } else {
+                    info!(
+                        "saved {} cached DNS answers to {}",
+                        snapshot.len(),
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => warn!("failed to serialize DNS cache: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +252,35 @@ mod tests {
         c.put(&qa, &response(&qa, [1, 1, 1, 1], 300), &[]);
         assert!(c.get(&query(2, "a.com")).is_some());
         assert!(c.get(&query(3, "b.com")).is_none());
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let c = DnsCache::new();
+        let q = query(1, "persist.example");
+        c.put(
+            &q,
+            &response(&q, [9, 9, 9, 9], 300),
+            &[Ipv4Addr::new(9, 9, 9, 9)],
+        );
+        let path = std::env::temp_dir().join(format!("svpn-cache-{}.json", std::process::id()));
+
+        c.save(&path);
+        let loaded = DnsCache::new();
+        assert_eq!(loaded.load(&path), 1);
+
+        let (resp, ips) = loaded
+            .get(&query(2, "persist.example"))
+            .expect("hit after load");
+        assert_eq!(dns::a_records(&resp), vec![Ipv4Addr::new(9, 9, 9, 9)]);
+        assert_eq!(ips, vec![Ipv4Addr::new(9, 9, 9, 9)]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_missing_file_is_harmless() {
+        let c = DnsCache::new();
+        assert_eq!(c.load("/nonexistent/shadowvpn/cache.json"), 0);
     }
 
     #[test]

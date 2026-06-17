@@ -18,6 +18,27 @@ const TYPE_A: u16 = 1;
 /// RR CLASS for the Internet (`IN`).
 const CLASS_IN: u16 = 1;
 
+/// Build a standard recursive `A`/`IN` query for `name` with transaction id
+/// `id`. Used to pre-warm the cache; labels longer than 63 bytes are skipped.
+pub fn build_query(id: u16, name: &str) -> Vec<u8> {
+    let mut m = Vec::with_capacity(name.len() + 18);
+    m.extend_from_slice(&id.to_be_bytes());
+    m.extend_from_slice(&[0x01, 0x00]); // flags: RD (recursion desired)
+    m.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    m.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR = 0
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
+        m.push(label.len() as u8);
+        m.extend_from_slice(label.as_bytes());
+    }
+    m.push(0); // root label
+    m.extend_from_slice(&TYPE_A.to_be_bytes());
+    m.extend_from_slice(&CLASS_IN.to_be_bytes());
+    m
+}
+
 /// Extract the (lower-cased, dot-joined) name from the first question of a DNS
 /// message, or `None` if there is no question or the message is malformed.
 ///
@@ -268,6 +289,15 @@ mod tests {
             m.extend_from_slice(ip);
         }
         m
+    }
+
+    #[test]
+    fn build_query_round_trips() {
+        let q = build_query(0xABCD, "www.example.com");
+        assert_eq!(&q[0..2], &[0xAB, 0xCD]); // id
+        let (name, qtype, qclass) = question(&q).unwrap();
+        assert_eq!(name, "www.example.com");
+        assert_eq!((qtype, qclass), (TYPE_A, CLASS_IN));
     }
 
     #[test]

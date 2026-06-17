@@ -23,7 +23,8 @@ shadowvpn-client -c /etc/shadowvpn/policy-client.json \
     --dns-local "$DNS:53" \
     --dns-remote "$DNS:53" \
     --gfwlist /etc/shadowvpn/gfwlist.txt \
-    --chnroute /etc/shadowvpn/chnroute.txt &
+    --chnroute /etc/shadowvpn/chnroute.txt \
+    --no-prewarm --no-cache-persist &
 CLIENT_PID=$!
 trap 'kill "$CLIENT_PID" 2>/dev/null || true' EXIT
 

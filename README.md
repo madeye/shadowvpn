@@ -279,11 +279,19 @@ server's masquerade matches with no client-side NAT. Direct (non-tunneled)
 traffic stays on the normal kernel path untouched, and every route added is
 removed again on exit.
 
-The proxy is built for low latency: answers are **cached** (TTL-respecting, like
-`dnsmasq`) so repeat lookups skip the upstream round-trip, and in chinadns mode
-the local and clean resolvers are queried concurrently but a **domestic answer
-returns immediately** rather than waiting for the slower tunneled upstream — so
-China sites resolve at local-DNS speed.
+The proxy is built for low latency:
+
+* **Cache** — answers are cached (TTL-respecting, like `dnsmasq`) so repeat
+  lookups skip the upstream round-trip.
+* **chinadns fast-path** — the local and clean resolvers are queried
+  concurrently, but a **domestic answer returns immediately** instead of waiting
+  for the slower tunneled upstream, so China sites resolve at local-DNS speed.
+* **Pre-warm** — on startup a built-in list of common domains is resolved in the
+  background, so their first real lookup (and their tunnel routes) are already
+  hot. Customize with the `prewarm` config list or disable with `--no-prewarm`.
+* **Persistence** — the cache is saved on exit and reloaded on startup
+  (`--cache-file`, default `dns-cache.json` next to the binary; `--no-cache-persist`
+  to disable), so a restart doesn't start cold.
 
 <p align="center">
   <img src="docs/policy-routing.svg" alt="ShadowVPN client policy routing — control and data plane" width="100%">
@@ -334,6 +342,8 @@ Relevant config / flags (all client-only; CLI overrides JSON):
 | `geoip`       | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it     | —                    |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database    | `CN`                 |
 | `set_dns`     | `--set-dns` / `--no-set-dns` | point the system resolver at the proxy (auto-restored on exit) | `true` (needs `dns_listen` port 53) |
+| `prewarm`     | `--no-prewarm`  | pre-resolve common domains into the cache on startup        | built-in list        |
+| `cache_file`  | `--cache-file` / `--no-cache-persist` | persist the DNS cache across restarts        | `dns-cache.json` (next to the binary) |
 
 * **gfwlist file** — one domain per line; `#`/`!` comments and a leading `*.`/`.`
   are accepted (the plain list produced by `gfwlist2dnsmasq`, not the base64

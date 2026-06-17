@@ -53,6 +53,9 @@ pub const DEFAULT_DNS_REMOTE: &str = "8.8.8.8:53";
 /// Default GeoIP country code selected for the China set.
 pub const DEFAULT_GEOIP_COUNTRY: &str = "CN";
 
+/// Default file name for the persisted DNS cache (placed next to the binary).
+pub const DEFAULT_CACHE_FILE_NAME: &str = "dns-cache.json";
+
 /// Default per-query DNS upstream timeout, in milliseconds.
 pub const DEFAULT_DNS_TIMEOUT_MS: u64 = 3000;
 
@@ -164,6 +167,14 @@ pub struct FileConfig {
     /// Whether to point the system resolver at the proxy automatically
     /// (default `true` in gfwlist/chinadns mode).
     pub set_dns: Option<bool>,
+
+    /// Domains to pre-resolve into the cache on startup. Absent uses a built-in
+    /// list of common domains; an empty list disables pre-warming.
+    pub prewarm: Option<Vec<String>>,
+
+    /// Where to persist the DNS cache across restarts. Absent uses the default
+    /// path; set to disable via `--no-cache-persist`.
+    pub cache_file: Option<String>,
 
     /// Per-query DNS upstream timeout, in milliseconds.
     pub dns_timeout_ms: Option<u64>,
@@ -358,6 +369,18 @@ pub struct ClientArgs {
     /// Do NOT modify the system resolver; configure DNS yourself.
     #[arg(long = "no-set-dns")]
     pub no_set_dns: bool,
+
+    /// Do NOT pre-resolve common domains into the cache on startup.
+    #[arg(long = "no-prewarm")]
+    pub no_prewarm: bool,
+
+    /// Path to persist the DNS cache across restarts.
+    #[arg(long = "cache-file")]
+    pub cache_file: Option<String>,
+
+    /// Do NOT persist the DNS cache to disk.
+    #[arg(long = "no-cache-persist")]
+    pub no_cache_persist: bool,
 }
 
 /// Load the optional file config referenced by a `--config` path.
@@ -379,6 +402,16 @@ fn resolve_crypto(
     let password = password.ok_or(ConfigError::Missing("password"))?;
     let master_key = crate::crypto::evp_bytes_to_key(password.as_bytes(), cipher.key_len());
     Ok((cipher, master_key))
+}
+
+/// Default DNS-cache path: `dns-cache.json` in the same directory as the running
+/// binary (falling back to the current directory if the exe path is unknown).
+fn default_cache_file() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(DEFAULT_CACHE_FILE_NAME)
 }
 
 /// Parse a DNS endpoint that may be `ip:port` or a bare `ip` (defaulting the
@@ -443,6 +476,32 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
         file.set_dns.unwrap_or(true)
     };
 
+    // Pre-warm: `--no-prewarm` disables; else the file list, else the built-in.
+    let prewarm = if args.no_prewarm {
+        Vec::new()
+    } else {
+        file.prewarm.clone().unwrap_or_else(|| {
+            crate::policy::DEFAULT_PREWARM
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
+    };
+
+    // Cache persistence: `--no-cache-persist` disables; else CLI/file path, else
+    // a file next to the binary.
+    let cache_file = if args.no_cache_persist {
+        None
+    } else {
+        Some(
+            args.cache_file
+                .clone()
+                .or_else(|| file.cache_file.clone())
+                .map(PathBuf::from)
+                .unwrap_or_else(default_cache_file),
+        )
+    };
+
     // Fail fast if the chosen mode is missing its data file.
     if matches!(mode, Mode::GfwList) && gfwlist.is_none() {
         return Err(ConfigError::Missing("gfwlist (required by gfwlist mode)"));
@@ -467,6 +526,8 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
             .or_else(|| file.geoip_country.clone())
             .unwrap_or_else(|| DEFAULT_GEOIP_COUNTRY.to_string()),
         set_dns,
+        prewarm,
+        cache_file,
         dns_timeout: Duration::from_millis(file.dns_timeout_ms.unwrap_or(DEFAULT_DNS_TIMEOUT_MS)),
     })
 }
@@ -584,6 +645,9 @@ mod tests {
                 geoip_country: None,
                 set_dns: false,
                 no_set_dns: false,
+                no_prewarm: false,
+                cache_file: None,
+                no_cache_persist: false,
             }
         }
     }
@@ -654,6 +718,18 @@ mod tests {
         let mut sd = base.clone();
         sd.set_dns = true;
         assert!(sd.resolve().unwrap().policy.set_dns);
+
+        // prewarm defaults to the built-in list; --no-prewarm empties it.
+        assert!(!cfg.policy.prewarm.is_empty());
+        let mut np = base.clone();
+        np.no_prewarm = true;
+        assert!(np.resolve().unwrap().policy.prewarm.is_empty());
+
+        // cache persistence on by default; --no-cache-persist disables it.
+        assert!(cfg.policy.cache_file.is_some());
+        let mut nc = base.clone();
+        nc.no_cache_persist = true;
+        assert!(nc.resolve().unwrap().policy.cache_file.is_none());
 
         // gfwlist mode without a gfwlist file is rejected.
         let mut g = base.clone();
