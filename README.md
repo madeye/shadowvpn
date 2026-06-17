@@ -165,6 +165,13 @@ Run the test suite (crypto + config unit tests):
 cargo test --lib
 ```
 
+It also builds on **Windows** (`x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc`)
+with the MSVC toolchain; CI builds and tests the Windows target on every push. The
+client's TUN layer uses [Wintun](https://www.wintun.net/), whose `wintun.dll` is
+loaded at runtime and must sit next to `shadowvpn-client.exe` — download the build
+matching the CPU architecture and drop it alongside the binary. See
+[`scripts/`](scripts/) for a ready-made launcher.
+
 ### End-to-end test (Docker)
 
 A full data-path test lives under `docker/`. It builds both binaries, starts a
@@ -223,7 +230,8 @@ Fully self-contained (no external network), so CI runs it on every PR.
 ## Running
 
 Creating a TUN device requires elevated privileges (root on Linux, `sudo` on
-macOS). Both binaries log to stderr; set `RUST_LOG=debug` for verbose tracing.
+macOS, **Administrator** on Windows). Both binaries log to stderr; set
+`RUST_LOG=debug` for verbose tracing.
 
 ### Server
 
@@ -262,13 +270,32 @@ sudo ./target/release/shadowvpn-client \
 Once the tunnel is up you can verify connectivity with a ping across the tunnel
 addresses, e.g. from the client `ping 10.9.0.1`.
 
+### Windows (client)
+
+Put `shadowvpn-client.exe`, `wintun.dll` (matching the CPU architecture), and your
+`client.json` in one folder, then run from an **elevated** PowerShell:
+
+```powershell
+.\shadowvpn-client.exe -c client.json
+```
+
+Wintun and the routing/DNS changes need Administrator, so launch the terminal with
+*Run as administrator*. Stop the client with **Ctrl-C** for a graceful shutdown
+(it restores the system resolver, removes the per-destination routes, and saves the
+DNS cache); avoid `taskkill /F`, which skips that cleanup.
+
+The [`scripts/`](scripts/) folder has a self-elevating launcher that does this for
+you — `shadowvpn-client.cmd` (or `shadowvpn-client.ps1 -Config <path>`); see
+[`scripts/README.md`](scripts/README.md).
+
 ### Running as a service
 
 Example service definitions live in [`dist/`](dist/): **systemd** units for the
 Linux server and client, and a **launchd** daemon for the macOS client. See
 [`dist/README.md`](dist/README.md) for install steps. Stopping the client service
 is graceful — it restores the system resolver, removes the tunnel routes, and
-saves the DNS cache.
+saves the DNS cache. On **Windows**, use the launcher in [`scripts/`](scripts/)
+(foreground; stop with Ctrl-C).
 
 ---
 
@@ -431,6 +458,16 @@ sudo route -n add -net 0.0.0.0/1 10.9.0.1
 sudo route -n add -net 128.0.0.0/1 10.9.0.1
 ```
 
+**Windows** (elevated prompt):
+
+```bat
+:: Keep the server reachable over your real link (replace GW):
+route add <SERVER_IP> mask 255.255.255.255 <YOUR_DEFAULT_GW>
+:: Route everything through the tunnel peer:
+route add 0.0.0.0 mask 128.0.0.0 10.9.0.1
+route add 128.0.0.0 mask 128.0.0.0 10.9.0.1
+```
+
 To stop using the tunnel, delete the routes you added. If the server is given as
 a hostname rather than a literal IP, resolve it first and add the host route for
 that resolved IP.
@@ -445,7 +482,7 @@ src/
   crypto.rs       Cipher enum, EVP_BytesToKey, HKDF-SHA1 subkey, AEAD seal/open
   protocol.rs     tunnel framing constants and buffer sizing
   config.rs       JSON file + clap CLI config, merge/validate
-  tun_device.rs   async TUN wrapper (tun-rs, macOS utun + Linux)
+  tun_device.rs   async TUN wrapper (tun-rs: macOS utun, Linux, Windows Wintun)
   policy/         client policy routing (gfwlist / chinadns, user-mode)
     mod.rs        Mode, PolicyConfig, orchestration
     gfwlist.rs    domain-suffix matching
@@ -454,8 +491,8 @@ src/
     dns.rs        minimal DNS wire parsing
     cache.rs      TTL-respecting DNS answer cache
     proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
-    route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE)
-    dnsconf.rs    point the system resolver at the proxy (networksetup / resolv.conf)
+    route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE / IP Helper API)
+    dnsconf.rs    point the system resolver at the proxy (networksetup / resolv.conf / netsh)
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
   bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
 docs/
@@ -464,6 +501,9 @@ docs/
 dist/
   systemd/        Linux service units (server + client)
   launchd/        macOS client daemon
+scripts/
+  shadowvpn-client.ps1   self-elevating Windows client launcher
+  shadowvpn-client.cmd   execution-policy-bypass wrapper for the launcher
 ```
 
 ---
