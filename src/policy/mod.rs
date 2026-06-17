@@ -20,6 +20,7 @@
 //! [`Mode::Full`] disables all of this (the historical behavior: the whole TUN
 //! is the tunnel and routing is the operator's job).
 
+pub mod cache;
 pub mod chnroute;
 pub mod dns;
 pub mod dnsconf;
