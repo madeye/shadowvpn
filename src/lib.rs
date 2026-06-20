@@ -37,6 +37,7 @@
 
 pub mod config;
 pub mod crypto;
+pub mod obfs;
 pub mod policy;
 pub mod protocol;
 pub mod tun_device;

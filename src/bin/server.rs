@@ -31,6 +31,7 @@ use tokio::sync::RwLock;
 
 use shadowvpn::config::{ServerArgs, ServerConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
+use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
 use shadowvpn::tun_device::TunDevice;
 
@@ -78,6 +79,18 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 
     let clients: ClientTable = Arc::new(RwLock::new(HashMap::new()));
 
+    // Carrier obfuscation, matching the client. When enabled, datagrams on the
+    // wire look like QUIC/HTTP3 short-header packets; `None` is the plain
+    // `salt ++ AEAD` envelope.
+    let obfuscator: Option<Arc<Obfuscator>> = cfg
+        .obfs
+        .as_deref()
+        .and_then(Obfuscator::from_name)
+        .map(Arc::new);
+    if let Some(name) = cfg.obfs.as_deref() {
+        info!("  obfuscation    : {name} datagram shaping ENABLED");
+    }
+
     // Loop A: UDP → TUN.
     let a = {
         let socket = Arc::clone(&socket);
@@ -85,7 +98,8 @@ async fn run(cfg: ServerConfig) -> Result<()> {
         let clients = Arc::clone(&clients);
         let cipher = cfg.cipher;
         let key = cfg.master_key.clone();
-        tokio::spawn(async move { udp_to_tun(socket, tun, clients, cipher, key).await })
+        let obfs = obfuscator.clone();
+        tokio::spawn(async move { udp_to_tun(socket, tun, clients, cipher, key, obfs).await })
     };
 
     // Loop B: TUN → UDP.
@@ -95,7 +109,8 @@ async fn run(cfg: ServerConfig) -> Result<()> {
         let clients = Arc::clone(&clients);
         let cipher = cfg.cipher;
         let key = cfg.master_key.clone();
-        tokio::spawn(async move { tun_to_udp(socket, tun, clients, cipher, key).await })
+        let obfs = obfuscator.clone();
+        tokio::spawn(async move { tun_to_udp(socket, tun, clients, cipher, key, obfs).await })
     };
 
     // If either loop returns (only on a fatal IO error), tear the server down.
@@ -113,15 +128,35 @@ async fn udp_to_tun(
     clients: ClientTable,
     cipher: Cipher,
     master_key: Vec<u8>,
+    obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
-    let mut buf = vec![0u8; max_datagram_size(cipher)];
+    // Extra headroom for the obfs prefix on top of the largest crypto datagram.
+    let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
     loop {
         let (n, peer) = socket
             .recv_from(&mut buf)
             .await
             .context("UDP recv_from failed")?;
 
-        let plaintext = match decrypt_packet(cipher, &master_key, &buf[..n]) {
+        // De-obfuscate when enabled; a packet that doesn't match the configured
+        // obfuscation is noise/probe traffic — drop it. `decoded` owns the bytes
+        // for variants (base64) that can't borrow from `buf`.
+        let decoded;
+        let datagram: &[u8] = match obfuscator {
+            Some(ref o) => match o.unwrap(&buf[..n]) {
+                Some(inner) => {
+                    decoded = inner;
+                    &decoded
+                }
+                None => {
+                    debug!("dropping {n}-byte non-obfs datagram from {peer}");
+                    continue;
+                }
+            },
+            None => &buf[..n],
+        };
+
+        let plaintext = match decrypt_packet(cipher, &master_key, datagram) {
             Ok(pt) => pt,
             Err(err) => {
                 // Bad PSK, corruption, or stray traffic — drop and continue.
@@ -166,6 +201,7 @@ async fn tun_to_udp(
     clients: ClientTable,
     cipher: Cipher,
     master_key: Vec<u8>,
+    obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_IP_PACKET];
     loop {
@@ -205,6 +241,12 @@ async fn tun_to_udp(
                 warn!("failed to encrypt packet for {dst} ({peer}): {err}");
                 continue;
             }
+        };
+
+        // Shape the reply to look like a QUIC packet when obfuscation is on.
+        let datagram = match obfuscator {
+            Some(ref o) => o.wrap(&datagram),
+            None => datagram,
         };
 
         if let Err(err) = socket.send_to(&datagram, peer).await {
