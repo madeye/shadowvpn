@@ -43,6 +43,7 @@ use tokio::net::UdpSocket;
 
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
+use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
 use shadowvpn::tun_device::TunDevice;
 
@@ -71,6 +72,18 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     // The master key length is guaranteed to match the cipher by `resolve()`.
     let cipher = cfg.cipher;
     let master_key: Arc<[u8]> = Arc::from(cfg.master_key.into_boxed_slice());
+
+    // Carrier obfuscation, matching the server. When enabled, every datagram is
+    // wrapped on send and unwrapped on recv; `None` is the plain envelope. Both
+    // ends must agree (see `obfs`).
+    let obfuscator: Option<Arc<Obfuscator>> = cfg
+        .obfs
+        .as_deref()
+        .and_then(Obfuscator::from_name)
+        .map(Arc::new);
+    if let Some(name) = cfg.obfs.as_deref() {
+        info!("carrier obfuscation: {name}");
+    }
 
     // --- UDP socket ---------------------------------------------------------
     // Bind to an ephemeral local port on the unspecified address, then
@@ -155,6 +168,7 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         Arc::clone(&socket),
         cipher,
         Arc::clone(&master_key),
+        obfuscator.clone(),
     ));
 
     // Loop B: net -> TUN (recv UDP, decrypt, write IP packet).
@@ -163,6 +177,7 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         Arc::clone(&socket),
         cipher,
         Arc::clone(&master_key),
+        obfuscator.clone(),
     ));
 
     // Keepalive: periodic tiny encrypted datagram so the server learns/refreshes
@@ -171,6 +186,7 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         Arc::clone(&socket),
         cipher,
         Arc::clone(&master_key),
+        obfuscator.clone(),
     ));
 
     // The DNS-proxy task, when policy routing is active. When it is not (or on
@@ -251,6 +267,7 @@ async fn tun_to_net(
     socket: Arc<UdpSocket>,
     cipher: Cipher,
     master_key: Arc<[u8]>,
+    obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     // Plaintext buffer sized for the largest IP packet we might read.
     let mut buf = vec![0u8; MAX_IP_PACKET];
@@ -274,13 +291,19 @@ async fn tun_to_net(
             }
         };
 
+        // Apply carrier obfuscation (if enabled) just before the wire.
+        let wire = match obfuscator {
+            Some(ref o) => o.wrap(&datagram),
+            None => datagram,
+        };
+
         // A failed send to a connected socket is treated as fatal.
-        if let Err(e) = socket.send(&datagram).await {
+        if let Err(e) = socket.send(&wire).await {
             return Err(e).context("failed to send datagram to server");
         }
         debug!(
-            "tun->net: {n} bytes plaintext -> {} bytes datagram",
-            datagram.len()
+            "tun->net: {n} bytes plaintext -> {} bytes on wire",
+            wire.len()
         );
     }
 }
@@ -292,18 +315,38 @@ async fn net_to_tun(
     socket: Arc<UdpSocket>,
     cipher: Cipher,
     master_key: Arc<[u8]>,
+    obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
-    // UDP buffer sized for the encrypted form of the largest IP packet.
-    let mut buf = vec![0u8; max_datagram_size(cipher)];
+    // UDP buffer sized for the encrypted form of the largest IP packet, plus
+    // headroom for the obfs prefix when obfuscation is enabled.
+    let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
     loop {
         let n = match socket.recv(&mut buf).await {
             Ok(n) => n,
             Err(e) => return Err(e).context("failed to receive datagram from server"),
         };
 
+        // De-obfuscate (if enabled); a packet that doesn't match the configured
+        // obfuscation is noise/probe traffic — drop it. `decoded` owns the bytes
+        // for variants (base64) that can't borrow from `buf`.
+        let decoded;
+        let datagram: &[u8] = match obfuscator {
+            Some(ref o) => match o.unwrap(&buf[..n]) {
+                Some(inner) => {
+                    decoded = inner;
+                    &decoded
+                }
+                None => {
+                    debug!("dropping {n}-byte non-obfs datagram");
+                    continue;
+                }
+            },
+            None => &buf[..n],
+        };
+
         // Bad/forged/corrupt datagrams (too short or failing AEAD auth) are
         // dropped, not fatal — this is normal on an open UDP port.
-        let plaintext = match decrypt_packet(cipher, &master_key, &buf[..n]) {
+        let plaintext = match decrypt_packet(cipher, &master_key, datagram) {
             Ok(p) => p,
             Err(e) => {
                 debug!("dropping undecryptable {n}-byte datagram: {e}");
@@ -338,6 +381,7 @@ async fn keepalive_loop(
     socket: Arc<UdpSocket>,
     cipher: Cipher,
     master_key: Arc<[u8]>,
+    obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
     // Don't fire a burst if we ever fall behind schedule.
@@ -352,10 +396,15 @@ async fn keepalive_loop(
                 continue;
             }
         };
-        if let Err(e) = socket.send(&datagram).await {
+        // Keepalives ride the same obfs framing so the whole flow is uniform.
+        let wire = match obfuscator {
+            Some(ref o) => o.wrap(&datagram),
+            None => datagram,
+        };
+        if let Err(e) = socket.send(&wire).await {
             return Err(e).context("failed to send keepalive to server");
         }
-        debug!("sent {}-byte keepalive", datagram.len());
+        debug!("sent {}-byte keepalive", wire.len());
     }
 }
 

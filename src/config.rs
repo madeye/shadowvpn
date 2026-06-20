@@ -138,6 +138,10 @@ pub struct FileConfig {
     /// TUN interface MTU.
     pub mtu: Option<u16>,
 
+    /// Carrier obfuscation: `"none"` (default) or `"quic"` (wrap datagrams to
+    /// look like QUIC/HTTP3 short-header packets). Must match the client.
+    pub obfs: Option<String>,
+
     // --- Client-only policy routing (ignored by the server) ----------------
     /// Policy-routing mode: `full` (default), `gfwlist`, or `chinadns`.
     pub mode: Option<String>,
@@ -221,6 +225,8 @@ pub struct ServerConfig {
     pub master_key: Vec<u8>,
     /// TUN interface settings.
     pub tun: TunConfig,
+    /// Carrier obfuscation name (`"quic"` | `"base64"`), or `None` for plain.
+    pub obfs: Option<String>,
 }
 
 /// Fully resolved, validated client configuration.
@@ -236,6 +242,9 @@ pub struct ClientConfig {
     pub tun: TunConfig,
     /// Policy-routing settings (mode `full` means no policy routing).
     pub policy: PolicyConfig,
+    /// Carrier obfuscation name (`"quic"` | `"base64"`), or `None` for plain.
+    /// Must match the server.
+    pub obfs: Option<String>,
 }
 
 /// Command-line arguments for `shadowvpn-server`.
@@ -572,11 +581,14 @@ impl ServerArgs {
             self.mtu.or(file.mtu),
         )?;
 
+        let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
+
         Ok(ServerConfig {
             listen,
             cipher,
             master_key,
             tun,
+            obfs,
         })
     }
 }
@@ -607,12 +619,15 @@ impl ClientArgs {
             self.mtu.or(file.mtu),
         )?;
 
+        let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
+
         Ok(ClientConfig {
             server,
             cipher,
             master_key,
             tun,
             policy,
+            obfs,
         })
     }
 }
