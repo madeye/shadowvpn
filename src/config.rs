@@ -242,6 +242,9 @@ pub struct ClientConfig {
     pub tun: TunConfig,
     /// Policy-routing settings (mode `full` means no policy routing).
     pub policy: PolicyConfig,
+    /// Carrier obfuscation name (`"quic"` | `"base64"`), or `None` for plain.
+    /// Must match the server.
+    pub obfs: Option<String>,
 }
 
 /// Command-line arguments for `shadowvpn-server`.
@@ -616,12 +619,15 @@ impl ClientArgs {
             self.mtu.or(file.mtu),
         )?;
 
+        let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
+
         Ok(ClientConfig {
             server,
             cipher,
             master_key,
             tun,
             policy,
+            obfs,
         })
     }
 }
