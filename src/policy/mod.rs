@@ -127,7 +127,8 @@ pub struct PolicyConfig {
     pub dns_local: SocketAddr,
     /// Clean DNS upstream, reached through the tunnel.
     pub dns_remote: SocketAddr,
-    /// gfwlist domain file (required in gfwlist mode).
+    /// gfwlist domain file: required in gfwlist mode; an optional force-tunnel
+    /// override in chinadns mode.
     pub gfwlist: Option<PathBuf>,
     /// China route (CIDR) file (one source for chinadns mode).
     pub chnroute: Option<PathBuf>,
@@ -188,17 +189,32 @@ pub async fn spawn(
     use std::net::IpAddr;
     use std::sync::Arc;
 
-    let gfwlist = if matches!(cfg.mode, Mode::GfwList) {
-        let p = cfg
-            .gfwlist
-            .as_ref()
-            .context("gfwlist mode requires a gfwlist file")?;
-        let list = gfwlist::GfwList::load(p)
-            .with_context(|| format!("loading gfwlist from {}", p.display()))?;
-        log::info!("loaded {} gfwlist domains from {}", list.len(), p.display());
-        list
-    } else {
-        gfwlist::GfwList::default()
+    let gfwlist = match cfg.mode {
+        // Required in gfwlist mode: it is the sole routing decision.
+        Mode::GfwList => {
+            let p = cfg
+                .gfwlist
+                .as_ref()
+                .context("gfwlist mode requires a gfwlist file")?;
+            let list = gfwlist::GfwList::load(p)
+                .with_context(|| format!("loading gfwlist from {}", p.display()))?;
+            log::info!("loaded {} gfwlist domains from {}", list.len(), p.display());
+            list
+        }
+        // Optional in chinadns mode: a force-tunnel override for names the
+        // local-vs-clean race would otherwise misclassify as domestic.
+        Mode::ChinaDns if cfg.gfwlist.is_some() => {
+            let p = cfg.gfwlist.as_ref().unwrap();
+            let list = gfwlist::GfwList::load(p)
+                .with_context(|| format!("loading gfwlist from {}", p.display()))?;
+            log::info!(
+                "loaded {} gfwlist force-tunnel domains from {}",
+                list.len(),
+                p.display()
+            );
+            list
+        }
+        _ => gfwlist::GfwList::default(),
     };
 
     let chnroute = if matches!(cfg.mode, Mode::ChinaDns) {

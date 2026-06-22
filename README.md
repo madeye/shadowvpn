@@ -373,7 +373,7 @@ Two modes:
 | Mode       | Decision                                                            | Needs       |
 |------------|--------------------------------------------------------------------|-------------|
 | `gfwlist`  | tunnel names listed in a gfwlist file; everything else is direct    | `--gfwlist` |
-| `chinadns` | query a domestic + a clean resolver; tunnel anything **not** resolving to an in-China address | `--chnroute` or `--geoip` |
+| `chinadns` | query a domestic + a clean resolver; tunnel anything **not** resolving to an in-China address. An optional `--gfwlist` is a force-tunnel override | `--chnroute` or `--geoip` (+ optional `--gfwlist`) |
 | `full`     | no policy routing (the default)                                     | —           |
 
 ```sh
@@ -388,6 +388,12 @@ sudo ./target/release/shadowvpn-client -c client.json \
 # chinadns mode: derive the China set from a GeoLite2 database instead
 sudo ./target/release/shadowvpn-client -c client.json \
   --mode chinadns --geoip /etc/shadowvpn/GeoLite2-Country.mmdb
+
+# chinadns mode + a gfwlist force list: domains on the list always tunnel,
+# even if the domestic resolver returns an in-China (poisoned) address
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode chinadns --geoip /etc/shadowvpn/GeoLite2-Country.mmdb \
+  --gfwlist /etc/shadowvpn/gfwlist.txt
 ```
 
 Policy routing only takes effect for names resolved **through** the proxy (that's
@@ -408,7 +414,7 @@ Relevant config / flags (all client-only; CLI overrides JSON):
 | `dns_listen`  | `--dns-listen`  | address the split-DNS proxy listens on                    | `127.0.0.1:53`       |
 | `dns_local`   | `--dns-local`   | domestic / direct DNS upstream                            | `114.114.114.114:53` |
 | `dns_remote`  | `--dns-remote`  | clean DNS upstream (reached through the tunnel)           | `8.8.8.8:53`         |
-| `gfwlist`     | `--gfwlist`     | domain-suffix file (gfwlist mode)                         | —                    |
+| `gfwlist`     | `--gfwlist`     | domain-suffix file (gfwlist mode; optional force-tunnel list in chinadns mode) | —                    |
 | `chnroute`    | `--chnroute`    | China CIDR file (chinadns mode)                           | —                    |
 | `geoip`       | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it     | —                    |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database    | `CN`                 |
