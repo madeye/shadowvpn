@@ -29,11 +29,18 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Config = (Join-Path $PSScriptRoot 'client.json'),
-    [string]$Exe = (Join-Path $PSScriptRoot 'shadowvpn-client.exe')
+    [string]$Config,
+    [string]$Exe
 )
 
 $ErrorActionPreference = 'Stop'
+
+# $PSScriptRoot is an empty string inside param() default expressions under
+# Windows PowerShell 5.1, so resolve the script folder here in the body (where it
+# is populated) and apply the defaults.
+$here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $Config) { $Config = Join-Path $here 'client.json' }
+if (-not $Exe)    { $Exe    = Join-Path $here 'shadowvpn-client.exe' }
 
 # Make paths absolute so they survive the elevated re-launch, which starts in a
 # different working directory (system32).

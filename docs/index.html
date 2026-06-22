@@ -119,8 +119,9 @@
     <h1 class="brand">ShadowVPN</h1>
     <p class="tagline">A UDP-based, pre-shared-key, user-mode VPN written in Rust on Tokio.</p>
     <p class="subtle">A fixed point-to-point / multi-client tunnel whose on-wire crypto matches the
-      shadowsocks AEAD UDP scheme byte-for-byte. Runs on Linux and macOS, with optional
-      user-mode policy routing (gfwlist / chinadns) and no kernel ipset or nft rules.</p>
+      shadowsocks AEAD UDP scheme byte-for-byte. Runs on Linux, macOS, and Windows, with optional
+      user-mode policy routing (gfwlist / chinadns), QUIC/HTTP3 carrier obfuscation, and no kernel
+      ipset or nft rules.</p>
     <div class="cta">
       <a class="btn primary" href="https://github.com/madeye/shadowvpn">★ View on GitHub</a>
       <a class="btn ghost" href="#quickstart">Quick start →</a>
@@ -128,7 +129,8 @@
     <div class="badges">
       <span class="badge"><b>Wire:</b> shadowsocks AEAD (UDP)</span>
       <span class="badge"><b>Ciphers:</b> AES-128/256-GCM · ChaCha20-Poly1305</span>
-      <span class="badge"><b>Platforms:</b> Linux · macOS</span>
+      <span class="badge"><b>Platforms:</b> Linux · macOS · Windows</span>
+      <span class="badge"><b>Obfuscation:</b> QUIC/HTTP3 · base64</span>
       <span class="badge"><b>License:</b> MIT</span>
     </div>
   </div>
@@ -158,6 +160,12 @@
       <div class="feat"><div class="ic">🌏</div><h3>gfwlist · chinadns</h3>
         <p>Tunnel a domain list, or everything that isn't a China IP. Build the China set from a
           plain CIDR file or a GeoLite2 database.</p></div>
+      <div class="feat"><div class="ic">🎭</div><h3>Carrier obfuscation</h3>
+        <p>Optionally shape the UDP payload to look like <b>QUIC/HTTP3</b>, or encode it as printable
+          base64 — cosmetic framing to dodge naive classification.</p></div>
+      <div class="feat"><div class="ic">🪟</div><h3>Cross-platform client</h3>
+        <p>The client runs on Linux, macOS, and <b>Windows</b> (TUN via Wintun), policy routing
+          included — a self-elevating launcher ships in <code>scripts/</code>.</p></div>
       <div class="feat"><div class="ic">🦀</div><h3>Lean Rust</h3>
         <p>Tokio + RustCrypto, a tiny dependency set, and a Docker end-to-end test suite covering
           the tunnel, HTTP/3, and policy routing.</p></div>
@@ -191,6 +199,10 @@
       standard shadowsocks UDP relays prepend a SOCKS target address; ShadowVPN does not. This is a
       fixed tunnel, so the plaintext is exactly the raw IP packet — everything else matches the AEAD
       scheme byte-for-byte.</p>
+    <p class="subtle" style="margin-top:14px"><b style="color:var(--text)">Optional obfuscation:</b>
+      set <code>obfs</code> (both ends must match) to wrap each datagram as a <b>QUIC/HTTP3</b>
+      short-header packet, or encode it as printable <b>base64</b>. This is cosmetic framing to dodge
+      naive UDP classification — it adds no security; the AEAD envelope underneath is unchanged.</p>
   </div>
 </section>
 

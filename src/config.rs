@@ -138,8 +138,9 @@ pub struct FileConfig {
     /// TUN interface MTU.
     pub mtu: Option<u16>,
 
-    /// Carrier obfuscation: `"none"` (default) or `"quic"` (wrap datagrams to
-    /// look like QUIC/HTTP3 short-header packets). Must match the client.
+    /// Carrier obfuscation: `"none"` (default), `"quic"` (wrap datagrams to
+    /// look like QUIC/HTTP3 short-header packets), or `"base64"` (printable
+    /// ASCII payload). Must match the other end.
     pub obfs: Option<String>,
 
     // --- Client-only policy routing (ignored by the server) ----------------
