@@ -88,6 +88,39 @@ The alias `chacha20-ietf-poly1305` is accepted and treated as
 
 ---
 
+## Carrier obfuscation (optional)
+
+By default the UDP payload on the wire is the bare `salt ++ AEAD` envelope. The
+optional `obfs` field shapes that payload so it doesn't read as an opaque
+random-looking UDP blob, to evade naive protocol classification. It is selected
+with the `obfs` config field and **both ends must agree** — a mismatched peer
+just sees its traffic dropped.
+
+This is **cosmetic framing only**: it adds no security. The AEAD envelope
+underneath is unchanged, and a wrong/absent obfuscation simply fails to decode
+(the packet is dropped before decryption).
+
+| `obfs`   | On the wire                                                                                   | Note                                              |
+|----------|----------------------------------------------------------------------------------------------|---------------------------------------------------|
+| `none`   | the plain `salt ++ AEAD` datagram (default)                                                   | —                                                 |
+| `quic`   | each datagram is wrapped as a **QUIC 1-RTT short-header** packet, so it reads as HTTP/3       | adds a few header bytes; self-describing decode    |
+| `base64` | each datagram is **standard base64**, so the UDP payload is printable ASCII                   | ~33% larger — size the `mtu` down to compensate    |
+
+Set it in both config files (it has no CLI flag):
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "password": "correct horse battery staple",
+  "obfs": "quic"
+}
+```
+
+The server logs the active mode in its startup banner. The wire formats are
+documented in `src/obfs.rs`.
+
+---
+
 ## Configuration
 
 Configuration can come from a JSON config file, CLI flags, or both. **CLI flags
@@ -106,6 +139,7 @@ supplied.
 | `tun_netmask` | `--tun-netmask`   | IPv4 netmask for the TUN interface                            | no       | `255.255.255.0`      |
 | `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: client IP; client: server IP)| yes     | —                    |
 | `mtu`         | `--mtu`           | TUN interface MTU                                              | no       | `1400`               |
+| `obfs`        | *(config only)*   | carrier obfuscation: `none` \| `quic` \| `base64` (both ends must match) | no | `none`               |
 
 On the **server** the `server` field is the UDP bind/listen address; on the
 **client** it is the remote server address to connect to. Both binaries accept
