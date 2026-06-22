@@ -1,0 +1,127 @@
+name: Release
+
+# Build per-platform packages (binaries + scripts + service files) and attach
+# them to a GitHub Release. Triggered by pushing a semver tag (e.g. `v0.1.0`);
+# also runnable manually (workflow_dispatch) to produce artifacts without
+# publishing a release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create the GitHub Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      # aarch64 Linux is cross-compiled from the x86_64 runner, so it needs the
+      # GNU cross linker. The crate graph is pure Rust + libc (no C deps), so the
+      # linker is all that's required.
+      - name: Install aarch64 Linux cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          {
+            echo "[target.aarch64-unknown-linux-gnu]"
+            echo "linker = \"aarch64-linux-gnu-gcc\""
+          } >> .cargo/config.toml
+
+      - name: Build binaries
+        run: cargo build --release --locked --bins --target ${{ matrix.target }}
+
+      # Resolve a human version string for the archive name: strip the leading
+      # `v` from a tag, otherwise use the short SHA for manual/dispatch builds.
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Assemble the package (Unix: tar.gz). Each archive contains a single
+      # top-level dir so it extracts cleanly.
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="shadowvpn-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          stage="dist-stage/$name"
+          mkdir -p "$stage"
+          bin="target/${{ matrix.target }}/release"
+          cp "$bin/shadowvpn-server" "$bin/shadowvpn-client" "$stage/"
+          cp LICENSE README.md "$stage/"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            mkdir -p "$stage/systemd"
+            cp dist/systemd/shadowvpn-server.service dist/systemd/shadowvpn-client.service "$stage/systemd/"
+            cp dist/README.md "$stage/SERVICES.md"
+          else # macOS
+            mkdir -p "$stage/launchd"
+            cp dist/launchd/io.github.madeye.shadowvpn-client.plist "$stage/launchd/"
+            cp dist/README.md "$stage/SERVICES.md"
+          fi
+          tar -C dist-stage -czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      # Assemble the package (Windows: zip). wintun.dll is intentionally not
+      # bundled — it is licensed separately and arch-specific; the bundled
+      # scripts/README explains where to get the matching build.
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "shadowvpn-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          $stage = "dist-stage/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $bin = "target/${{ matrix.target }}/release"
+          Copy-Item "$bin/shadowvpn-server.exe", "$bin/shadowvpn-client.exe" $stage
+          Copy-Item LICENSE, README.md $stage
+          Copy-Item scripts/shadowvpn-client.ps1, scripts/shadowvpn-client.cmd $stage
+          Copy-Item scripts/README.md "$stage/SCRIPTS.md"
+          Compress-Archive -Path $stage -DestinationPath "$name.zip" -Force
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowvpn-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
