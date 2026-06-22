@@ -13,7 +13,9 @@
 //!   a domestic (in-China, [`ChnRoute`]) result — so China names resolve at
 //!   local-DNS speed instead of waiting for the slow clean upstream. Only
 //!   foreign/poisoned names wait for the clean answer, whose addresses are then
-//!   routed through the tunnel.
+//!   routed through the tunnel. An optional [`GfwList`] acts as a force-tunnel
+//!   override: names on it always take the clean (tunneled) path regardless of
+//!   the race, covering domains the GFW poisons to an in-China-looking address.
 //!
 //! Answers are [cached](super::cache) by question (TTL-respecting), so repeat
 //! lookups skip the upstream round-trip entirely. Responses are otherwise relayed
@@ -97,8 +99,9 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// Build a resolver. `gfwlist` is only consulted in gfwlist mode and
-    /// `chnroute` only in chinadns mode; pass empty defaults for the unused one.
+    /// Build a resolver. `gfwlist` is consulted in gfwlist mode and as an optional
+    /// force-tunnel override in chinadns mode; `chnroute` is only consulted in
+    /// chinadns mode. Pass empty defaults for whichever is unused.
     /// `cache` is shared so it can be pre-loaded and persisted by the caller.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -157,7 +160,10 @@ impl Resolver {
                 let name = dns::question_name(query);
                 self.decide_gfwlist(query, name.as_deref()).await?
             }
-            Mode::ChinaDns => self.decide_chinadns(query).await?,
+            Mode::ChinaDns => {
+                let name = dns::question_name(query);
+                self.decide_chinadns(query, name.as_deref()).await?
+            }
         };
 
         self.tunnel(&decided.tunnel_ips);
@@ -197,7 +203,33 @@ impl Resolver {
     /// *local* resolver settles a domestic (in-China) answer — so China names
     /// resolve at local-DNS speed instead of waiting for the slow clean upstream.
     /// Only foreign/poisoned names wait for the clean (tunneled) answer.
-    async fn decide_chinadns(&self, query: &[u8]) -> Option<Decided> {
+    ///
+    /// A gfwlist, when configured, is an authoritative force-tunnel override: any
+    /// name on it always uses the clean (tunneled) upstream, bypassing the
+    /// local-vs-clean race. This covers domains the GFW poisons to an
+    /// in-China-looking address (or CDN-fronted blocked sites) that the race would
+    /// otherwise misclassify as domestic and leave on the direct path.
+    async fn decide_chinadns(&self, query: &[u8], name: Option<&str>) -> Option<Decided> {
+        // Force-tunnel override: gfwlist names skip the race and go clean-only.
+        if name.map(|n| self.gfwlist.matches(n)).unwrap_or(false) {
+            let response =
+                match query_upstream(self.remote, query, self.timeout, self.remote_bind).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!(
+                            "chinadns: forced-tunnel upstream {} failed for {name:?}: {e}",
+                            self.remote
+                        );
+                        return None;
+                    }
+                };
+            let tunnel_ips = dns::a_records(&response);
+            return Some(Decided {
+                response,
+                tunnel_ips,
+            });
+        }
+
         // Start the clean (tunneled) query in the background so it overlaps the
         // local query, but don't block on it unless we actually need it.
         let remote_query = query.to_vec();
@@ -495,6 +527,38 @@ mod tests {
         let resp = r_blk.resolve(&query("blocked.com")).await.unwrap();
         assert_eq!(dns::a_records(&resp), vec![real_ip]);
         assert_eq!(sink.ips(), vec![real_ip]);
+    }
+
+    #[tokio::test]
+    async fn chinadns_gfwlist_forces_tunnel_over_china_answer() {
+        // The local resolver returns a China IP for the blocked name (as the GFW
+        // poison or a CDN front would) — the race alone would keep it direct.
+        // The gfwlist override must force it onto the clean (tunneled) upstream.
+        let china_ip = Ipv4Addr::new(114, 114, 114, 114);
+        let real_ip = Ipv4Addr::new(93, 184, 216, 34);
+        let chnroute = ChnRoute::from_lines(["114.114.114.0/24"]);
+        let sink = Arc::new(VecSink::default());
+
+        let r = Resolver::new(
+            Mode::ChinaDns,
+            GfwList::from_lines(["blocked.com"]),
+            chnroute,
+            mock_upstream(vec![china_ip]).await, // local: looks domestic
+            mock_upstream(vec![real_ip]).await,  // remote (clean, tunneled)
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        );
+
+        // On the gfwlist: forced to remote and tunneled despite the China answer.
+        let resp = r.resolve(&query("www.blocked.com")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![real_ip]);
+        assert_eq!(sink.ips(), vec![real_ip]);
+
+        // Not on the gfwlist: ordinary chinadns race -> trust the China answer.
+        let resp = r.resolve(&query("safe.cn")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![china_ip]);
+        assert_eq!(sink.ips(), vec![real_ip]); // unchanged: nothing new tunneled
     }
 
     /// A mock upstream that answers with a different IP (10.0.0.N) on each query,
