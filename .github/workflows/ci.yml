@@ -125,3 +125,27 @@ jobs:
 
       - name: Verify policy routing
         run: ./docker/run-e2e-policy.sh "${{ matrix.mode }}"
+
+  # Multi-client auto-IP test: one --auto-assign server and three auto_ip
+  # clients. Verifies each client is leased a distinct tunnel IP, every client
+  # reaches the server through the tunnel, and clients reach each other via the
+  # server's inner-IP routing. Self-contained (no external network).
+  e2e-multi:
+    name: docker e2e multi-client (${{ matrix.cipher }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cipher:
+          - chacha20-poly1305
+          - aes-128-gcm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the TUN device is available on the runner
+        run: |
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+
+      - name: Verify multi-client auto-IP assignment
+        run: ./docker/run-e2e-multi.sh "${{ matrix.cipher }}"
