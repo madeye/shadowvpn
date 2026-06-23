@@ -28,10 +28,10 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/shadowvpn-server /usr/local/bin/shadowvpn-server
 COPY --from=builder /src/target/release/shadowvpn-client /usr/local/bin/shadowvpn-client
 
-COPY docker/server.json docker/client.json docker/client-auto.json /etc/shadowvpn/
+COPY docker/server.json docker/client.json /etc/shadowvpn/
 COPY docker/run-server.sh docker/test-client.sh \
-     docker/run-server-auto.sh docker/run-client-auto.sh /usr/local/bin/
+     docker/run-server-multi.sh docker/run-client-multi.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/run-server.sh /usr/local/bin/test-client.sh \
-    /usr/local/bin/run-server-auto.sh /usr/local/bin/run-client-auto.sh
+    /usr/local/bin/run-server-multi.sh /usr/local/bin/run-client-multi.sh
 
 ENV RUST_LOG=info

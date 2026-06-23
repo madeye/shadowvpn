@@ -1,15 +1,13 @@
-//! Server-side tunnel-IP lease pool for auto-assignment.
+//! Tunnel-IP allocation pool with TTL leases.
 //!
 //! Allocates host addresses from the server's TUN subnet (network and broadcast
 //! addresses and the server's own IP excluded) and tracks a per-IP lease. A
 //! lease is refreshed by any traffic from its client (data packet or keepalive)
-//! and reclaimed once it has been idle longer than the TTL — so a reconnecting
-//! client simply draws a fresh lease and abandoned ones do not leak.
+//! and reclaimed once it has been idle longer than the TTL — so an abandoned
+//! address is freed for reuse.
 //!
-//! There is no client identifier on the wire: a lease is keyed purely by the
-//! assigned IP, which keeps the control protocol minimal (see [`crate::control`]).
-//! Idempotency for a retransmitted request is handled one level up by the server,
-//! which remembers each peer's currently assigned address.
+//! Used by [`crate::nat`] to hand each client (keyed by its UDP endpoint) a
+//! distinct internal IP.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -91,8 +89,7 @@ impl LeasePool {
     }
 
     /// Refresh the lease for `ip` to `now`. Returns `false` if `ip` is not a
-    /// currently leased (auto-assigned) address — e.g. a statically configured
-    /// client, which the pool does not manage.
+    /// currently leased address.
     pub fn refresh(&mut self, ip: Ipv4Addr, now: Instant) -> bool {
         if let Some(slot) = self.leases.get_mut(&u32::from(ip)) {
             *slot = now;

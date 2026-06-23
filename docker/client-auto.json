@@ -1,7 +1,0 @@
-{
-  "server": "server:8388",
-  "password": "shadowvpn-e2e-password",
-  "cipher": "chacha20-poly1305",
-  "tun_name": "tun0",
-  "auto_ip": true
-}

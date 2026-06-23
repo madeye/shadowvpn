@@ -36,8 +36,8 @@
 #![warn(missing_docs)]
 
 pub mod config;
-pub mod control;
 pub mod crypto;
+pub mod nat;
 pub mod obfs;
 pub mod policy;
 pub mod pool;

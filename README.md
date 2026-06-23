@@ -200,18 +200,21 @@ shadowvpn-client uri import --image config-qr.png -o client.json
 
 The URI carries every config field, but file-path fields (`gfwlist`, `chnroute`,
 `geoip`, `cache_file`) are only meaningful on the host that has those files —
-re-point them after importing. When several clients share one server, give each a
-distinct `tun_ip` — or use auto-assignment (below) so one config works for all.
+re-point them after importing. When several clients share one server, either give
+each a distinct `tun_ip`, or run the server with `--nat` (below) so every client
+can share one identical config.
 
-### Auto-assigned tunnel IPs (multiple clients)
+### Multiple clients with one shared config (`--nat`)
 
-Instead of hand-allocating a distinct `tun_ip`/`peer_ip` per client, the server
-can lease addresses from its TUN subnet on demand. Enable it on the server, then
-let each client request one — so a single client config (or QR/URI) works for
-every device.
+By default the server routes by learning each client's inner tunnel source IP, so
+clients must use distinct `tun_ip`s. With `--nat` the server instead tells clients
+apart by their UDP endpoint and maps each onto a **distinct internal IP** drawn
+from the TUN subnet, rewriting inner addresses as packets pass through. Every
+client can then run the **same static config** (same placeholder `tun_ip`) — no
+per-client setup, and no IP-assignment handshake (0-RTT: a client just starts
+sending).
 
-**Server** — add `"auto_assign": true` (or `--auto-assign`). The pool is the
-server's TUN subnet minus the network, broadcast, and server addresses:
+**Server** — add `"nat": true` (or `--nat`):
 
 ```json
 {
@@ -220,28 +223,32 @@ server's TUN subnet minus the network, broadcast, and server addresses:
   "tun_ip": "10.9.0.1",
   "tun_netmask": "255.255.255.0",
   "peer_ip": "10.9.0.2",
-  "auto_assign": true
+  "nat": true
 }
 ```
 
-**Client** — add `"auto_ip": true` (or `--auto-ip`) and drop `tun_ip`/`peer_ip`;
-the server fills them in:
+**Clients** — all run the ordinary static config, identical on every device:
 
 ```json
 {
   "server": "vpn.example.com:8388",
   "password": "correct horse battery staple",
-  "auto_ip": true
+  "tun_ip": "10.9.0.2",
+  "tun_netmask": "255.255.255.0",
+  "peer_ip": "10.9.0.1"
 }
 ```
 
-How it works: before bringing up its TUN, the client sends an encrypted in-band
-`REQUEST`; the server replies with an `ASSIGN` (address, netmask, peer, MTU). A
-lease is keyed by the assigned IP and kept alive by ongoing traffic (data or the
-25-second keepalive); idle leases are reclaimed after `lease_ttl_secs` (default
-120). There is no separate identity — the PSK is the authentication boundary — so
-the protocol stays minimal, with the trade-off that a client may receive a
-different IP after reconnecting.
+How it works: the server keys a mapping by the client's UDP 4-tuple, allocates a
+free internal IP from the subnet (network/broadcast/server excluded), and rewrites
+the inner source on ingress (placeholder → internal) and destination on egress
+(internal → placeholder), fixing IPv4/TCP/UDP checksums incrementally. Mappings
+are refreshed by traffic (data or the 25-second keepalive) and reclaimed after
+`lease_ttl_secs` idle (default 120). Trade-offs: clients **cannot address each
+other** (they share one placeholder — it's hub-and-spoke to the server and beyond),
+and ICMP error payloads that embed the original header aren't rewritten (tunnelled
+PMTU discovery may suffer). The per-packet cost is a couple of checksum deltas,
+negligible next to the AEAD.
 
 ---
 
