@@ -41,3 +41,4 @@ pub mod obfs;
 pub mod policy;
 pub mod protocol;
 pub mod tun_device;
+pub mod uri;

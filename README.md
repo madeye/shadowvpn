@@ -178,6 +178,32 @@ On the **server** the `server` field is the UDP bind/listen address; on the
 Note how `tun_ip` and `peer_ip` are mirror images: the server's local tunnel IP
 is the client's peer, and vice versa.
 
+### Share a client config as a URI / QR code
+
+A client config can be exported as a single `shadowvpn://` URI (the config JSON,
+URL-safe Base64) and imported back — handy for moving a config to another device
+by copy-paste or by scanning a QR code:
+
+```sh
+# Print the shadowvpn:// URI for a config…
+shadowvpn-client uri export -c client.json
+
+# …or also render a scannable QR code to the terminal:
+shadowvpn-client uri export -c client.json --qr
+
+# Import a URI back into a JSON config (omit -o to print to stdout):
+shadowvpn-client uri import 'shadowvpn://…' -o client.json
+
+# Import by decoding a QR-code image instead of pasting the URI:
+shadowvpn-client uri import --image config-qr.png -o client.json
+```
+
+The URI carries every config field, but file-path fields (`gfwlist`, `chnroute`,
+`geoip`, `cache_file`) are only meaningful on the host that has those files —
+re-point them after importing. When several clients share one server, give each a
+distinct `tun_ip`: the server routes return traffic by inner tunnel IP, so two
+clients with the same `tun_ip` would collide.
+
 ---
 
 ## Building

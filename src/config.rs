@@ -109,79 +109,105 @@ pub enum ConfigError {
 /// All fields are optional so that any subset can live in the file and the rest
 /// can be supplied on the command line. Field semantics differ slightly between
 /// server and client (see [`ServerConfig`] / [`ClientConfig`]).
+///
+/// `None` fields are omitted on serialization (`skip_serializing_if`) so an
+/// exported config — and the `shadowvpn://` URI built from it — stays compact and
+/// matches the hand-written configs, which simply leave unused keys out. Missing
+/// keys deserialize back to `None`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Server `host:port`. On the server this is the bind/listen address; on
     /// the client this is the remote address to connect to.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
 
     /// Pre-shared password; the AEAD master key is derived from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 
     /// AEAD cipher name (e.g. `"aes-256-gcm"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cipher: Option<String>,
 
     /// Optional explicit TUN interface name (e.g. `utun7` / `tun0`). If unset,
     /// the OS picks a name.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tun_name: Option<String>,
 
     /// Local IPv4 address assigned to the TUN interface.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tun_ip: Option<Ipv4Addr>,
 
     /// IPv4 netmask for the TUN interface.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tun_netmask: Option<Ipv4Addr>,
 
     /// Peer / point-to-point destination IPv4 address inside the tunnel.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_ip: Option<Ipv4Addr>,
 
     /// TUN interface MTU.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
 
     /// Carrier obfuscation: `"none"` (default), `"quic"` (wrap datagrams to
     /// look like QUIC/HTTP3 short-header packets), or `"base64"` (printable
     /// ASCII payload). Must match the other end.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub obfs: Option<String>,
 
     // --- Client-only policy routing (ignored by the server) ----------------
     /// Policy-routing mode: `full` (default), `gfwlist`, or `chinadns`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
 
     /// Address the split-DNS proxy listens on.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_listen: Option<String>,
 
     /// Domestic / direct DNS upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_local: Option<String>,
 
     /// Clean DNS upstream (reached through the tunnel).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_remote: Option<String>,
 
     /// Path to the gfwlist domain file (gfwlist mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gfwlist: Option<PathBuf>,
 
     /// Path to the China route (CIDR) file (chinadns mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chnroute: Option<PathBuf>,
 
     /// Path to a GeoLite2/GeoIP2 country database (chinadns mode); when set, the
     /// China set is built from it instead of `chnroute`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geoip: Option<PathBuf>,
 
     /// ISO 3166-1 alpha-2 country code to select from the GeoIP database.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geoip_country: Option<String>,
 
     /// Whether to point the system resolver at the proxy automatically
     /// (default `true` in gfwlist/chinadns mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub set_dns: Option<bool>,
 
     /// Domains to pre-resolve into the cache on startup. Absent uses a built-in
     /// list of common domains; an empty list disables pre-warming.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prewarm: Option<Vec<String>>,
 
     /// Where to persist the DNS cache across restarts. Absent uses the default
     /// path; set to disable via `--no-cache-persist`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_file: Option<String>,
 
     /// Per-query DNS upstream timeout, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_timeout_ms: Option<u64>,
 }
 
@@ -296,12 +322,11 @@ pub struct ServerArgs {
 
 /// Command-line arguments for `shadowvpn-client`.
 ///
-/// Every option overrides the corresponding JSON field when present.
-#[derive(Debug, Clone, Parser)]
-#[command(
-    name = "shadowvpn-client",
-    about = "ShadowVPN client: tunnels TUN traffic to the server over encrypted UDP."
-)]
+/// Every option overrides the corresponding JSON field when present. This is an
+/// [`Args`](clap::Args) group (not a standalone `Parser`) so the binary can
+/// flatten it alongside the `uri` subcommand; the binary owns the top-level
+/// command name/about.
+#[derive(Debug, Clone, clap::Args)]
 pub struct ClientArgs {
     /// Path to a JSON config file. CLI flags override its values.
     #[arg(short = 'c', long = "config")]
