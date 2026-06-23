@@ -59,6 +59,12 @@ pub const DEFAULT_CACHE_FILE_NAME: &str = "dns-cache.json";
 /// Default per-query DNS upstream timeout, in milliseconds.
 pub const DEFAULT_DNS_TIMEOUT_MS: u64 = 3000;
 
+/// Default time-to-live for an auto-assigned tunnel-IP lease, in seconds. A
+/// lease is refreshed by any traffic (data or keepalive) from its client and
+/// reclaimed once idle for longer than this — comfortably above the client's
+/// 25-second keepalive interval.
+pub const DEFAULT_LEASE_TTL_SECS: u64 = 120;
+
 /// Errors raised while loading or validating configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -157,6 +163,22 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obfs: Option<String>,
 
+    /// Client-only: request the tunnel IP from the server instead of using a
+    /// static `tun_ip`/`peer_ip` (which then become optional). Requires the
+    /// server to run with `auto_assign`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_ip: Option<bool>,
+
+    /// Server-only: hand out tunnel IPs from the TUN subnet to clients that ask
+    /// (`auto_ip`). Ignored by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_assign: Option<bool>,
+
+    /// Server-only: lease time-to-live for auto-assigned IPs, in seconds
+    /// (default [`DEFAULT_LEASE_TTL_SECS`]). Ignored by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_secs: Option<u64>,
+
     // --- Client-only policy routing (ignored by the server) ----------------
     /// Policy-routing mode: `full` (default), `gfwlist`, or `chinadns`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,6 +276,10 @@ pub struct ServerConfig {
     pub tun: TunConfig,
     /// Carrier obfuscation name (`"quic"` | `"base64"`), or `None` for plain.
     pub obfs: Option<String>,
+    /// Hand out tunnel IPs from the TUN subnet to clients that request one.
+    pub auto_assign: bool,
+    /// Time-to-live for an auto-assigned lease (idle reclamation threshold).
+    pub lease_ttl: Duration,
 }
 
 /// Fully resolved, validated client configuration.
@@ -272,6 +298,9 @@ pub struct ClientConfig {
     /// Carrier obfuscation name (`"quic"` | `"base64"`), or `None` for plain.
     /// Must match the server.
     pub obfs: Option<String>,
+    /// Request the tunnel IP from the server at startup. When set, `tun.ip` /
+    /// `tun.peer_ip` are placeholders until the server's assignment arrives.
+    pub auto_ip: bool,
 }
 
 /// Command-line arguments for `shadowvpn-server`.
@@ -318,6 +347,14 @@ pub struct ServerArgs {
     /// TUN interface MTU.
     #[arg(long = "mtu")]
     pub mtu: Option<u16>,
+
+    /// Assign tunnel IPs from the TUN subnet to clients that request one.
+    #[arg(long = "auto-assign")]
+    pub auto_assign: bool,
+
+    /// Lease time-to-live for auto-assigned IPs, in seconds.
+    #[arg(long = "lease-ttl-secs")]
+    pub lease_ttl_secs: Option<u64>,
 }
 
 /// Command-line arguments for `shadowvpn-client`.
@@ -363,6 +400,11 @@ pub struct ClientArgs {
     /// TUN interface MTU.
     #[arg(long = "mtu")]
     pub mtu: Option<u16>,
+
+    /// Request the tunnel IP from the server (makes `tun_ip`/`peer_ip`
+    /// optional). The server must run with `--auto-assign`.
+    #[arg(long = "auto-ip")]
+    pub auto_ip: bool,
 
     /// Policy-routing mode: full | gfwlist | chinadns.
     #[arg(long = "mode")]
@@ -568,6 +610,10 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
 }
 
 /// Build the validated [`TunConfig`] from merged file + CLI values.
+///
+/// When `auto_ip` is set, `tun_ip`/`peer_ip` are optional: missing values become
+/// `0.0.0.0` placeholders that the client overwrites once the server's
+/// assignment arrives. Otherwise both are required.
 #[allow(clippy::too_many_arguments)]
 fn resolve_tun(
     name: Option<String>,
@@ -575,12 +621,24 @@ fn resolve_tun(
     netmask: Option<Ipv4Addr>,
     peer_ip: Option<Ipv4Addr>,
     mtu: Option<u16>,
+    auto_ip: bool,
 ) -> Result<TunConfig, ConfigError> {
+    let (ip, peer_ip) = if auto_ip {
+        (
+            ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            peer_ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
+        )
+    } else {
+        (
+            ip.ok_or(ConfigError::Missing("tun_ip"))?,
+            peer_ip.ok_or(ConfigError::Missing("peer_ip"))?,
+        )
+    };
     Ok(TunConfig {
         name,
-        ip: ip.ok_or(ConfigError::Missing("tun_ip"))?,
+        ip,
         netmask: netmask.unwrap_or(DEFAULT_NETMASK),
-        peer_ip: peer_ip.ok_or(ConfigError::Missing("peer_ip"))?,
+        peer_ip,
         mtu: mtu.unwrap_or(DEFAULT_TUN_MTU),
     })
 }
@@ -605,9 +663,17 @@ impl ServerArgs {
             self.tun_netmask.or(file.tun_netmask),
             self.peer_ip.or(file.peer_ip),
             self.mtu.or(file.mtu),
+            false,
         )?;
 
         let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
+
+        let auto_assign = self.auto_assign || file.auto_assign.unwrap_or(false);
+        let lease_ttl = Duration::from_secs(
+            self.lease_ttl_secs
+                .or(file.lease_ttl_secs)
+                .unwrap_or(DEFAULT_LEASE_TTL_SECS),
+        );
 
         Ok(ServerConfig {
             listen,
@@ -615,6 +681,8 @@ impl ServerArgs {
             master_key,
             tun,
             obfs,
+            auto_assign,
+            lease_ttl,
         })
     }
 }
@@ -637,12 +705,15 @@ impl ClientArgs {
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
 
+        let auto_ip = self.auto_ip || file.auto_ip.unwrap_or(false);
+
         let tun = resolve_tun(
             self.tun_name.or(file.tun_name),
             self.tun_ip.or(file.tun_ip),
             self.tun_netmask.or(file.tun_netmask),
             self.peer_ip.or(file.peer_ip),
             self.mtu.or(file.mtu),
+            auto_ip,
         )?;
 
         let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
@@ -654,6 +725,7 @@ impl ClientArgs {
             tun,
             policy,
             obfs,
+            auto_ip,
         })
     }
 }
@@ -676,6 +748,7 @@ mod tests {
                 tun_netmask: None,
                 peer_ip: None,
                 mtu: None,
+                auto_ip: false,
                 mode: None,
                 dns_listen: None,
                 dns_local: None,
@@ -705,6 +778,8 @@ mod tests {
             tun_netmask: None,
             peer_ip: Some(Ipv4Addr::new(10, 9, 0, 2)),
             mtu: None,
+            auto_assign: false,
+            lease_ttl_secs: None,
         };
         let cfg = args.resolve().expect("resolve");
         assert_eq!(cfg.listen, "0.0.0.0:9000");
@@ -815,5 +890,53 @@ mod tests {
         assert_eq!(fc.server.as_deref(), Some("1.2.3.4:8388"));
         assert_eq!(fc.cipher.as_deref(), Some("aes-256-gcm"));
         assert_eq!(fc.tun_ip, Some(Ipv4Addr::new(10, 1, 0, 2)));
+    }
+
+    #[test]
+    fn auto_ip_makes_tun_addresses_optional() {
+        // With auto_ip, neither tun_ip nor peer_ip is required; both become
+        // placeholders until the server assigns the real values.
+        let args = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            auto_ip: true,
+            ..ClientArgs::empty()
+        };
+        let cfg = args
+            .resolve()
+            .expect("auto_ip resolves without tun_ip/peer_ip");
+        assert!(cfg.auto_ip);
+        assert_eq!(cfg.tun.ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(cfg.tun.peer_ip, Ipv4Addr::UNSPECIFIED);
+
+        // Without auto_ip, the missing addresses are still an error.
+        let args = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            ..ClientArgs::empty()
+        };
+        assert!(matches!(args.resolve(), Err(ConfigError::Missing(_))));
+    }
+
+    #[test]
+    fn server_auto_assign_flag_and_default_ttl() {
+        let args = ServerArgs {
+            config: None,
+            listen: Some("0.0.0.0:1".to_string()),
+            password: Some("pw".to_string()),
+            cipher: None,
+            tun_name: None,
+            tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
+            tun_netmask: None,
+            peer_ip: Some(Ipv4Addr::new(10, 9, 0, 2)),
+            mtu: None,
+            auto_assign: true,
+            lease_ttl_secs: None,
+        };
+        let cfg = args.resolve().expect("resolve");
+        assert!(cfg.auto_assign);
+        assert_eq!(cfg.lease_ttl, Duration::from_secs(DEFAULT_LEASE_TTL_SECS));
     }
 }

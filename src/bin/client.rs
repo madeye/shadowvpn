@@ -42,12 +42,19 @@ use clap::{Parser, Subcommand};
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
-use shadowvpn::config::{ClientArgs, ClientConfig, FileConfig, TunConfig};
+use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
+use shadowvpn::control::{self, Control};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
 use shadowvpn::tun_device::TunDevice;
-use shadowvpn::uri;
+use shadowvpn::{config::FileConfig, uri};
+
+/// How many times to (re)send an auto-IP request before giving up.
+const AUTO_IP_RETRIES: u32 = 5;
+
+/// How long to wait for an ASSIGN reply after each auto-IP request.
+const AUTO_IP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often to send a keepalive datagram to the server.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
@@ -215,25 +222,43 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     info!("UDP socket {local_addr} connected to server {}", cfg.server);
     let socket = Arc::new(socket);
 
+    // --- Auto-IP assignment (optional) -------------------------------------
+    // When enabled, ask the server for our tunnel address *before* creating the
+    // TUN (the config's tun_ip/peer_ip are placeholders), then fill the TUN
+    // settings in from the server's reply.
+    let mut tun_cfg = cfg.tun.clone();
+    if cfg.auto_ip {
+        info!("auto-IP: requesting a tunnel address from the server");
+        let (ip, netmask, peer_ip, mtu) =
+            request_address(&socket, cipher, &master_key, &obfuscator)
+                .await
+                .context("auto-IP assignment failed")?;
+        tun_cfg.ip = ip;
+        tun_cfg.netmask = netmask;
+        tun_cfg.peer_ip = peer_ip;
+        tun_cfg.mtu = mtu;
+        info!("auto-IP: server assigned ip={ip} netmask={netmask} peer={peer_ip} mtu={mtu}");
+    }
+
     // --- TUN device ---------------------------------------------------------
-    let tun = TunDevice::create(&cfg.tun).with_context(|| {
+    let tun = TunDevice::create(&tun_cfg).with_context(|| {
         format!(
             "failed to create TUN device (need root/elevated privileges); \
              requested ip={} peer={} mtu={}",
-            cfg.tun.ip, cfg.tun.peer_ip, cfg.tun.mtu
+            tun_cfg.ip, tun_cfg.peer_ip, tun_cfg.mtu
         )
     })?;
     let tun = Arc::new(tun);
 
     let iface_name = tun.name().unwrap_or_else(|_| {
-        cfg.tun
+        tun_cfg
             .name
             .clone()
             .unwrap_or_else(|| "<unknown>".to_string())
     });
     info!(
         "TUN up: iface={iface_name} ip={} peer={} netmask={} mtu={}",
-        cfg.tun.ip, cfg.tun.peer_ip, cfg.tun.netmask, cfg.tun.mtu
+        tun_cfg.ip, tun_cfg.peer_ip, tun_cfg.netmask, tun_cfg.mtu
     );
 
     // --- Policy routing (optional) -----------------------------------------
@@ -248,14 +273,14 @@ async fn run(cfg: ClientConfig) -> Result<()> {
             cfg.policy.mode.name()
         );
         Some(
-            shadowvpn::policy::spawn(&cfg.policy, &iface_name, cfg.tun.ip, direct_src)
+            shadowvpn::policy::spawn(&cfg.policy, &iface_name, tun_cfg.ip, direct_src)
                 .await
                 .context("failed to start policy routing")?,
         )
     } else {
         // Tell the user how to actually route traffic through the tunnel; in
         // full mode we never mutate the routing table ourselves.
-        print_routing_hint(&cfg.tun, &cfg.server);
+        print_routing_hint(&tun_cfg, &cfg.server);
         None
     };
 
@@ -359,6 +384,91 @@ fn propagate(which: &str, joined: Result<Result<()>, tokio::task::JoinError>) ->
     }
 }
 
+/// Perform the auto-IP handshake: send a REQUEST and wait for the server's
+/// ASSIGN, retrying a few times. Returns `(ip, netmask, peer_ip, mtu)`.
+async fn request_address(
+    socket: &UdpSocket,
+    cipher: Cipher,
+    master_key: &[u8],
+    obfuscator: &Option<Arc<Obfuscator>>,
+) -> Result<(Ipv4Addr, Ipv4Addr, Ipv4Addr, u16)> {
+    // Pre-build the (encrypted, possibly obfuscated) REQUEST datagram once.
+    let request = {
+        let datagram = encrypt_packet(cipher, master_key, &Control::Request.encode())
+            .context("failed to encrypt auto-IP request")?;
+        match obfuscator {
+            Some(o) => o.wrap(&datagram),
+            None => datagram,
+        }
+    };
+
+    let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
+    for attempt in 1..=AUTO_IP_RETRIES {
+        socket
+            .send(&request)
+            .await
+            .context("failed to send auto-IP request")?;
+
+        // Wait up to the timeout for a control reply; on timeout, retry.
+        match tokio::time::timeout(
+            AUTO_IP_TIMEOUT,
+            recv_assign(socket, cipher, master_key, obfuscator, &mut buf),
+        )
+        .await
+        {
+            Ok(result) => return result,
+            Err(_) => {
+                warn!("auto-IP request attempt {attempt}/{AUTO_IP_RETRIES} timed out; retrying")
+            }
+        }
+    }
+    bail!("no address assigned by the server after {AUTO_IP_RETRIES} attempts");
+}
+
+/// Receive datagrams until an ASSIGN (Ok) or NAK (Err) control frame arrives,
+/// discarding stray data/keepalives in between.
+async fn recv_assign(
+    socket: &UdpSocket,
+    cipher: Cipher,
+    master_key: &[u8],
+    obfuscator: &Option<Arc<Obfuscator>>,
+    buf: &mut [u8],
+) -> Result<(Ipv4Addr, Ipv4Addr, Ipv4Addr, u16)> {
+    loop {
+        let n = socket
+            .recv(buf)
+            .await
+            .context("recv during auto-IP handshake")?;
+        let decoded;
+        let datagram: &[u8] = match obfuscator {
+            Some(o) => match o.unwrap(&buf[..n]) {
+                Some(inner) => {
+                    decoded = inner;
+                    &decoded
+                }
+                None => continue,
+            },
+            None => &buf[..n],
+        };
+        let plaintext = match decrypt_packet(cipher, master_key, datagram) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        match control::parse(&plaintext) {
+            Some(Control::Assign {
+                ip,
+                netmask,
+                peer_ip,
+                mtu,
+            }) => return Ok((ip, netmask, peer_ip, mtu)),
+            Some(Control::Nak(reason)) => {
+                bail!("server refused auto-IP assignment (reason code {reason})")
+            }
+            _ => continue, // stray data or keepalive; keep waiting
+        }
+    }
+}
+
 /// Loop A: read raw IP packets from TUN, encrypt, and send to the server.
 async fn tun_to_net(
     tun: Arc<TunDevice>,
@@ -451,6 +561,13 @@ async fn net_to_tun(
                 continue;
             }
         };
+
+        // Stray control frames (e.g. a duplicated ASSIGN after the handshake)
+        // are not data and must never reach the TUN.
+        if control::is_control(&plaintext) {
+            debug!("ignoring stray control frame");
+            continue;
+        }
 
         // Drop keepalive-sized payloads: anything too small to be an IP packet
         // (an IPv4 header alone is 20 bytes) must not be written to the TUN.

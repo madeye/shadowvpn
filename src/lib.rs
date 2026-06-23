@@ -36,9 +36,11 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod control;
 pub mod crypto;
 pub mod obfs;
 pub mod policy;
+pub mod pool;
 pub mod protocol;
 pub mod tun_device;
 pub mod uri;
