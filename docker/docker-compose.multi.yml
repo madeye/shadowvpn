@@ -1,10 +1,10 @@
-# Docker-based multi-client end-to-end test for ShadowVPN auto-IP assignment.
+# Docker-based multi-client end-to-end test for ShadowVPN server-side NAT.
 #
-# Brings up one server (with --auto-assign) and three clients (auto_ip: true) on
-# a private bridge. Each client requests its tunnel address from the server. The
-# driver (run-e2e-multi.sh) then checks that every client got a distinct lease,
-# can reach the server through the tunnel, and can reach the other clients
-# (server-side inner-IP routing).
+# Brings up one server (with --nat) and three clients that all run the SAME
+# static config (same placeholder tunnel IP) on a private bridge. The server
+# tells them apart by UDP endpoint and maps each onto a distinct internal IP. The
+# driver (run-e2e-multi.sh) checks that every client reaches the server through
+# the tunnel and that the server allocated a distinct internal IP per client.
 #
 #   docker/run-e2e-multi.sh            # or set CIPHER=aes-256-gcm
 
@@ -25,22 +25,22 @@ services:
   server:
     <<: *shadowvpn
     container_name: svpn-multi-server
-    command: ["run-server-auto.sh"]
+    command: ["run-server-multi.sh"]
 
   client1:
     <<: *shadowvpn
     container_name: svpn-multi-client1
     depends_on: [server]
-    command: ["run-client-auto.sh"]
+    command: ["run-client-multi.sh"]
 
   client2:
     <<: *shadowvpn
     container_name: svpn-multi-client2
     depends_on: [server]
-    command: ["run-client-auto.sh"]
+    command: ["run-client-multi.sh"]
 
   client3:
     <<: *shadowvpn
     container_name: svpn-multi-client3
     depends_on: [server]
-    command: ["run-client-auto.sh"]
+    command: ["run-client-multi.sh"]
