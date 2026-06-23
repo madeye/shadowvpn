@@ -201,8 +201,47 @@ shadowvpn-client uri import --image config-qr.png -o client.json
 The URI carries every config field, but file-path fields (`gfwlist`, `chnroute`,
 `geoip`, `cache_file`) are only meaningful on the host that has those files —
 re-point them after importing. When several clients share one server, give each a
-distinct `tun_ip`: the server routes return traffic by inner tunnel IP, so two
-clients with the same `tun_ip` would collide.
+distinct `tun_ip` — or use auto-assignment (below) so one config works for all.
+
+### Auto-assigned tunnel IPs (multiple clients)
+
+Instead of hand-allocating a distinct `tun_ip`/`peer_ip` per client, the server
+can lease addresses from its TUN subnet on demand. Enable it on the server, then
+let each client request one — so a single client config (or QR/URI) works for
+every device.
+
+**Server** — add `"auto_assign": true` (or `--auto-assign`). The pool is the
+server's TUN subnet minus the network, broadcast, and server addresses:
+
+```json
+{
+  "server": "0.0.0.0:8388",
+  "password": "correct horse battery staple",
+  "tun_ip": "10.9.0.1",
+  "tun_netmask": "255.255.255.0",
+  "peer_ip": "10.9.0.2",
+  "auto_assign": true
+}
+```
+
+**Client** — add `"auto_ip": true` (or `--auto-ip`) and drop `tun_ip`/`peer_ip`;
+the server fills them in:
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "password": "correct horse battery staple",
+  "auto_ip": true
+}
+```
+
+How it works: before bringing up its TUN, the client sends an encrypted in-band
+`REQUEST`; the server replies with an `ASSIGN` (address, netmask, peer, MTU). A
+lease is keyed by the assigned IP and kept alive by ongoing traffic (data or the
+25-second keepalive); idle leases are reclaimed after `lease_ttl_secs` (default
+120). There is no separate identity — the PSK is the authentication boundary — so
+the protocol stays minimal, with the trade-off that a client may receive a
+different IP after reconnecting.
 
 ---
 
