@@ -26,7 +26,7 @@
 //! TUN interface, with no address header. Everything else (salt, HKDF subkey,
 //! zero nonce, AEAD tag) matches the shadowsocks UDP AEAD scheme byte-for-byte.
 
-use aead::{Aead, KeyInit};
+use aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
@@ -40,6 +40,11 @@ pub const NONCE_LEN: usize = 12;
 /// AEAD authentication tag length in bytes. All supported ciphers use a
 /// 16-byte (128-bit) Poly1305 / GCM tag.
 pub const TAG_LEN: usize = 16;
+
+/// Largest key/subkey length across the supported ciphers (32 for AES-256-GCM /
+/// ChaCha20-Poly1305). Lets the per-datagram subkey live on the stack instead of
+/// a fresh heap `Vec` on every encrypt/decrypt.
+const MAX_KEY_LEN: usize = 32;
 
 /// HKDF `info` parameter used by the shadowsocks AEAD subkey derivation.
 const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
@@ -152,25 +157,34 @@ pub fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
 }
 
 /// Derive a per-datagram subkey via `HKDF-SHA1(ikm = master_key, salt, info =
-/// "ss-subkey", L = key_len)`, matching the shadowsocks AEAD subkey scheme.
-fn derive_subkey(master_key: &[u8], salt: &[u8], key_len: usize) -> Result<Vec<u8>, CryptoError> {
+/// "ss-subkey", L = key_len)`, matching the shadowsocks AEAD subkey scheme, into
+/// the caller-provided `out` (whose length is the desired key length). Writing
+/// into a borrowed slice lets callers keep the subkey on the stack.
+fn derive_subkey(master_key: &[u8], salt: &[u8], out: &mut [u8]) -> Result<(), CryptoError> {
     let hk = Hkdf::<Sha1>::new(Some(salt), master_key);
-    let mut subkey = vec![0u8; key_len];
-    hk.expand(SS_SUBKEY_INFO, &mut subkey)
-        .map_err(|_| CryptoError::Hkdf)?;
-    Ok(subkey)
+    hk.expand(SS_SUBKEY_INFO, out)
+        .map_err(|_| CryptoError::Hkdf)
 }
 
-/// Run an AEAD seal (encrypt) with a freshly derived subkey for the chosen
-/// cipher, using the all-zero 12-byte UDP nonce. Returns `ciphertext ++ tag`.
-fn aead_seal(cipher: Cipher, subkey: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// AEAD-seal `buf` (the plaintext) in place with `subkey` and the all-zero UDP
+/// nonce, returning the detached authentication tag. No allocation: the
+/// ciphertext overwrites the plaintext and the tag is returned by value.
+fn aead_seal_in_place(
+    cipher: Cipher,
+    subkey: &[u8],
+    buf: &mut [u8],
+) -> Result<[u8; TAG_LEN], CryptoError> {
     let nonce = [0u8; NONCE_LEN];
     macro_rules! seal {
         ($alg:ty) => {{
             let key = aead::Key::<$alg>::try_from(subkey).map_err(|_| CryptoError::Aead)?;
             let aead = <$alg>::new(&key);
-            aead.encrypt((&nonce).into(), plaintext)
-                .map_err(|_| CryptoError::Aead)
+            let tag = aead
+                .encrypt_inout_detached((&nonce).into(), b"", buf.into())
+                .map_err(|_| CryptoError::Aead)?;
+            let mut out = [0u8; TAG_LEN];
+            out.copy_from_slice(&tag);
+            Ok(out)
         }};
     }
     match cipher {
@@ -180,16 +194,22 @@ fn aead_seal(cipher: Cipher, subkey: &[u8], plaintext: &[u8]) -> Result<Vec<u8>,
     }
 }
 
-/// Run an AEAD open (decrypt + verify) with a derived subkey for the chosen
-/// cipher, using the all-zero 12-byte UDP nonce. Returns the recovered
-/// plaintext, or [`CryptoError::Aead`] on authentication failure.
-fn aead_open(cipher: Cipher, subkey: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// AEAD-open `buf` (the ciphertext) in place with `subkey`, the all-zero UDP
+/// nonce, and the detached `tag`. On success `buf` holds the recovered
+/// plaintext; returns [`CryptoError::Aead`] on authentication failure.
+fn aead_open_in_place(
+    cipher: Cipher,
+    subkey: &[u8],
+    buf: &mut [u8],
+    tag: &[u8],
+) -> Result<(), CryptoError> {
     let nonce = [0u8; NONCE_LEN];
     macro_rules! open {
         ($alg:ty) => {{
             let key = aead::Key::<$alg>::try_from(subkey).map_err(|_| CryptoError::Aead)?;
             let aead = <$alg>::new(&key);
-            aead.decrypt((&nonce).into(), ciphertext)
+            let tag = aead::Tag::<$alg>::try_from(tag).map_err(|_| CryptoError::Aead)?;
+            aead.decrypt_inout_detached((&nonce).into(), b"", buf.into(), &tag)
                 .map_err(|_| CryptoError::Aead)
         }};
     }
@@ -217,17 +237,22 @@ pub fn encrypt_packet(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let salt_len = cipher.salt_len();
-    let mut salt = vec![0u8; salt_len];
+
+    // Build the datagram in a single buffer: `salt ++ plaintext`, then encrypt
+    // the plaintext region in place and append the tag. One allocation total.
+    let mut datagram = Vec::with_capacity(salt_len + plaintext.len() + TAG_LEN);
+    datagram.resize(salt_len, 0);
     // `rand::rng()` is an OS-seeded, cryptographically secure thread-local RNG;
-    // each datagram gets a fresh random salt.
-    rand::rng().fill(salt.as_mut_slice());
+    // each datagram gets a fresh random salt written straight into the buffer.
+    rand::rng().fill(&mut datagram[..salt_len]);
 
-    let subkey = derive_subkey(master_key, &salt, cipher.key_len())?;
-    let ciphertext = aead_seal(cipher, &subkey, plaintext)?;
+    let mut subkey = [0u8; MAX_KEY_LEN];
+    let subkey = &mut subkey[..cipher.key_len()];
+    derive_subkey(master_key, &datagram[..salt_len], subkey)?;
 
-    let mut datagram = Vec::with_capacity(salt_len + ciphertext.len());
-    datagram.extend_from_slice(&salt);
-    datagram.extend_from_slice(&ciphertext);
+    datagram.extend_from_slice(plaintext);
+    let tag = aead_seal_in_place(cipher, subkey, &mut datagram[salt_len..])?;
+    datagram.extend_from_slice(&tag);
     Ok(datagram)
 }
 
@@ -254,9 +279,18 @@ pub fn decrypt_packet(
             need,
         });
     }
-    let (salt, ciphertext) = datagram.split_at(salt_len);
-    let subkey = derive_subkey(master_key, salt, cipher.key_len())?;
-    aead_open(cipher, &subkey, ciphertext)
+    let (salt, rest) = datagram.split_at(salt_len);
+
+    let mut subkey = [0u8; MAX_KEY_LEN];
+    let subkey = &mut subkey[..cipher.key_len()];
+    derive_subkey(master_key, salt, subkey)?;
+
+    // `rest` is `ciphertext ++ tag`; decrypt the ciphertext in place into a fresh
+    // owned buffer (the one allocation) and verify against the detached tag.
+    let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
+    let mut plaintext = ciphertext.to_vec();
+    aead_open_in_place(cipher, subkey, &mut plaintext, tag)?;
+    Ok(plaintext)
 }
 
 #[cfg(test)]

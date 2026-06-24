@@ -20,6 +20,7 @@
 //! take `pn_len = (first & 0x03) + 1`, then the payload starts at
 //! `1 + dcid_len + pn_len`.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rand::RngExt;
@@ -125,10 +126,14 @@ impl Obfuscator {
 
     /// Decode a received wire packet back to the crypto datagram, or `None` if it
     /// doesn't match this obfuscation (caller drops it).
-    pub fn unwrap(&self, pkt: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// QUIC unwrapping only strips a header prefix, so it borrows from `pkt`
+    /// (`Cow::Borrowed`) — no copy on the hot receive path. Base64 must decode
+    /// into a fresh buffer (`Cow::Owned`).
+    pub fn unwrap<'a>(&self, pkt: &'a [u8]) -> Option<Cow<'a, [u8]>> {
         match self {
-            Obfuscator::Quic(q) => q.unwrap(pkt).map(<[u8]>::to_vec),
-            Obfuscator::Base64 => base64_decode(pkt),
+            Obfuscator::Quic(q) => q.unwrap(pkt).map(Cow::Borrowed),
+            Obfuscator::Base64 => base64_decode(pkt).map(Cow::Owned),
         }
     }
 }

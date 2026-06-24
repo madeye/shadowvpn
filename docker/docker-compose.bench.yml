@@ -1,0 +1,55 @@
+# Netem-based throughput/latency benchmark for ShadowVPN.
+#
+# A server and a client container share one private bridge ("wan"), which stands
+# in for the public internet between them. Both apply a `tc netem` qdisc (delay,
+# jitter, loss, bandwidth) to that link, then the client measures latency and
+# TCP/UDP throughput through the encrypted tunnel and, for comparison, directly
+# over the same shaped link.
+#
+#   docker/run-bench.sh                     # default broadband-ish scenario
+#   DELAY=80ms LOSS=1% RATE=20mbit docker/run-bench.sh
+#
+# Both containers need NET_ADMIN (TUN + tc) and /dev/net/tun.
+
+x-bench: &bench
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.bench
+  image: shadowvpn-bench:latest
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun
+  environment:
+    # AEAD + carrier framing under test.
+    CIPHER: ${CIPHER:-chacha20-poly1305}
+    OBFS: ${OBFS:-none}
+    MTU: ${MTU:-1400}
+    # Emulated internet path (applied per side; RTT ~ 2x DELAY).
+    DELAY: ${DELAY:-20ms}
+    JITTER: ${JITTER:-5ms}
+    LOSS: ${LOSS:-0.05%}
+    RATE: ${RATE:-100mbit}
+    # Measurement knobs.
+    DURATION: ${DURATION:-10}
+    UDP_RATE: ${UDP_RATE:-50M}
+    RUST_LOG: ${RUST_LOG:-warn}
+
+networks:
+  wan:
+    driver: bridge
+
+services:
+  server:
+    <<: *bench
+    container_name: shadowvpn-bench-server
+    networks: [wan]
+    command: ["bench-server.sh"]
+
+  client:
+    <<: *bench
+    container_name: shadowvpn-bench-client
+    networks: [wan]
+    depends_on:
+      - server
+    command: ["bench-client.sh"]
