@@ -9,8 +9,10 @@
 //! shadowvpn-uri export -c client.json [--qr]
 //! shadowvpn-uri import 'shadowvpn://…' -o client.json
 //! shadowvpn-uri import --image qr.png -o client.json
+//! shadowvpn-uri qr 'shadowvpn://…'
 //! ```
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -51,6 +53,11 @@ enum Action {
         #[arg(short = 'o', long = "out")]
         out: Option<PathBuf>,
     },
+    /// Render an existing `shadowvpn://` URI as a scannable QR code in the terminal.
+    Qr {
+        /// The `shadowvpn://` URI. Omit to read it from stdin.
+        uri: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -84,6 +91,24 @@ fn main() -> Result<()> {
                 }
                 None => println!("{json}"),
             }
+            Ok(())
+        }
+        Action::Qr { uri } => {
+            let text = match uri {
+                Some(s) => s,
+                None => {
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("reading URI from stdin")?;
+                    buf
+                }
+            };
+            let text = text.trim();
+            // Validate it really is a config URI so we don't paint a QR of a typo.
+            uri::decode(text).context("not a valid shadowvpn:// URI")?;
+            let rendered = uri::render_qr(text).context("rendering QR code")?;
+            println!("{rendered}");
             Ok(())
         }
     }
