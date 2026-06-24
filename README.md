@@ -369,16 +369,23 @@ DELAY=80ms LOSS=1% RATE=20mbit ./docker/run-bench.sh  # lossy mobile-ish link
 
 Scenario knobs (all environment variables, with defaults): `CIPHER`, `OBFS`
 (`none`/`quic`/`base64`), `MTU`, `DELAY` (one-way; RTT ≈ 2×), `JITTER`, `LOSS`,
-`RATE`, `DURATION`, `UDP_RATE`. The run prints a summary table:
+`RATE`, `DURATION`, `UDP_RATE`. The run prints a summary table — for example, a
+clean ~100 Mbit/s broadband path (RTT ≈ 48 ms, 0 % loss) with the default
+cipher:
 
 ```text
  Metric                       Tunnel        Direct(WAN)
- RTT (ms)                     48.3            45.7
- TCP upload   (Mbit/s)        26.4            89.1
- TCP download (Mbit/s)        15.4            91.5
+ RTT (ms)                     48.0            51.2
+ TCP upload   (Mbit/s)        68.8            77.6
+ TCP download (Mbit/s)        87.3            93.3
  UDP @ 50M (Mbit/s)           50.0            50.0
- UDP loss (%)                 0.04            0.04
+ UDP loss (%)                 0.00            0.00
 ```
+
+Both columns cross the same shaped link, so the gap is ShadowVPN's own overhead
+(here ~15–25 % on TCP; UDP stays at line rate). Full results across ciphers,
+carrier framing, and a lossy/high-latency link — plus how to read them — are in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 Needs `NET_ADMIN` and `/dev/net/tun` (requested by the compose file). It is a
 measurement tool, not a CI gate — the absolute numbers depend on the host.
