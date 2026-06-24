@@ -200,6 +200,9 @@ shadowvpn-uri import 'shadowvpn://…' -o client.json
 
 # Import by decoding a QR-code image instead of pasting the URI:
 shadowvpn-uri import --image config-qr.png -o client.json
+
+# Render an existing shadowvpn:// URI as a terminal QR code (also reads stdin):
+shadowvpn-uri qr 'shadowvpn://…'
 ```
 
 The URI carries every config field, but file-path fields (`gfwlist`, `chnroute`,
