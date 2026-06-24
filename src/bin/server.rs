@@ -23,7 +23,7 @@
 //! logged and dropped; they never crash the server.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 use shadowvpn::config::{ServerArgs, ServerConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet};
@@ -53,6 +54,11 @@ enum Routing {
 /// Shared routing state.
 type Shared = Arc<Mutex<Routing>>;
 
+/// Depth of the hand-off channel between each relay loop's I/O reader and its
+/// processor. Bounded so a slow processor applies backpressure rather than
+/// buffering without limit; deep enough to absorb short bursts at line rate.
+const CHANNEL_DEPTH: usize = 1024;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Default to `info` so the startup banner and routing events are visible
@@ -73,8 +79,13 @@ async fn main() -> Result<()> {
 /// Bind the socket, bring up TUN, print the banner, and run both forwarding
 /// loops (plus the NAT sweeper) until one of them fails.
 async fn run(cfg: ServerConfig) -> Result<()> {
-    let socket = UdpSocket::bind(&cfg.listen)
-        .await
+    let listen_addr = cfg
+        .listen
+        .to_socket_addrs()
+        .with_context(|| format!("resolving listen address {}", cfg.listen))?
+        .next()
+        .with_context(|| format!("no address resolved for {}", cfg.listen))?;
+    let socket = shadowvpn::net::bind_udp(listen_addr)
         .with_context(|| format!("failed to bind UDP socket on {}", cfg.listen))?;
     let socket = Arc::new(socket);
 
@@ -164,6 +175,12 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 }
 
 /// Loop A: receive encrypted datagrams, decrypt, route/rewrite, write to TUN.
+///
+/// Split into a pipeline so socket I/O overlaps the per-packet crypto: a
+/// **reader** drains the UDP socket into a bounded channel as fast as the kernel
+/// delivers (so bursts are not dropped while a packet is being decrypted), and a
+/// single **processor** de-obfuscates, decrypts, routes/rewrites, and writes to
+/// TUN. One processor keeps packets in order.
 async fn udp_to_tun(
     socket: Arc<UdpSocket>,
     tun: Arc<TunDevice>,
@@ -172,94 +189,123 @@ async fn udp_to_tun(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    // Extra headroom for the obfs prefix on top of the largest crypto datagram.
-    let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
-    loop {
-        let (n, peer) = socket
-            .recv_from(&mut buf)
-            .await
-            .context("UDP recv_from failed")?;
+    let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(CHANNEL_DEPTH);
 
-        // De-obfuscate when enabled; a packet that doesn't match the configured
-        // obfuscation is noise/probe traffic — drop it. `decoded` owns the bytes
-        // for variants (base64) that can't borrow from `buf`.
-        let decoded;
-        let datagram: &[u8] = match obfuscator {
-            Some(ref o) => match o.unwrap(&buf[..n]) {
-                Some(inner) => {
-                    decoded = inner;
-                    &decoded
-                }
-                None => {
-                    debug!("dropping {n}-byte non-obfs datagram from {peer}");
-                    continue;
-                }
-            },
-            None => &buf[..n],
-        };
-
-        let mut plaintext = match decrypt_packet(cipher, &cfg.master_key, datagram) {
-            Ok(pt) => pt,
-            Err(err) => {
-                // Bad PSK, corruption, or stray traffic — drop and continue.
-                debug!("dropping {n}-byte datagram from {peer}: decrypt failed: {err}");
-                continue;
+    // Reader: pull datagrams off the wire and hand each to the processor.
+    let reader = tokio::spawn(async move {
+        // Extra headroom for the obfs prefix on top of the largest crypto datagram.
+        let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
+        loop {
+            let (n, peer) = socket
+                .recv_from(&mut buf)
+                .await
+                .context("UDP recv_from failed")?;
+            if tx.send((peer, buf[..n].to_vec())).await.is_err() {
+                return Ok(()); // processor gone; nothing left to feed
             }
-        };
-
-        let now = Instant::now();
-
-        // Sub-IP-header payloads (the client keepalive) must not reach TUN, but
-        // still refresh the sender's NAT mapping so a quiet client isn't reaped.
-        if plaintext.len() < 20 {
-            if let Routing::Nat(nat) = &mut *routing.lock().unwrap() {
-                nat.touch(peer, now);
-            }
-            debug!(
-                "dropping {}-byte sub-IP-header payload from {peer} (keepalive?)",
-                plaintext.len()
-            );
-            continue;
         }
+    });
 
-        // Route/rewrite under the lock; release it before the awaited TUN write.
-        let forward = {
-            let mut guard = routing.lock().unwrap();
-            match &mut *guard {
-                Routing::Learn(clients) => {
-                    if let Some(src) = ipv4_src(&plaintext) {
-                        if clients.insert(src, peer) != Some(peer) {
-                            info!("client {src} reachable via {peer}");
-                        }
-                    } else {
-                        debug!("datagram from {peer} is not a parseable IPv4 packet; forwarding");
+    // Processor: de-obfuscate, decrypt, route/rewrite, write to TUN.
+    let processor = tokio::spawn(async move {
+        while let Some((peer, pkt)) = rx.recv().await {
+            let n = pkt.len();
+
+            // De-obfuscate when enabled; a packet that doesn't match the configured
+            // obfuscation is noise/probe traffic — drop it. `decoded` (a `Cow`)
+            // borrows from `pkt` for QUIC and owns for base64.
+            let decoded;
+            let datagram: &[u8] = match obfuscator {
+                Some(ref o) => match o.unwrap(&pkt) {
+                    Some(inner) => {
+                        decoded = inner;
+                        &decoded
                     }
-                    true
-                }
-                Routing::Nat(nat) => match nat.ingress(peer, &mut plaintext, now) {
-                    Ingress::Rewritten(_) => true,
-                    Ingress::Exhausted => {
-                        warn!("NAT address pool exhausted; dropping packet from {peer}");
-                        false
-                    }
-                    Ingress::Invalid => {
-                        debug!("unparseable IPv4 packet from {peer}; dropping");
-                        false
+                    None => {
+                        debug!("dropping {n}-byte non-obfs datagram from {peer}");
+                        continue;
                     }
                 },
-            }
-        };
+                None => &pkt,
+            };
 
-        if forward {
-            if let Err(err) = tun.send(&plaintext).await {
-                // A TUN write error is fatal: the interface is gone or broken.
-                return Err(err).context("failed to write packet to TUN");
+            let mut plaintext = match decrypt_packet(cipher, &cfg.master_key, datagram) {
+                Ok(pt) => pt,
+                Err(err) => {
+                    // Bad PSK, corruption, or stray traffic — drop and continue.
+                    debug!("dropping {n}-byte datagram from {peer}: decrypt failed: {err}");
+                    continue;
+                }
+            };
+
+            let now = Instant::now();
+
+            // Sub-IP-header payloads (the client keepalive) must not reach TUN, but
+            // still refresh the sender's NAT mapping so a quiet client isn't reaped.
+            if plaintext.len() < 20 {
+                if let Routing::Nat(nat) = &mut *routing.lock().unwrap() {
+                    nat.touch(peer, now);
+                }
+                debug!(
+                    "dropping {}-byte sub-IP-header payload from {peer} (keepalive?)",
+                    plaintext.len()
+                );
+                continue;
+            }
+
+            // Route/rewrite under the lock; release it before the awaited TUN write.
+            let forward = {
+                let mut guard = routing.lock().unwrap();
+                match &mut *guard {
+                    Routing::Learn(clients) => {
+                        if let Some(src) = ipv4_src(&plaintext) {
+                            if clients.insert(src, peer) != Some(peer) {
+                                info!("client {src} reachable via {peer}");
+                            }
+                        } else {
+                            debug!(
+                                "datagram from {peer} is not a parseable IPv4 packet; forwarding"
+                            );
+                        }
+                        true
+                    }
+                    Routing::Nat(nat) => match nat.ingress(peer, &mut plaintext, now) {
+                        Ingress::Rewritten(_) => true,
+                        Ingress::Exhausted => {
+                            warn!("NAT address pool exhausted; dropping packet from {peer}");
+                            false
+                        }
+                        Ingress::Invalid => {
+                            debug!("unparseable IPv4 packet from {peer}; dropping");
+                            false
+                        }
+                    },
+                }
+            };
+
+            if forward {
+                tun.send(&plaintext)
+                    .await
+                    .context("failed to write packet to TUN")?;
             }
         }
+        Ok(())
+    });
+
+    // First task to finish (only on a fatal error) ends the loop; abort the other.
+    let mut reader = reader;
+    let mut processor = processor;
+    tokio::select! {
+        r = &mut reader => { processor.abort(); r.context("UDP→TUN reader task panicked")? }
+        r = &mut processor => { reader.abort(); r.context("UDP→TUN processor task panicked")? }
     }
 }
 
 /// Loop B: read IP packets from TUN, find the destination client, encrypt, send.
+///
+/// Same reader/processor split as [`udp_to_tun`]: a **reader** drains the TUN
+/// device into a bounded channel, and a single **processor** resolves the
+/// destination (rewriting under NAT), encrypts, obfuscates, and sends.
 async fn tun_to_udp(
     socket: Arc<UdpSocket>,
     tun: Arc<TunDevice>,
@@ -268,51 +314,74 @@ async fn tun_to_udp(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    let mut buf = vec![0u8; MAX_IP_PACKET];
-    loop {
-        let n = tun
-            .recv(&mut buf)
-            .await
-            .context("failed to read from TUN")?;
-        let now = Instant::now();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
-        // Resolve (and, in NAT mode, rewrite) the destination under the lock.
-        let peer = {
-            let mut guard = routing.lock().unwrap();
-            match &mut *guard {
-                Routing::Learn(clients) => {
-                    ipv4_dst(&buf[..n]).and_then(|dst| clients.get(&dst).copied())
-                }
-                Routing::Nat(nat) => nat.egress(&mut buf[..n], now),
+    // Reader: pull IP packets off the TUN device and hand each to the processor.
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_IP_PACKET];
+        loop {
+            let n = tun
+                .recv(&mut buf)
+                .await
+                .context("failed to read from TUN")?;
+            if tx.send(buf[..n].to_vec()).await.is_err() {
+                return Ok(());
             }
-        };
-
-        let peer = match peer {
-            Some(peer) => peer,
-            None => {
-                debug!("dropping {n}-byte TUN packet: no known client for its destination");
-                continue;
-            }
-        };
-
-        let datagram = match encrypt_packet(cipher, &cfg.master_key, &buf[..n]) {
-            Ok(d) => d,
-            Err(err) => {
-                warn!("failed to encrypt packet for {peer}: {err}");
-                continue;
-            }
-        };
-
-        // Shape the reply to look like a QUIC packet when obfuscation is on.
-        let datagram = match obfuscator {
-            Some(ref o) => o.wrap(&datagram),
-            None => datagram,
-        };
-
-        if let Err(err) = socket.send_to(&datagram, peer).await {
-            // A transient send error to one client must not kill the server.
-            warn!("failed to send datagram to {peer}: {err}");
         }
+    });
+
+    // Processor: resolve/rewrite the destination, encrypt, obfuscate, send.
+    let processor = tokio::spawn(async move {
+        while let Some(mut pkt) = rx.recv().await {
+            let n = pkt.len();
+            let now = Instant::now();
+
+            // Resolve (and, in NAT mode, rewrite) the destination under the lock.
+            let peer = {
+                let mut guard = routing.lock().unwrap();
+                match &mut *guard {
+                    Routing::Learn(clients) => {
+                        ipv4_dst(&pkt).and_then(|dst| clients.get(&dst).copied())
+                    }
+                    Routing::Nat(nat) => nat.egress(&mut pkt, now),
+                }
+            };
+
+            let peer = match peer {
+                Some(peer) => peer,
+                None => {
+                    debug!("dropping {n}-byte TUN packet: no known client for its destination");
+                    continue;
+                }
+            };
+
+            let datagram = match encrypt_packet(cipher, &cfg.master_key, &pkt) {
+                Ok(d) => d,
+                Err(err) => {
+                    warn!("failed to encrypt packet for {peer}: {err}");
+                    continue;
+                }
+            };
+
+            // Shape the reply to look like a QUIC packet when obfuscation is on.
+            let datagram = match obfuscator {
+                Some(ref o) => o.wrap(&datagram),
+                None => datagram,
+            };
+
+            if let Err(err) = socket.send_to(&datagram, peer).await {
+                // A transient send error to one client must not kill the server.
+                warn!("failed to send datagram to {peer}: {err}");
+            }
+        }
+        Ok(())
+    });
+
+    let mut reader = reader;
+    let mut processor = processor;
+    tokio::select! {
+        r = &mut reader => { processor.abort(); r.context("TUN→UDP reader task panicked")? }
+        r = &mut processor => { reader.abort(); r.context("TUN→UDP processor task panicked")? }
     }
 }
 

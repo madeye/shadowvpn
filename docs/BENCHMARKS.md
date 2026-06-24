@@ -47,33 +47,51 @@ for figures that matter to you.
 | CPU | Apple M4 (10 cores), arm64 |
 | Host OS | macOS 26.5 |
 | Docker | 29.2.1, Compose 5.0.2 (Linux VM) |
-| Build | `--release` (fat LTO, `codegen-units = 1`) |
+| Build | `--release` (fat LTO, `codegen-units = 1`), pipelined relay loops, 4 MiB UDP buffers |
 | iperf3 | 10 s per stream |
+
+### Throughput ceiling — RTT ≈ 3 ms, 0 % loss, 4 Gbit/s cap
+
+How fast the tunnel goes when the *link* is not the limit. This is where the data
+plane's own ceiling shows, and where decoupling socket I/O from the per-packet
+crypto (a dedicated reader task feeding a single ordered processor, plus enlarged
+socket buffers) pays off:
+
+| Relay loops | TCP up (Mbit/s) | TCP down (Mbit/s) | UDP @ 2G loss |
+|------------------------------|-----------------|-------------------|---------------|
+| serial `recv → crypt → send` | 285 | 317 | 42 % |
+| **pipelined (reader ‖ processor)** | **1007** | **1003** | 37 % |
+| direct (no tunnel), for scale | 3811 | 3821 | 0.05 % |
+
+The pipeline **~3.2×'s single-flow TCP** through the tunnel (≈0.3 → ≈1.0 Gbit/s)
+by overlapping the receive syscall with decryption and the send. One-way UDP at a
+2 Gbit/s offer still sheds ~37 % — past ~1.25 Gbit/s the single crypto+send
+processor becomes the limit, so a blast like that is the next frontier (parallel
+crypto workers, at the cost of reordering). Real traffic is TCP, which is the row
+that moved.
 
 ### Clean broadband — RTT ≈ 48 ms, 0 % loss, 100 Mbit/s cap
 
 | Cipher / obfs | Dir. | RTT (ms) | TCP up (Mbit/s) | TCP down (Mbit/s) | UDP @ 50M loss |
 |------------------------------|--------|---------|-----------------|-------------------|----------------|
-| chacha20-poly1305 / none | tunnel | 48.0 | 68.8 | 87.3 | 0.00 % |
-| | direct | 51.2 | 77.6 | 93.3 | 0.00 % |
-| chacha20-poly1305 / quic | tunnel | 47.0 | 69.1 | 73.6 | 0.00 % |
-| | direct | 46.9 | 90.0 | 90.2 | 0.00 % |
-| aes-256-gcm / none | tunnel | 48.5 | 69.7 | 74.3 | 0.00 % |
-| | direct | 45.3 | 85.7 | 90.3 | 0.00 % |
+| chacha20-poly1305 / none | tunnel | 45.2 | 87.6 | 88.2 | 0.00 % |
+| | direct | 47.4 | 92.8 | 83.0 | 0.00 % |
+| chacha20-poly1305 / quic | tunnel | 45.1 | 86.1 | 86.6 | 0.00 % |
+| | direct | 45.1 | 77.9 | 81.7 | 0.00 % |
+| aes-256-gcm / none | tunnel | 49.7 | 73.8 | 87.2 | 0.00 % |
+| | direct | 47.2 | 89.7 | 85.7 | 0.00 % |
 
-The tunnel sustains roughly **70 Mbit/s up and 75–87 Mbit/s down** against an
-80–93 Mbit/s direct baseline — a modest ~15–25 % overhead — and it is
-**consistent across ciphers**: at these rates the link and per-packet latency
-dominate, not the AEAD. UDP rides at line rate with zero loss. The QUIC carrier
-adds a few bytes per packet and a slightly lower TCP ceiling, as expected for the
-extra framing.
+At ~100 Mbit/s the tunnel runs **at or near line rate** — within a few percent of
+the direct baseline, and effectively at parity within run-to-run noise — because
+the link, not ShadowVPN, is the bottleneck here. UDP rides at line rate with zero
+loss; cipher and carrier framing barely move the result.
 
 ### Lossy / higher-latency link — RTT ≈ 165 ms, 1 % loss, 20 Mbit/s cap
 
 | Cipher / obfs | Dir. | RTT (ms) | TCP up (Mbit/s) | TCP down (Mbit/s) | UDP @ 50M loss |
 |------------------------------|--------|---------|-----------------|-------------------|----------------|
-| chacha20-poly1305 / none | tunnel | 172.4 | 0.9 | 1.3 | 61.0 % |
-| | direct | 159.3 | 3.3 | 4.1 | 58.7 % |
+| chacha20-poly1305 / none | tunnel | 172.3 | 0.8 | 1.7 | 61.0 % |
+| | direct | 163.9 | 3.6 | 3.1 | 58.8 % |
 
 Here a single TCP flow collapses on **both** paths — classic high-RTT + 1 % loss
 behaviour for one cubic flow — with the tunnel a bit lower than direct because of
@@ -84,13 +102,19 @@ loss-recovery is.
 
 ## Interpretation
 
-- **Forwarding capacity is not the limit.** UDP runs at line rate with
-  link-level loss in every scenario; the per-packet crypto/obfs path keeps up.
-- **The TCP gap is latency- and loss-bound,** not CPU-bound. It is widest on
+- **Decoupling I/O from crypto roughly tripled single-flow TCP** at high rates
+  (≈0.3 → ≈1.0 Gbit/s) and closed the gap to the direct baseline at broadband
+  rates. A dedicated reader task drains the socket/TUN continuously instead of
+  stalling on the crypto+send of the previous packet, so the carrier stops
+  dropping bursts and TCP can keep its window full.
+- **Forwarding capacity is no longer the everyday limit.** UDP runs at line rate
+  with link-level loss in every realistic scenario; only a multi-Gbit one-way
+  blast still saturates the single crypto+send processor.
+- **The remaining TCP gap is latency- and loss-bound,** not CPU-bound — widest on
   high-RTT/lossy links, where a single tunneled flow inherits the carrier's loss
-  as inner-packet drops. The most promising next step is decoupling socket I/O
-  from crypto in the relay loops (and larger socket buffers) so the data plane
-  pipelines instead of doing strict `recv → crypt → send` per packet.
+  as inner-packet drops. The next lever for that regime is parallel crypto
+  workers with a reorder buffer (a larger change, traded against packet
+  reordering).
 - **Cipher choice barely moves throughput here** because the link, not the AEAD,
   is the bottleneck at ≤ 100 Mbit/s. On CPU-bound links (or ARM without AES
   acceleration) it matters more — see the cipher notes in the

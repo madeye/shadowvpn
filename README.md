@@ -375,16 +375,19 @@ cipher:
 
 ```text
  Metric                       Tunnel        Direct(WAN)
- RTT (ms)                     48.0            51.2
- TCP upload   (Mbit/s)        68.8            77.6
- TCP download (Mbit/s)        87.3            93.3
+ RTT (ms)                     45.2            47.4
+ TCP upload   (Mbit/s)        87.6            92.8
+ TCP download (Mbit/s)        88.2            83.0
  UDP @ 50M (Mbit/s)           50.0            50.0
  UDP loss (%)                 0.00            0.00
 ```
 
-Both columns cross the same shaped link, so the gap is ShadowVPN's own overhead
-(here ~15–25 % on TCP; UDP stays at line rate). Full results across ciphers,
-carrier framing, and a lossy/high-latency link — plus how to read them — are in
+Both columns cross the same shaped link, so the gap is ShadowVPN's own overhead —
+at ~100 Mbit/s the tunnel runs at or near line rate. When the link is *not* the
+limit the data plane's own ceiling shows: the pipelined relay loops carry single-
+flow TCP at ~1 Gbit/s (≈3× a strict per-packet `recv → crypt → send` loop). Full
+results across ciphers, carrier framing, a lossy/high-latency link, and that
+ceiling comparison — plus how to read them — are in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 Needs `NET_ADMIN` and `/dev/net/tun` (requested by the compose file). It is a
@@ -651,6 +654,7 @@ that resolved IP.
 src/
   lib.rs          crate root + module docs
   crypto.rs       Cipher enum, EVP_BytesToKey, HKDF-SHA1 subkey, AEAD seal/open
+  net.rs          UDP socket construction with enlarged SO_RCVBUF/SO_SNDBUF
   protocol.rs     tunnel framing constants and buffer sizing
   config.rs       JSON file + clap CLI config, merge/validate
   tun_device.rs   async TUN wrapper (tun-rs: macOS utun, Linux, Windows Wintun)

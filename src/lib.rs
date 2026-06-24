@@ -45,6 +45,7 @@
 //!
 //! * [`crypto`] — cipher abstraction, key derivation, packet encrypt/decrypt.
 //! * [`config`] — JSON + CLI configuration for the server and client.
+//! * [`net`] — UDP socket construction with enlarged kernel buffers.
 //! * [`protocol`] — tunnel framing constants and buffer sizing.
 //! * [`obfs`] — optional carrier obfuscation (QUIC/HTTP3-shaped or base64).
 //! * [`tun_device`] — async TUN interface wrapper (macOS utun + Linux + Windows).
@@ -58,6 +59,7 @@
 pub mod config;
 pub mod crypto;
 pub mod nat;
+pub mod net;
 pub mod obfs;
 pub mod policy;
 pub mod pool;
