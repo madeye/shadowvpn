@@ -40,6 +40,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
@@ -49,6 +50,10 @@ use shadowvpn::tun_device::TunDevice;
 
 /// How often to send a keepalive datagram to the server.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
+
+/// Depth of the hand-off channel between each relay loop's I/O reader and its
+/// processor (see the server for the rationale). Bounded for backpressure.
+const CHANNEL_DEPTH: usize = 1024;
 
 /// Plaintext payload of a keepalive datagram: a single zero byte. Smaller than
 /// any real IP packet header, so the server can distinguish/drop it cheaply.
@@ -96,8 +101,7 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     // the physical default route is unchanged. Connecting first resolves the
     // route against the pristine table and pins the socket to the physical
     // 5-tuple, so the tunnel coming up afterwards no longer affects it.
-    let socket = UdpSocket::bind(("0.0.0.0", 0))
-        .await
+    let socket = shadowvpn::net::bind_udp("0.0.0.0:0".parse().expect("valid bind address"))
         .context("failed to bind local UDP socket")?;
     socket
         .connect(&cfg.server)
@@ -262,6 +266,10 @@ fn propagate(which: &str, joined: Result<Result<()>, tokio::task::JoinError>) ->
 }
 
 /// Loop A: read raw IP packets from TUN, encrypt, and send to the server.
+///
+/// Pipelined so TUN reads overlap the per-packet encryption + UDP send: a
+/// **reader** drains the TUN device into a bounded channel, and a single
+/// **processor** encrypts, obfuscates, and sends (order preserved).
 async fn tun_to_net(
     tun: Arc<TunDevice>,
     socket: Arc<UdpSocket>,
@@ -269,47 +277,76 @@ async fn tun_to_net(
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
-    // Plaintext buffer sized for the largest IP packet we might read.
-    let mut buf = vec![0u8; MAX_IP_PACKET];
-    loop {
-        let n = tun
-            .recv(&mut buf)
-            .await
-            .context("failed to read from TUN device")?;
-        if n == 0 {
-            continue;
-        }
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
-        // Encrypt this IP packet into one on-wire datagram. A crypto failure
-        // here is non-fatal (skip the packet) — it should not normally happen
-        // since we control the key and input.
-        let datagram = match encrypt_packet(cipher, &master_key, &buf[..n]) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("failed to encrypt a {n}-byte packet, dropping: {e}");
+    // Reader: pull IP packets off the TUN device and hand each to the processor.
+    let reader = tokio::spawn(async move {
+        // Plaintext buffer sized for the largest IP packet we might read.
+        let mut buf = vec![0u8; MAX_IP_PACKET];
+        loop {
+            let n = tun
+                .recv(&mut buf)
+                .await
+                .context("failed to read from TUN device")?;
+            if n == 0 {
                 continue;
             }
-        };
-
-        // Apply carrier obfuscation (if enabled) just before the wire.
-        let wire = match obfuscator {
-            Some(ref o) => o.wrap(&datagram),
-            None => datagram,
-        };
-
-        // A failed send to a connected socket is treated as fatal.
-        if let Err(e) = socket.send(&wire).await {
-            return Err(e).context("failed to send datagram to server");
+            if tx.send(buf[..n].to_vec()).await.is_err() {
+                return Ok(());
+            }
         }
-        debug!(
-            "tun->net: {n} bytes plaintext -> {} bytes on wire",
-            wire.len()
-        );
+    });
+
+    // Processor: encrypt, obfuscate, and send to the server.
+    let processor = tokio::spawn(async move {
+        while let Some(pkt) = rx.recv().await {
+            let n = pkt.len();
+
+            // Encrypt this IP packet into one on-wire datagram. A crypto failure
+            // here is non-fatal (skip the packet) — it should not normally happen
+            // since we control the key and input.
+            let datagram = match encrypt_packet(cipher, &master_key, &pkt) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("failed to encrypt a {n}-byte packet, dropping: {e}");
+                    continue;
+                }
+            };
+
+            // Apply carrier obfuscation (if enabled) just before the wire.
+            let wire = match obfuscator {
+                Some(ref o) => o.wrap(&datagram),
+                None => datagram,
+            };
+
+            // A failed send to a connected socket is treated as fatal.
+            socket
+                .send(&wire)
+                .await
+                .context("failed to send datagram to server")?;
+            debug!(
+                "tun->net: {n} bytes plaintext -> {} bytes on wire",
+                wire.len()
+            );
+        }
+        Ok(())
+    });
+
+    let mut reader = reader;
+    let mut processor = processor;
+    tokio::select! {
+        r = &mut reader => { processor.abort(); r.context("tun->net reader task panicked")? }
+        r = &mut processor => { reader.abort(); r.context("tun->net processor task panicked")? }
     }
 }
 
 /// Loop B: receive datagrams from the server, decrypt, and write the resulting
 /// IP packet to the TUN device.
+///
+/// Pipelined so UDP receives overlap decryption + the TUN write: a **reader**
+/// drains the socket into a bounded channel (so reply bursts are not dropped
+/// while a packet is being decrypted), and a single **processor** de-obfuscates,
+/// decrypts, and writes to TUN (order preserved).
 async fn net_to_tun(
     tun: Arc<TunDevice>,
     socket: Arc<UdpSocket>,
@@ -317,58 +354,81 @@ async fn net_to_tun(
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
-    // UDP buffer sized for the encrypted form of the largest IP packet, plus
-    // headroom for the obfs prefix when obfuscation is enabled.
-    let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
-    loop {
-        let n = match socket.recv(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => return Err(e).context("failed to receive datagram from server"),
-        };
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
-        // De-obfuscate (if enabled); a packet that doesn't match the configured
-        // obfuscation is noise/probe traffic — drop it. `decoded` owns the bytes
-        // for variants (base64) that can't borrow from `buf`.
-        let decoded;
-        let datagram: &[u8] = match obfuscator {
-            Some(ref o) => match o.unwrap(&buf[..n]) {
-                Some(inner) => {
-                    decoded = inner;
-                    &decoded
-                }
-                None => {
-                    debug!("dropping {n}-byte non-obfs datagram");
+    // Reader: pull datagrams off the socket and hand each to the processor.
+    let reader = tokio::spawn(async move {
+        // UDP buffer sized for the encrypted form of the largest IP packet, plus
+        // headroom for the obfs prefix when obfuscation is enabled.
+        let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
+        loop {
+            let n = socket
+                .recv(&mut buf)
+                .await
+                .context("failed to receive datagram from server")?;
+            if tx.send(buf[..n].to_vec()).await.is_err() {
+                return Ok(());
+            }
+        }
+    });
+
+    // Processor: de-obfuscate, decrypt, and write to TUN.
+    let processor = tokio::spawn(async move {
+        while let Some(pkt) = rx.recv().await {
+            let n = pkt.len();
+
+            // De-obfuscate (if enabled); a packet that doesn't match the configured
+            // obfuscation is noise/probe traffic — drop it. `decoded` (a `Cow`)
+            // borrows from `pkt` for QUIC and owns for base64.
+            let decoded;
+            let datagram: &[u8] = match obfuscator {
+                Some(ref o) => match o.unwrap(&pkt) {
+                    Some(inner) => {
+                        decoded = inner;
+                        &decoded
+                    }
+                    None => {
+                        debug!("dropping {n}-byte non-obfs datagram");
+                        continue;
+                    }
+                },
+                None => &pkt,
+            };
+
+            // Bad/forged/corrupt datagrams (too short or failing AEAD auth) are
+            // dropped, not fatal — this is normal on an open UDP port.
+            let plaintext = match decrypt_packet(cipher, &master_key, datagram) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("dropping undecryptable {n}-byte datagram: {e}");
                     continue;
                 }
-            },
-            None => &buf[..n],
-        };
+            };
 
-        // Bad/forged/corrupt datagrams (too short or failing AEAD auth) are
-        // dropped, not fatal — this is normal on an open UDP port.
-        let plaintext = match decrypt_packet(cipher, &master_key, datagram) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!("dropping undecryptable {n}-byte datagram: {e}");
+            // Drop keepalive-sized payloads: anything too small to be an IP packet
+            // (an IPv4 header alone is 20 bytes) must not be written to the TUN.
+            if plaintext.len() < 20 {
+                debug!("dropping {}-byte sub-IP-header payload", plaintext.len());
                 continue;
             }
-        };
 
-        // Drop keepalive-sized payloads: anything too small to be an IP packet
-        // (an IPv4 header alone is 20 bytes) must not be written to the TUN.
-        if plaintext.len() < 20 {
-            debug!("dropping {}-byte sub-IP-header payload", plaintext.len());
-            continue;
-        }
-
-        if let Err(e) = tun.send(&plaintext).await {
             // A write failure to our own TUN device is fatal.
-            return Err(e).context("failed to write packet to TUN device");
+            tun.send(&plaintext)
+                .await
+                .context("failed to write packet to TUN device")?;
+            debug!(
+                "net->tun: {n} bytes datagram -> {} bytes plaintext",
+                plaintext.len()
+            );
         }
-        debug!(
-            "net->tun: {n} bytes datagram -> {} bytes plaintext",
-            plaintext.len()
-        );
+        Ok(())
+    });
+
+    let mut reader = reader;
+    let mut processor = processor;
+    tokio::select! {
+        r = &mut reader => { processor.abort(); r.context("net->tun reader task panicked")? }
+        r = &mut processor => { reader.abort(); r.context("net->tun processor task panicked")? }
     }
 }
 
