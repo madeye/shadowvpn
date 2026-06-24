@@ -5,6 +5,18 @@ edition = "2021"
 description = "A UDP-based, pre-shared-key (PSK), user-mode VPN using the shadowsocks AEAD UDP wire scheme."
 license = "MIT"
 repository = "https://github.com/madeye/shadowvpn"
+homepage = "https://github.com/madeye/shadowvpn"
+documentation = "https://docs.rs/shadowvpn"
+readme = "README.md"
+keywords = ["vpn", "tunnel", "shadowsocks", "udp", "aead"]
+categories = ["network-programming", "command-line-utilities"]
+# Keep the published package lean: ship the crate sources, README, and LICENSE,
+# but not the CI / Docker test harness or platform launcher scripts.
+exclude = ["/docker", "/.github", "/scripts"]
+
+# docs.rs builds with all features so the optional `uri` module is documented.
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "shadowvpn"
