@@ -2,7 +2,7 @@
 //!
 //! This is a tiny stand-in for the classic `dnsmasq` + ipset recipe. It listens
 //! for DNS queries from the local stub resolver and, depending on the
-//! [`Mode`](super::Mode), forwards each to the right upstream and decides whether
+//! [`Mode`], forwards each to the right upstream and decides whether
 //! the answer's addresses should be routed through the tunnel:
 //!
 //! * **gfwlist mode** — names matching the [`GfwList`] go to the *clean* upstream

@@ -25,13 +25,33 @@
 //! with no SOCKS address header — this is a tunnel, not a SOCKS proxy. See
 //! [`protocol`].
 //!
+//! ## Multiple clients
+//!
+//! One server serves many clients. By default it routes by *learning* each
+//! client's inner tunnel source IP, so clients need distinct addresses. With the
+//! server's NAT mode every client may share one identical config (same
+//! placeholder IP): the server tells them apart by UDP endpoint and maps each
+//! onto a distinct internal IP, rewriting inner addresses in flight. See [`nat`]
+//! and [`pool`].
+//!
+//! ## Binaries
+//!
+//! This crate ships three binaries: `shadowvpn-server` and `shadowvpn-client`
+//! (always built), and `shadowvpn-uri` — a config import/export tool gated behind
+//! the optional `uri` feature so the server/client builds stay lean (see the
+//! `uri` module, compiled only with that feature).
+//!
 //! ## Modules
 //!
 //! * [`crypto`] — cipher abstraction, key derivation, packet encrypt/decrypt.
 //! * [`config`] — JSON + CLI configuration for the server and client.
 //! * [`protocol`] — tunnel framing constants and buffer sizing.
-//! * [`tun_device`] — async TUN interface wrapper (macOS utun + Linux).
-//! * [`policy`] — client-side policy routing (gfwlist / chinadns + ipset).
+//! * [`obfs`] — optional carrier obfuscation (QUIC/HTTP3-shaped or base64).
+//! * [`tun_device`] — async TUN interface wrapper (macOS utun + Linux + Windows).
+//! * [`policy`] — client-side policy routing (gfwlist / chinadns split tunnel).
+//! * [`nat`] — server-side per-client NAT (multiple clients, one shared config).
+//! * [`pool`] — internal-IP allocation pool used by [`nat`].
+//! * `uri` — `shadowvpn://` config import/export + QR codes (feature `uri`).
 
 #![warn(missing_docs)]
 
