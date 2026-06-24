@@ -43,4 +43,5 @@ pub mod policy;
 pub mod pool;
 pub mod protocol;
 pub mod tun_device;
+#[cfg(feature = "uri")]
 pub mod uri;
