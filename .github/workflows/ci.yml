@@ -33,11 +33,16 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
 
-      - name: clippy
+      # Lint and test both the lean default build and the `uri`-enabled build so
+      # the feature-gated tooling stays covered.
+      - name: clippy (default)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: unit tests
-        run: cargo test --lib
+        run: cargo test --all-features --lib
 
   # Windows build (x86_64-pc-windows-msvc): the client/server compile and the
   # unit tests pass. Confirms portability; full runtime testing on Windows is

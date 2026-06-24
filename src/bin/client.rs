@@ -33,12 +33,11 @@
 //! traffic through the tunnel. See [`print_routing_hint`].
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result};
+use clap::Parser;
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
@@ -47,7 +46,6 @@ use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
 use shadowvpn::tun_device::TunDevice;
-use shadowvpn::{config::FileConfig, uri};
 
 /// How often to send a keepalive datagram to the server.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
@@ -56,112 +54,16 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 /// any real IP packet header, so the server can distinguish/drop it cheaply.
 const KEEPALIVE_PAYLOAD: &[u8] = &[0u8];
 
-/// Top-level CLI: run the tunnel (the flattened [`ClientArgs`], the default), or
-/// the `uri` subcommand for config import/export.
-#[derive(Parser)]
-#[command(
-    name = "shadowvpn-client",
-    about = "ShadowVPN client: tunnels TUN traffic to the server over encrypted UDP."
-)]
-struct Cli {
-    /// Optional subcommand. When omitted, the flattened args run the tunnel.
-    #[command(subcommand)]
-    command: Option<Command>,
-
-    /// Tunnel arguments (used when no subcommand is given).
-    #[command(flatten)]
-    run: ClientArgs,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Import or export the client config as a `shadowvpn://` URI / QR code.
-    Uri {
-        #[command(subcommand)]
-        action: UriAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum UriAction {
-    /// Encode a JSON config file as a `shadowvpn://` URI (optionally a QR code).
-    Export {
-        /// Path to the JSON client config to export.
-        #[arg(short = 'c', long = "config")]
-        config: PathBuf,
-        /// Also render a scannable QR code to the terminal.
-        #[arg(long)]
-        qr: bool,
-    },
-    /// Decode a `shadowvpn://` URI (or a QR image) into a JSON config file.
-    Import {
-        /// The `shadowvpn://` URI. Omit when using `--image`.
-        uri: Option<String>,
-        /// Read the URI from a QR-code image (PNG/JPEG) instead of an argument.
-        #[arg(long, value_name = "FILE")]
-        image: Option<PathBuf>,
-        /// Write the JSON config here (default: stdout).
-        #[arg(short = 'o', long = "out")]
-        out: Option<PathBuf>,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Default to `info` logging; override with `RUST_LOG`.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cli = Cli::parse();
-
-    // The `uri` subcommand is a synchronous, side-effect-light tool: handle it
-    // and exit without bringing up any tunnel.
-    if let Some(Command::Uri { action }) = cli.command {
-        return run_uri(action);
-    }
-
-    let cfg = cli
-        .run
+    let cfg = ClientArgs::parse()
         .resolve()
         .context("failed to resolve client configuration")?;
 
     run(cfg).await
-}
-
-/// Handle the `uri export` / `uri import` subcommands.
-fn run_uri(action: UriAction) -> Result<()> {
-    match action {
-        UriAction::Export { config, qr } => {
-            let file = FileConfig::load(&config)
-                .with_context(|| format!("loading config {}", config.display()))?;
-            let encoded = uri::encode(&file);
-            println!("{encoded}");
-            if qr {
-                let rendered = uri::render_qr(&encoded).context("rendering QR code")?;
-                println!("\n{rendered}");
-            }
-            Ok(())
-        }
-        UriAction::Import { uri, image, out } => {
-            let text = match (uri, image) {
-                (Some(_), Some(_)) => bail!("provide either a URI argument or --image, not both"),
-                (None, None) => bail!("provide a shadowvpn:// URI argument or --image <FILE>"),
-                (Some(s), None) => s,
-                (None, Some(path)) => uri::decode_qr_image(&path)
-                    .with_context(|| format!("decoding QR code from {}", path.display()))?,
-            };
-            let file = uri::decode(&text).context("decoding shadowvpn:// URI")?;
-            let json = serde_json::to_string_pretty(&file).context("serializing config to JSON")?;
-            match out {
-                Some(path) => {
-                    std::fs::write(&path, format!("{json}\n"))
-                        .with_context(|| format!("writing {}", path.display()))?;
-                    info!("wrote config to {}", path.display());
-                }
-                None => println!("{json}"),
-            }
-            Ok(())
-        }
-    }
 }
 
 /// Bring up the TUN device + UDP socket and drive the two relay loops until one

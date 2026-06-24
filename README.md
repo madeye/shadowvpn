@@ -178,24 +178,28 @@ On the **server** the `server` field is the UDP bind/listen address; on the
 Note how `tun_ip` and `peer_ip` are mirror images: the server's local tunnel IP
 is the client's peer, and vice versa.
 
-### Share a client config as a URI / QR code
+### Share a client config as a URI / QR code (`shadowvpn-uri`)
 
 A client config can be exported as a single `shadowvpn://` URI (the config JSON,
 URL-safe Base64) and imported back — handy for moving a config to another device
-by copy-paste or by scanning a QR code:
+by copy-paste or by scanning a QR code. This lives in a **separate
+`shadowvpn-uri` binary** so the server/client builds stay lean; build it with the
+`uri` feature (off by default):
 
 ```sh
+cargo build --release --features uri --bin shadowvpn-uri
+
 # Print the shadowvpn:// URI for a config…
-shadowvpn-client uri export -c client.json
+shadowvpn-uri export -c client.json
 
 # …or also render a scannable QR code to the terminal:
-shadowvpn-client uri export -c client.json --qr
+shadowvpn-uri export -c client.json --qr
 
 # Import a URI back into a JSON config (omit -o to print to stdout):
-shadowvpn-client uri import 'shadowvpn://…' -o client.json
+shadowvpn-uri import 'shadowvpn://…' -o client.json
 
 # Import by decoding a QR-code image instead of pasting the URI:
-shadowvpn-client uri import --image config-qr.png -o client.json
+shadowvpn-uri import --image config-qr.png -o client.json
 ```
 
 The URI carries every config field, but file-path fields (`gfwlist`, `chnroute`,

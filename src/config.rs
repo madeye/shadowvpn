@@ -352,11 +352,12 @@ pub struct ServerArgs {
 
 /// Command-line arguments for `shadowvpn-client`.
 ///
-/// Every option overrides the corresponding JSON field when present. This is an
-/// [`Args`](clap::Args) group (not a standalone `Parser`) so the binary can
-/// flatten it alongside the `uri` subcommand; the binary owns the top-level
-/// command name/about.
-#[derive(Debug, Clone, clap::Args)]
+/// Every option overrides the corresponding JSON field when present.
+#[derive(Debug, Clone, Parser)]
+#[command(
+    name = "shadowvpn-client",
+    about = "ShadowVPN client: tunnels TUN traffic to the server over encrypted UDP."
+)]
 pub struct ClientArgs {
     /// Path to a JSON config file. CLI flags override its values.
     #[arg(short = 'c', long = "config")]

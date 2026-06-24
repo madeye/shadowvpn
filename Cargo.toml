@@ -18,6 +18,19 @@ path = "src/bin/server.rs"
 name = "shadowvpn-client"
 path = "src/bin/client.rs"
 
+# Standalone config import/export tool. Built only with `--features uri`, so the
+# server/client builds never pull in the QR/image dependencies.
+[[bin]]
+name = "shadowvpn-uri"
+path = "src/bin/uri.rs"
+required-features = ["uri"]
+
+[features]
+# Off by default: enables the `shadowvpn://` URI / QR tooling (the
+# `shadowvpn-uri` binary and the `shadowvpn::uri` module) and its dependencies.
+default = []
+uri = ["dep:base64", "dep:qrcode", "dep:rqrr", "dep:image"]
+
 [dependencies]
 # Async runtime.
 tokio = { version = "1.52", features = ["full"] }
@@ -56,12 +69,17 @@ maxminddb = "0.28.1"
 ipnetwork = "0.21.1"
 libc = "0.2.186"
 
-# Config import/export as a `shadowvpn://` URI + QR code.
-base64 = "0.22"
-qrcode = "0.14"
-# QR-image decoding for `uri import --image` (PNG/JPEG only to slim the build).
-rqrr = "0.9"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Config import/export as a `shadowvpn://` URI + QR code. Optional: gated by the
+# `uri` feature and only pulled in by the `shadowvpn-uri` tool, so the default
+# server/client builds stay lean (no image-decoding code).
+base64 = { version = "0.22", optional = true }
+qrcode = { version = "0.14", optional = true }
+# QR-image decoding for `import --image` (PNG/JPEG only to slim the build).
+rqrr = { version = "0.9", optional = true }
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+], optional = true }
 
 # Windows policy routing: program per-destination routes via the IP Helper API
 # (CreateIpForwardEntry2) and resolve the tun interface index — no `route.exe`.
