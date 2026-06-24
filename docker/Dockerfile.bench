@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+#
+# Image for the netem-based throughput/latency benchmark (docker/run-bench.sh).
+#
+# On top of the two ShadowVPN binaries it carries:
+#   * iperf3   — TCP/UDP throughput generator/sink,
+#   * iproute2 — `tc`/`netem` to emulate a real internet path (delay, jitter,
+#                loss, bandwidth) on the encrypted carrier, plus `ip`,
+#   * iputils-ping — latency probe through the tunnel,
+#   * jq       — parse iperf3's JSON output into the summary table.
+# The same image runs as both server and client; the compose file picks the role.
+
+# --- Build stage ------------------------------------------------------------
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Release build so the benchmark measures the optimized data plane (fat LTO +
+# codegen-units=1, per the [profile.release] in Cargo.toml).
+RUN cargo build --release --locked --bins
+
+# --- Runtime stage ----------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        iproute2 iputils-ping iperf3 jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/shadowvpn-server /usr/local/bin/shadowvpn-server
+COPY --from=builder /src/target/release/shadowvpn-client /usr/local/bin/shadowvpn-client
+
+COPY docker/bench-lib.sh docker/bench-server.sh docker/bench-client.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/bench-server.sh /usr/local/bin/bench-client.sh
+
+ENV RUST_LOG=warn

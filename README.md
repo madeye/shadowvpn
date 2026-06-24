@@ -86,6 +86,20 @@ The alias `chacha20-ietf-poly1305` is accepted and treated as
 `chacha20-poly1305`. The default cipher (when none is specified) is
 `chacha20-poly1305`.
 
+### Hardware acceleration (especially on ARM)
+
+`chacha20-poly1305` uses runtime SIMD feature detection, so it is fast out of
+the box on every target. AES-GCM uses AES-NI automatically on x86-64, **but on
+aarch64 (Raspberry Pi, Apple Silicon, Windows-on-ARM) the ARMv8 AES backend is
+gated behind compile-time target features** — a plain `cargo build` for ARM runs
+AES-GCM in slow constant-time software. So:
+
+* On ARM hardware that lacks (or isn't built for) AES acceleration, prefer
+  `chacha20-poly1305` — it is both faster and simpler there.
+* To use AES-GCM at full speed on ARM, build with the crypto features enabled,
+  e.g. `RUSTFLAGS="-C target-feature=+aes,+neon" cargo build --release` (or
+  `-C target-cpu=native` when building on the device itself).
+
 ---
 
 ## Carrier obfuscation (optional)
@@ -337,6 +351,37 @@ both modes tunnel the selected domain and leave the other direct:
 ```
 
 Fully self-contained (no external network), so CI runs it on every PR.
+
+### Throughput / latency benchmark (Docker + netem)
+
+`docker/run-bench.sh` measures the data plane over an **emulated internet path**.
+A server and client container share a private bridge that stands in for the
+public internet; both apply a `tc netem` qdisc (delay, jitter, loss, bandwidth)
+to it. The client then measures latency and TCP/UDP throughput **through the
+tunnel** and, for comparison, **directly** over the same shaped link — so the gap
+is ShadowVPN's own overhead (crypto + obfs + MTU), not the link.
+
+```sh
+./docker/run-bench.sh                                 # ~100 Mbit broadband-ish
+OBFS=quic CIPHER=aes-256-gcm ./docker/run-bench.sh    # with QUIC carrier shaping
+DELAY=80ms LOSS=1% RATE=20mbit ./docker/run-bench.sh  # lossy mobile-ish link
+```
+
+Scenario knobs (all environment variables, with defaults): `CIPHER`, `OBFS`
+(`none`/`quic`/`base64`), `MTU`, `DELAY` (one-way; RTT ≈ 2×), `JITTER`, `LOSS`,
+`RATE`, `DURATION`, `UDP_RATE`. The run prints a summary table:
+
+```text
+ Metric                       Tunnel        Direct(WAN)
+ RTT (ms)                     48.3            45.7
+ TCP upload   (Mbit/s)        26.4            89.1
+ TCP download (Mbit/s)        15.4            91.5
+ UDP @ 50M (Mbit/s)           50.0            50.0
+ UDP loss (%)                 0.04            0.04
+```
+
+Needs `NET_ADMIN` and `/dev/net/tun` (requested by the compose file). It is a
+measurement tool, not a CI gate — the absolute numbers depend on the host.
 
 ---
 
