@@ -15,6 +15,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Wintun userspace TUN driver bundled into the Windows client packages. Pin a
+  # known release; the correct CPU-arch DLL is selected per target at package time.
+  WINTUN_VERSION: "0.14.1"
+  # GeoLite2 Country database bundled into the Windows client packages (used by
+  # the client's chinadns `geoip` mode). MaxMind requires an account to download
+  # from source, so we pull a redistributed mirror; override to use your own.
+  GEOIP_MMDB_URL: "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb"
 
 jobs:
   package:
@@ -94,13 +101,15 @@ jobs:
           tar -C dist-stage -czf "$name.tar.gz" "$name"
           echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
 
-      # Assemble the package (Windows: zip). wintun.dll is intentionally not
-      # bundled — it is licensed separately and arch-specific; the bundled
-      # scripts/README explains where to get the matching build.
+      # Assemble the package (Windows: zip). Bundles the matching-arch wintun.dll
+      # (required at runtime, loaded from the exe's folder) and the GeoLite2
+      # Country database (for the client's chinadns geoip mode), so the zip is
+      # self-contained — no separate downloads to get the client running.
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $name = "shadowvpn-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
           $stage = "dist-stage/$name"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -109,6 +118,45 @@ jobs:
           Copy-Item LICENSE, README.md $stage
           Copy-Item scripts/shadowvpn-client.ps1, scripts/shadowvpn-client.cmd $stage
           Copy-Item scripts/README.md "$stage/SCRIPTS.md"
+
+          # --- Bundle the matching-arch wintun.dll ----------------------------
+          # The Wintun zip lays DLLs out as wintun/bin/<arch>/wintun.dll. Map the
+          # Rust target to Wintun's arch directory; an x64 exe needs amd64, an
+          # ARM64 exe needs arm64 (a mismatch is the LoadLibrary error 193).
+          $arch = switch ("${{ matrix.target }}") {
+            "x86_64-pc-windows-msvc"  { "amd64" }
+            "aarch64-pc-windows-msvc" { "arm64" }
+            default { throw "no Wintun arch mapping for target ${{ matrix.target }}" }
+          }
+          $wzip = "wintun-${env:WINTUN_VERSION}.zip"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/$wzip" -OutFile $wzip `
+            -MaximumRetryCount 3 -RetryIntervalSec 5
+          Expand-Archive -Path $wzip -DestinationPath wintun-extract -Force
+          $dll = "wintun-extract/wintun/bin/$arch/wintun.dll"
+          if (-not (Test-Path $dll)) { throw "wintun.dll for '$arch' not found in $wzip" }
+          Copy-Item $dll $stage
+
+          # --- Bundle the GeoLite2 Country database (chinadns geoip mode) ------
+          Invoke-WebRequest -Uri "${env:GEOIP_MMDB_URL}" -OutFile "$stage/GeoLite2-Country.mmdb" `
+            -MaximumRetryCount 3 -RetryIntervalSec 5
+          if ((Get-Item "$stage/GeoLite2-Country.mmdb").Length -lt 100000) {
+            throw "GeoLite2-Country.mmdb download looks too small — bad mirror?"
+          }
+
+          # --- Third-party attribution for the bundled, non-project files -----
+          @"
+          This package bundles two third-party files, each under its own license:
+
+          * wintun.dll (Wintun ${env:WINTUN_VERSION}, $arch) — the Wintun userspace
+            TUN driver by WireGuard LLC. https://www.wintun.net/  Redistributed
+            verbatim under its own license; not covered by ShadowVPN's LICENSE.
+
+          * GeoLite2-Country.mmdb — this product includes GeoLite2 data created by
+            MaxMind, available from https://www.maxmind.com/ , subject to the
+            GeoLite2 End User License Agreement. Updated copies / your own
+            licensed database can replace this file.
+          "@ | Out-File -Encoding utf8 "$stage/THIRD-PARTY-NOTICES.txt"
+
           Compress-Archive -Path $stage -DestinationPath "$name.zip" -Force
           "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
