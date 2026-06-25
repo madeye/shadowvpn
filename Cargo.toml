@@ -1,6 +1,6 @@
 [package]
 name = "shadowvpn"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A UDP-based, pre-shared-key (PSK), user-mode VPN using the shadowsocks AEAD UDP wire scheme."
 license = "MIT"
