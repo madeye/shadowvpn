@@ -37,3 +37,8 @@ services:
     depends_on:
       - server
     command: ["test-client.sh"]
+
+# Note: the client resolves the `server` service name with shadowvpn's built-in
+# DNS client, not the OS stub resolver. That name is known only to Docker's
+# embedded DNS (127.0.0.11:53), so docker/client.json points both DNS upstreams
+# there — see the `dns_local`/`dns_remote` keys.
