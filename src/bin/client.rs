@@ -103,10 +103,27 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     // 5-tuple, so the tunnel coming up afterwards no longer affects it.
     let socket = shadowvpn::net::bind_udp("0.0.0.0:0".parse().expect("valid bind address"))
         .context("failed to bind local UDP socket")?;
-    socket
-        .connect(&cfg.server)
-        .await
-        .with_context(|| format!("failed to connect UDP socket to server {}", cfg.server))?;
+    // Resolve the server's address with the built-in DNS client (querying the
+    // clean/local upstreams directly) rather than the OS resolver, which may be
+    // pinned at a not-yet-listening split-DNS proxy on 127.0.0.1 left over from a
+    // previous run. The tunnel is not up yet, so these queries egress the
+    // physical interface like the tunnel datagrams themselves.
+    let server_addr = shadowvpn::net::resolve_server(
+        &cfg.server,
+        &[cfg.policy.dns_remote, cfg.policy.dns_local],
+        cfg.policy.dns_timeout,
+    )
+    .await
+    .with_context(|| format!("failed to resolve server address {}", cfg.server))?;
+    if server_addr.to_string() != cfg.server {
+        info!("resolved server {} -> {server_addr}", cfg.server);
+    }
+    socket.connect(server_addr).await.with_context(|| {
+        format!(
+            "failed to connect UDP socket to server {} ({server_addr})",
+            cfg.server
+        )
+    })?;
     // The physical source address the OS chose to reach the server. Policy
     // routing binds direct (domestic) DNS queries to it on Windows so they don't
     // get mis-routed into the tunnel once it is up.
