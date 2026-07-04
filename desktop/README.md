@@ -134,6 +134,23 @@ Resolution order, reported back as `resolved_from`:
 If none resolve, `connect` will fail (once implemented) with an error listing
 which of the three it tried.
 
+### Bundled policy data (gfwlist / GeoIP)
+
+`gfwlist` and `chinadns` modes need a data file. If a `gfwlist.txt` or a
+`GeoLite2-Country.mmdb` sits **next to the resolved `shadowvpn-client` binary**,
+the client auto-discovers it, so those modes work with the profile's path fields
+left blank. `gfwlist` mode uses the bundled `gfwlist.txt` as its routing list;
+`chinadns` mode uses the bundled `GeoLite2-Country.mmdb` for the China set and
+**also auto-applies the bundled `gfwlist.txt` as its force-tunnel override**
+(aligned with the iOS client's network extension). The packaged macOS app ships
+both files inside `ShadowVPN.app/Contents/MacOS/` alongside the bundled
+`shadowvpn-client`; the Windows zip ships both next to `shadowvpn-client.exe`.
+
+`save_profile` mirrors this: it only rejects `mode=gfwlist` / `mode=chinadns`
+with empty path fields when no matching bundled file is found next to the
+resolved client binary (`bundled_data` in `profiles.rs`). A profile path, when
+set, always overrides the bundled copy.
+
 ## Elevation model (by design — see Status above)
 
 Creating a TUN device and rewriting DNS needs root/Administrator, but Tauri's

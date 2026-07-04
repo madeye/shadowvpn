@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
+use crate::settings;
 
 /// EXACT mirror of `shadowvpn::config::FileConfig` (all 21 client+server
 /// fields), same `deny_unknown_fields` + per-field `skip_serializing_if`.
@@ -125,7 +126,7 @@ pub fn save_profile(
     config: ProfileConfig,
 ) -> Result<(), String> {
     paths::validate_profile_name(&name)?;
-    validate_config(&config)?;
+    validate_config(&config, bundled_data(&app))?;
     let path = paths::profile_path(&app, &name)?;
     let data = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     // Profiles hold the VPN password in plaintext: write with mode 0600 on
@@ -153,9 +154,41 @@ pub fn delete_profile(app: tauri::AppHandle, name: String) -> Result<(), String>
     std::fs::remove_file(&path).map_err(|e| format!("profile '{name}' not found: {e}"))
 }
 
+/// Data files the client can auto-discover next to its own binary; these mirror
+/// `shadowvpn::config::DEFAULT_GEOIP_DB_NAME` / `DEFAULT_GFWLIST_NAME` (the
+/// desktop crate does not depend on the client library).
+const GEOIP_DB_NAME: &str = "GeoLite2-Country.mmdb";
+const GFWLIST_NAME: &str = "gfwlist.txt";
+
+/// Which bundled data files ship next to the resolved client binary. When a
+/// file is present, its policy mode needs no explicit path — the client
+/// auto-discovers the bundled copy.
+#[derive(Clone, Copy, Default)]
+struct BundledData {
+    geoip: bool,
+    gfwlist: bool,
+}
+
+fn bundled_data(app: &tauri::AppHandle) -> BundledData {
+    let Ok(info) = settings::get_settings(app.clone()) else {
+        return BundledData::default();
+    };
+    let Some(bin) = info.resolved_client_bin else {
+        return BundledData::default();
+    };
+    let Some(dir) = std::path::Path::new(&bin).parent() else {
+        return BundledData::default();
+    };
+    BundledData {
+        geoip: dir.join(GEOIP_DB_NAME).is_file(),
+        gfwlist: dir.join(GFWLIST_NAME).is_file(),
+    }
+}
+
 /// Mirrors the client's fail-fast validation (src/config.rs) so mistakes
-/// surface at save time rather than at connect time.
-fn validate_config(config: &ProfileConfig) -> Result<(), String> {
+/// surface at save time rather than at connect time. `bundled` reflects which
+/// data files the client ships and can fall back to.
+fn validate_config(config: &ProfileConfig, bundled: BundledData) -> Result<(), String> {
     if config.server.as_deref().unwrap_or("").is_empty() {
         return Err("server is required".to_string());
     }
@@ -194,15 +227,24 @@ fn validate_config(config: &ProfileConfig) -> Result<(), String> {
     match config.mode.as_deref() {
         None | Some("full") => {}
         Some("gfwlist") => {
-            if config.gfwlist.as_deref().unwrap_or("").is_empty() {
-                return Err("mode=gfwlist requires a gfwlist path".to_string());
+            let has_gfwlist = !config.gfwlist.as_deref().unwrap_or("").is_empty();
+            if !has_gfwlist && !bundled.gfwlist {
+                return Err(
+                    "mode=gfwlist requires a gfwlist path (no gfwlist is bundled with \
+                     the client)"
+                        .to_string(),
+                );
             }
         }
         Some("chinadns") => {
             let has_chnroute = !config.chnroute.as_deref().unwrap_or("").is_empty();
             let has_geoip = !config.geoip.as_deref().unwrap_or("").is_empty();
-            if !has_chnroute && !has_geoip {
-                return Err("mode=chinadns requires chnroute or geoip".to_string());
+            if !has_chnroute && !has_geoip && !bundled.geoip {
+                return Err(
+                    "mode=chinadns requires chnroute or geoip (no GeoLite2 database is \
+                     bundled with the client)"
+                        .to_string(),
+                );
             }
         }
         Some(other) => return Err(format!("invalid mode '{other}'")),
