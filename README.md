@@ -465,6 +465,19 @@ is graceful — it restores the system resolver, removes the tunnel routes, and
 saves the DNS cache. On **Windows**, use the launcher in [`scripts/`](scripts/)
 (foreground; stop with Ctrl-C).
 
+### Desktop GUI (experimental)
+
+[`desktop/`](desktop/) has a small [Tauri v2](https://v2.tauri.app/) app that
+wraps `shadowvpn-client` with a profile manager, an elevated launch/kill flow,
+and a live log viewer — no separate reimplementation of the tunnel. It's an
+early, in-progress build (see [`desktop/README.md`](desktop/README.md) for
+current status, prerequisites per OS, and the elevation model). Build and run
+it with:
+
+```sh
+cd desktop/src-tauri && cargo run
+```
+
 ---
 
 ## Policy routing (gfwlist / chinadns) — client, Linux + macOS + Windows
@@ -565,6 +578,29 @@ Relevant config / flags (all client-only; CLI overrides JSON):
   startup every IPv4 network whose country is `--geoip-country` (default `CN`) is
   enumerated and merged into the China set, so you don't have to maintain a CIDR
   file. Takes precedence over `--chnroute` when both are given.
+
+**Bundled data files.** If a `gfwlist.txt` or `GeoLite2-Country.mmdb` sits next
+to the `shadowvpn-client` binary, it is auto-discovered when the relevant mode
+needs it but no path is configured:
+
+* `gfwlist` mode falls back to a bundled `gfwlist.txt` (the routing list).
+* `chinadns` mode with no `--chnroute`/`--geoip` falls back to a bundled
+  `GeoLite2-Country.mmdb`, and — with no `--gfwlist` — also auto-applies a
+  bundled `gfwlist.txt` as its force-tunnel override (names on the list always
+  take the clean tunneled path). This matches the iOS client, whose network
+  extension always injects its bundled `gfwlist.txt` in chinadns mode.
+
+So the packaged clients run these modes out of the box; an explicit
+`--gfwlist`/`--geoip`/`--chnroute` path is only needed to override a bundled
+copy.
+
+The gfwlist is vendored in this repo at [`assets/gfwlist.txt`](assets/gfwlist.txt)
+(regenerate from the upstream AutoProxy list with
+[`scripts/gen-gfwlist.sh`](scripts/gen-gfwlist.sh)); the release packages bundle
+it next to the client — the Unix tarballs and the Windows zip — and the macOS
+desktop `.app` ships it inside `Contents/MacOS/`. The GeoLite2 database is not
+vendored (it is large and separately licensed): the Windows zip downloads it at
+package time, and the desktop `.app` ships a copy.
 
 This needs root / Administrator (to create the tun and edit the routing table)
 and runs on **Linux, macOS, and Windows**; routes are programmed directly via the

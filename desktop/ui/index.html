@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ShadowVPN</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div id="status-block">
+          <div id="status-pill" class="pill pill-disconnected">Disconnected</div>
+          <div id="status-detail"></div>
+          <button id="connect-toggle-btn" type="button" disabled>Connect</button>
+        </div>
+
+        <div id="profile-list-wrap">
+          <h2 class="sidebar-heading">Profiles</h2>
+          <ul id="profile-list"></ul>
+        </div>
+
+        <div id="sidebar-actions">
+          <button id="new-profile-btn" type="button">+ New Profile</button>
+          <button id="import-uri-btn" type="button">Import URI</button>
+          <button id="settings-btn" type="button">Settings</button>
+        </div>
+      </aside>
+
+      <main id="main-panel">
+        <nav id="view-tabs">
+          <button class="tab-btn active" data-tab="editor" type="button">Profile</button>
+          <button class="tab-btn" data-tab="log" type="button">Log</button>
+        </nav>
+
+        <!-- View: profile editor -->
+        <section id="view-editor" class="view" data-view>
+          <p id="editor-placeholder" class="placeholder">Select a profile on the left, or create a new one.</p>
+
+          <form id="profile-form" hidden>
+            <div class="form-header">
+              <label class="name-label">
+                Profile name
+                <input id="f-name" name="name" type="text" placeholder="sf1" required
+                       pattern="[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}" autocomplete="off" />
+              </label>
+            </div>
+
+            <fieldset>
+              <legend>Server</legend>
+
+              <label>
+                Server
+                <input id="f-server" type="text" placeholder="vpn.example.com:8388" required />
+              </label>
+
+              <label>
+                Password
+                <span class="input-with-btn">
+                  <input id="f-password" type="password" placeholder="required" required autocomplete="off" />
+                  <button id="password-toggle-btn" type="button" class="btn-inline">Show</button>
+                </span>
+              </label>
+
+              <label>
+                Cipher
+                <select id="f-cipher">
+                  <option value="">chacha20-poly1305 (default)</option>
+                  <option value="chacha20-poly1305">chacha20-poly1305</option>
+                  <option value="aes-128-gcm">aes-128-gcm</option>
+                  <option value="aes-256-gcm">aes-256-gcm</option>
+                </select>
+              </label>
+
+              <label>
+                Obfuscation
+                <select id="f-obfs">
+                  <option value="">none (default)</option>
+                  <option value="none">none</option>
+                  <option value="quic">quic</option>
+                  <option value="base64">base64</option>
+                </select>
+              </label>
+            </fieldset>
+
+            <fieldset>
+              <legend>TUN</legend>
+
+              <label>
+                TUN device name
+                <input id="f-tun_name" type="text" placeholder="auto" />
+              </label>
+
+              <label>
+                TUN IP
+                <input id="f-tun_ip" type="text" placeholder="10.7.0.2" required />
+              </label>
+
+              <label>
+                TUN netmask
+                <input id="f-tun_netmask" type="text" placeholder="255.255.255.0" />
+              </label>
+
+              <label>
+                Peer IP
+                <input id="f-peer_ip" type="text" placeholder="10.7.0.1" required />
+              </label>
+
+              <label>
+                MTU
+                <input id="f-mtu" type="number" placeholder="1400" min="500" max="9000" />
+              </label>
+            </fieldset>
+
+            <fieldset>
+              <legend>Policy routing</legend>
+
+              <label>
+                Mode
+                <select id="f-mode">
+                  <option value="">full (default)</option>
+                  <option value="full">full</option>
+                  <option value="gfwlist">gfwlist</option>
+                  <option value="chinadns">chinadns</option>
+                </select>
+              </label>
+
+              <label>
+                dns_listen
+                <input id="f-dns_listen" type="text" placeholder="127.0.0.1:53" />
+              </label>
+
+              <label>
+                dns_local
+                <input id="f-dns_local" type="text" placeholder="114.114.114.114:53" />
+              </label>
+
+              <label>
+                dns_remote
+                <input id="f-dns_remote" type="text" placeholder="8.8.8.8:53" />
+              </label>
+
+              <label class="policy-field" data-for-mode="gfwlist">
+                GFWList path
+                <span class="input-with-btn">
+                  <input id="f-gfwlist" type="text" placeholder="/path/to/gfwlist.txt" />
+                  <button type="button" class="btn-inline" data-browse="f-gfwlist">Browse…</button>
+                </span>
+              </label>
+
+              <label class="policy-field" data-for-mode="chinadns">
+                CHNRoute path
+                <span class="input-with-btn">
+                  <input id="f-chnroute" type="text" placeholder="/path/to/chnroute.txt" />
+                  <button type="button" class="btn-inline" data-browse="f-chnroute">Browse…</button>
+                </span>
+              </label>
+
+              <label class="policy-field" data-for-mode="chinadns">
+                GeoIP database path
+                <span class="input-with-btn">
+                  <input id="f-geoip" type="text" placeholder="/path/to/GeoLite2-Country.mmdb" />
+                  <button type="button" class="btn-inline" data-browse="f-geoip">Browse…</button>
+                </span>
+              </label>
+
+              <label class="policy-field" data-for-mode="chinadns">
+                GeoIP country
+                <input id="f-geoip_country" type="text" placeholder="CN" />
+              </label>
+
+              <label class="checkbox-label">
+                <input id="f-set_dns" type="checkbox" checked />
+                Manage system DNS (set_dns)
+              </label>
+            </fieldset>
+
+            <details id="dns-advanced">
+              <summary>DNS (advanced)</summary>
+
+              <label>
+                dns_timeout_ms
+                <input id="f-dns_timeout_ms" type="number" placeholder="3000" min="0" />
+              </label>
+
+              <label class="checkbox-label">
+                <input id="f-prewarm_disable" type="checkbox" />
+                Disable DNS pre-warm
+              </label>
+
+              <label>
+                Pre-warm domains (one per line, empty = built-in list)
+                <textarea id="f-prewarm" rows="4" placeholder="www.google.com&#10;www.apple.com"></textarea>
+              </label>
+
+              <label>
+                Cache file
+                <span class="input-with-btn">
+                  <input id="f-cache_file" type="text" placeholder="/path/to/cache.json" />
+                  <button type="button" class="btn-inline" data-browse="f-cache_file">Browse…</button>
+                </span>
+              </label>
+            </details>
+
+            <div class="form-actions">
+              <button id="save-profile-btn" type="submit">Save</button>
+              <button id="duplicate-profile-btn" type="button">Duplicate</button>
+              <button id="export-uri-btn" type="button">Export URI</button>
+              <button id="delete-profile-btn" type="button" class="btn-danger">Delete</button>
+            </div>
+          </form>
+        </section>
+
+        <!-- View: live log -->
+        <section id="view-log" class="view" data-view hidden>
+          <div class="log-header">
+            <span id="log-source"></span>
+          </div>
+          <pre id="log-pane">(no log yet)</pre>
+        </section>
+
+        <!-- View: settings -->
+        <section id="view-settings" class="view" data-view hidden>
+          <h2>Settings</h2>
+
+          <label>
+            Client binary path
+            <span class="input-with-btn">
+              <input id="f-client-bin" type="text" placeholder="leave empty to auto-detect" />
+              <button type="button" class="btn-inline" data-browse="f-client-bin">Browse…</button>
+            </span>
+          </label>
+
+          <p id="settings-resolved" class="help-text"></p>
+
+          <div class="form-actions">
+            <button id="save-settings-btn" type="button">Save</button>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Modal: import a shadowvpn:// URI -->
+    <div id="import-modal" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="import-modal-title">
+        <h2 id="import-modal-title">Import from URI</h2>
+        <p class="help-text">
+          Paste a <code>shadowvpn://</code> URI. It opens as a new profile for
+          review — re-point any file paths (GFWList / CHNRoute / GeoIP) for this
+          machine, then Save.
+        </p>
+        <textarea id="import-uri-input" rows="4" placeholder="shadowvpn://…" autocomplete="off" spellcheck="false"></textarea>
+        <div class="form-actions">
+          <button id="import-uri-confirm" type="button">Import</button>
+          <button id="import-uri-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: export the current profile as a shadowvpn:// URI -->
+    <div id="export-modal" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">
+        <h2 id="export-modal-title">Export URI</h2>
+        <p class="help-text">
+          Share this URI to import the profile elsewhere. It contains the
+          password in an unencrypted (Base64) payload — treat it as a secret.
+        </p>
+        <textarea id="export-uri-output" rows="4" readonly spellcheck="false"></textarea>
+        <div class="form-actions">
+          <button id="export-uri-copy" type="button">Copy</button>
+          <button id="export-uri-close" type="button">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <script src="main.js"></script>
+  </body>
+</html>

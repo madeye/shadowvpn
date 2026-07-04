@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ShadowVPN",
+  "version": "0.1.0",
+  "identifier": "io.github.madeye.shadowvpn.desktop",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "ShadowVPN",
+        "label": "main",
+        "width": 980,
+        "height": 700,
+        "minWidth": 760,
+        "minHeight": 520
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "public.app-category.utilities",
+    "shortDescription": "Controller GUI for the ShadowVPN client",
+    "longDescription": "A cross-platform desktop UI that manages ShadowVPN client profiles and runs the encrypted UDP tunnel with per-connection privilege elevation.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

@@ -56,6 +56,19 @@ pub const DEFAULT_GEOIP_COUNTRY: &str = "CN";
 /// Default file name for the persisted DNS cache (placed next to the binary).
 pub const DEFAULT_CACHE_FILE_NAME: &str = "dns-cache.json";
 
+/// File name of a GeoLite2 country database shipped alongside the client
+/// binary. In chinadns mode, when the config supplies neither a `chnroute` nor
+/// a `geoip` path, the client auto-discovers this file next to its own
+/// executable (how the desktop `.app` and Windows packages bundle it), so the
+/// China IP set works out of the box with no explicit path.
+pub const DEFAULT_GEOIP_DB_NAME: &str = "GeoLite2-Country.mmdb";
+
+/// File name of a gfwlist domain-suffix list shipped alongside the client
+/// binary. When the config supplies no `gfwlist` path, the client auto-discovers
+/// this file next to its own executable — as the routing list in gfwlist mode,
+/// and as the force-tunnel override in chinadns mode (matching the iOS client).
+pub const DEFAULT_GFWLIST_NAME: &str = "gfwlist.txt";
+
 /// Default per-query DNS upstream timeout, in milliseconds.
 pub const DEFAULT_DNS_TIMEOUT_MS: u64 = 3000;
 
@@ -480,6 +493,46 @@ fn default_cache_file() -> PathBuf {
         .join(DEFAULT_CACHE_FILE_NAME)
 }
 
+/// The directory holding the running client binary, if it can be determined.
+/// Bundled policy data files (a GeoLite2 database, a gfwlist) are looked up here
+/// so a copy shipped alongside the executable (desktop `.app`, Windows zip) is
+/// auto-discovered.
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// The file `name` inside `dir`, if it exists as a regular file.
+fn data_file_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = dir.join(name);
+    path.is_file().then_some(path)
+}
+
+/// The gfwlist to use when the config sets no explicit `gfwlist` path: a bundled
+/// [`DEFAULT_GFWLIST_NAME`] in `dir`. Applied in gfwlist mode (the routing list)
+/// and in chinadns mode (the force-tunnel override, matching the iOS client,
+/// whose network extension always injects its bundled gfwlist in chinadns mode);
+/// never in full mode.
+fn bundled_gfwlist(mode: Mode, dir: &Path) -> Option<PathBuf> {
+    if matches!(mode, Mode::GfwList | Mode::ChinaDns) {
+        data_file_in_dir(dir, DEFAULT_GFWLIST_NAME)
+    } else {
+        None
+    }
+}
+
+/// The GeoIP database to use when the config sets no `chnroute`/`geoip` path: a
+/// bundled [`DEFAULT_GEOIP_DB_NAME`] in `dir`, in chinadns mode only (and only
+/// when no `chnroute` is configured, since that supplies the China set instead).
+fn bundled_geoip(mode: Mode, chnroute_set: bool, dir: &Path) -> Option<PathBuf> {
+    if matches!(mode, Mode::ChinaDns) && !chnroute_set {
+        data_file_in_dir(dir, DEFAULT_GEOIP_DB_NAME)
+    } else {
+        None
+    }
+}
+
 /// Parse a DNS endpoint that may be `ip:port` or a bare `ip` (defaulting the
 /// port to `default_port`).
 fn parse_dns_addr(
@@ -529,9 +582,28 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
         53,
     )?;
 
-    let gfwlist = args.gfwlist.clone().or_else(|| file.gfwlist.clone());
+    // Data files bundled next to the client binary are the fallback when the
+    // config sets no explicit path (desktop `.app`, Windows zip). Resolve the
+    // exe dir once and reuse it for both lookups.
+    let bundle_dir = exe_dir();
+
+    // Explicit `gfwlist` (CLI or file) wins; otherwise fall back to a bundled
+    // gfwlist.txt (routing list in gfwlist mode, force-tunnel override in
+    // chinadns mode).
+    let gfwlist = args
+        .gfwlist
+        .clone()
+        .or_else(|| file.gfwlist.clone())
+        .or_else(|| bundle_dir.as_deref().and_then(|d| bundled_gfwlist(mode, d)));
     let chnroute = args.chnroute.clone().or_else(|| file.chnroute.clone());
-    let geoip = args.geoip.clone().or_else(|| file.geoip.clone());
+    // Explicit `geoip` (CLI or file) wins; otherwise, in chinadns mode with no
+    // `chnroute` either, fall back to a bundled GeoLite2-Country.mmdb so the
+    // China set works with no configured path.
+    let geoip = args.geoip.clone().or_else(|| file.geoip.clone()).or_else(|| {
+        bundle_dir
+            .as_deref()
+            .and_then(|d| bundled_geoip(mode, chnroute.is_some(), d))
+    });
 
     // `--no-set-dns` wins over `--set-dns`; otherwise file value; default on.
     let set_dns = if args.no_set_dns {
@@ -842,6 +914,50 @@ mod tests {
         let mut m = base;
         m.mode = Some("bogus".to_string());
         assert!(matches!(m.resolve(), Err(ConfigError::Policy(_))));
+    }
+
+    #[test]
+    fn bundled_data_fallbacks_match_mode() {
+        // A unique scratch dir with both bundled data files present.
+        let dir = std::env::temp_dir().join(format!(
+            "svpn-bundle-test-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let gfw = dir.join(DEFAULT_GFWLIST_NAME);
+        let db = dir.join(DEFAULT_GEOIP_DB_NAME);
+        std::fs::write(&gfw, b"example.com\n").expect("write dummy gfwlist");
+        std::fs::write(&db, b"not a real mmdb").expect("write dummy db");
+
+        // gfwlist fallback: applied in gfwlist and chinadns modes, not full.
+        assert_eq!(
+            bundled_gfwlist(Mode::GfwList, &dir).as_deref(),
+            Some(gfw.as_path())
+        );
+        assert_eq!(
+            bundled_gfwlist(Mode::ChinaDns, &dir).as_deref(),
+            Some(gfw.as_path()),
+            "chinadns must auto-apply a bundled gfwlist (iOS-aligned force-tunnel override)"
+        );
+        assert!(bundled_gfwlist(Mode::Full, &dir).is_none());
+
+        // geoip fallback: chinadns only, and only when no chnroute is set.
+        assert_eq!(
+            bundled_geoip(Mode::ChinaDns, false, &dir).as_deref(),
+            Some(db.as_path())
+        );
+        assert!(bundled_geoip(Mode::ChinaDns, true, &dir).is_none());
+        assert!(bundled_geoip(Mode::GfwList, false, &dir).is_none());
+        assert!(bundled_geoip(Mode::Full, false, &dir).is_none());
+
+        // An empty dir yields nothing for any mode.
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).expect("create empty subdir");
+        assert!(bundled_gfwlist(Mode::ChinaDns, &empty).is_none());
+        assert!(bundled_geoip(Mode::ChinaDns, false, &empty).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

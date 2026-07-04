@@ -89,6 +89,8 @@ jobs:
           bin="target/${{ matrix.target }}/release"
           cp "$bin/shadowvpn-server" "$bin/shadowvpn-client" "$stage/"
           cp LICENSE README.md "$stage/"
+          # gfwlist domain list, next to the client so gfwlist mode auto-finds it.
+          cp assets/gfwlist.txt "$stage/"
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             mkdir -p "$stage/systemd"
             cp dist/systemd/shadowvpn-server.service dist/systemd/shadowvpn-client.service "$stage/systemd/"
@@ -102,9 +104,12 @@ jobs:
           echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
 
       # Assemble the package (Windows: zip). Bundles the matching-arch wintun.dll
-      # (required at runtime, loaded from the exe's folder) and the GeoLite2
-      # Country database (for the client's chinadns geoip mode), so the zip is
-      # self-contained — no separate downloads to get the client running.
+      # (required at runtime, loaded from the exe's folder), the GeoLite2 Country
+      # database (chinadns geoip mode), and the vendored gfwlist.txt (gfwlist
+      # mode), so the zip is self-contained — no separate downloads to get the
+      # client running. The client auto-discovers a GeoLite2-Country.mmdb or a
+      # gfwlist.txt sitting next to the exe, so those modes work without an
+      # explicit --geoip / --gfwlist path.
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -118,6 +123,9 @@ jobs:
           Copy-Item LICENSE, README.md $stage
           Copy-Item scripts/shadowvpn-client.ps1, scripts/shadowvpn-client.cmd $stage
           Copy-Item scripts/README.md "$stage/SCRIPTS.md"
+          # Vendored gfwlist domain list, next to the exe for gfwlist-mode
+          # auto-discovery (no separate download; regenerate via gen-gfwlist.sh).
+          Copy-Item assets/gfwlist.txt $stage
 
           # --- Bundle the matching-arch wintun.dll ----------------------------
           # The Wintun zip lays DLLs out as wintun/bin/<arch>/wintun.dll. Map the
@@ -145,7 +153,7 @@ jobs:
 
           # --- Third-party attribution for the bundled, non-project files -----
           @"
-          This package bundles two third-party files, each under its own license:
+          This package bundles third-party files, each under its own license:
 
           * wintun.dll (Wintun ${env:WINTUN_VERSION}, $arch) — the Wintun userspace
             TUN driver by WireGuard LLC. https://www.wintun.net/  Redistributed
@@ -155,6 +163,10 @@ jobs:
             MaxMind, available from https://www.maxmind.com/ , subject to the
             GeoLite2 End User License Agreement. Updated copies / your own
             licensed database can replace this file.
+
+          * gfwlist.txt — a domain-suffix list derived from the AutoProxy gfwlist
+            (https://github.com/gfwlist/gfwlist , LGPL-2.1), decoded and reduced to
+            plain domains. Regenerate with scripts/gen-gfwlist.sh.
           "@ | Out-File -Encoding utf8 "$stage/THIRD-PARTY-NOTICES.txt"
 
           Compress-Archive -Path $stage -DestinationPath "$name.zip" -Force
