@@ -5,6 +5,7 @@ mod paths;
 mod profiles;
 mod runner;
 mod settings;
+mod uri;
 
 use std::sync::Mutex;
 
@@ -30,6 +31,8 @@ fn main() {
             runner::read_log,
             settings::get_settings,
             settings::save_settings,
+            uri::import_uri,
+            uri::export_uri,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

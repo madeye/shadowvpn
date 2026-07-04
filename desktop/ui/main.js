@@ -25,7 +25,19 @@
 
   const profileListEl = document.getElementById("profile-list");
   const newProfileBtn = document.getElementById("new-profile-btn");
+  const importUriBtn = document.getElementById("import-uri-btn");
   const settingsBtn = document.getElementById("settings-btn");
+
+  const importModal = document.getElementById("import-modal");
+  const importUriInput = document.getElementById("import-uri-input");
+  const importUriConfirm = document.getElementById("import-uri-confirm");
+  const importUriCancel = document.getElementById("import-uri-cancel");
+
+  const exportModal = document.getElementById("export-modal");
+  const exportUriBtn = document.getElementById("export-uri-btn");
+  const exportUriOutput = document.getElementById("export-uri-output");
+  const exportUriCopy = document.getElementById("export-uri-copy");
+  const exportUriClose = document.getElementById("export-uri-close");
 
   const tabBtns = Array.from(document.querySelectorAll(".tab-btn"));
   const viewEditor = document.getElementById("view-editor");
@@ -328,6 +340,126 @@
   }
 
   newProfileBtn.addEventListener("click", newProfile);
+
+  // ---------------------------------------------------------------------
+  // Import / export as a shadowvpn:// URI
+  // ---------------------------------------------------------------------
+
+  // Suggest a unique profile name from the imported server host, e.g.
+  // "sf1.maxlv.net:443" -> "sf1" (or "sf1-2" if taken).
+  function suggestName(config) {
+    let base = "imported";
+    const server = (config && config.server ? config.server : "").trim();
+    if (server) {
+      const label = server.split(":")[0].split(".")[0];
+      const cleaned = label.replace(/[^A-Za-z0-9 ._-]/g, "");
+      if (cleaned) base = cleaned;
+    }
+    const existing = new Set(profiles.map((p) => p.name));
+    if (!existing.has(base)) return base;
+    for (let i = 2; i < 1000; i++) {
+      const cand = `${base}-${i}`;
+      if (!existing.has(cand)) return cand;
+    }
+    return base;
+  }
+
+  function openImportModal() {
+    importUriInput.value = "";
+    importModal.hidden = false;
+    importUriInput.focus();
+  }
+
+  function closeImportModal() {
+    importModal.hidden = true;
+  }
+
+  async function doImport() {
+    const uri = importUriInput.value.trim();
+    if (!uri) {
+      toast("Paste a shadowvpn:// URI first");
+      return;
+    }
+    let config;
+    try {
+      config = await callInvoke("import_uri", { uri });
+    } catch (_err) {
+      return; // already toasted; leave the modal open to fix the URI
+    }
+    closeImportModal();
+    // Open as a NEW, unsaved profile so the user can re-point host-specific
+    // paths and name it before Save validates + writes it.
+    selectedProfile = null;
+    renderProfileList();
+    editorPlaceholder.hidden = true;
+    profileForm.hidden = false;
+    populateForm("", config);
+    fName.value = suggestName(config);
+    showTab("editor");
+    fName.focus();
+    fName.select();
+    toast("Imported — review, name it, then Save", "info");
+  }
+
+  importUriBtn.addEventListener("click", openImportModal);
+  importUriConfirm.addEventListener("click", doImport);
+  importUriCancel.addEventListener("click", closeImportModal);
+  importModal.addEventListener("click", (ev) => {
+    if (ev.target === importModal) closeImportModal();
+  });
+
+  async function openExportModal() {
+    if (profileForm.hidden) {
+      toast("Open a profile to export");
+      return;
+    }
+    const config = serializeForm();
+    let uri;
+    try {
+      uri = await callInvoke("export_uri", { config });
+    } catch (_err) {
+      return; // already toasted
+    }
+    exportUriOutput.value = uri;
+    exportModal.hidden = false;
+    exportUriOutput.focus();
+    exportUriOutput.select();
+  }
+
+  function closeExportModal() {
+    exportModal.hidden = true;
+  }
+
+  async function copyExportUri() {
+    const text = exportUriOutput.value;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        exportUriOutput.select();
+        document.execCommand("copy");
+      }
+      toast("Copied URI to clipboard", "info");
+    } catch (_err) {
+      // Clipboard may be blocked; the text is selected so the user can copy it.
+      exportUriOutput.select();
+      toast("Press ⌘/Ctrl+C to copy");
+    }
+  }
+
+  exportUriBtn.addEventListener("click", openExportModal);
+  exportUriCopy.addEventListener("click", copyExportUri);
+  exportUriClose.addEventListener("click", closeExportModal);
+  exportModal.addEventListener("click", (ev) => {
+    if (ev.target === exportModal) closeExportModal();
+  });
+
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
+      if (!importModal.hidden) closeImportModal();
+      if (!exportModal.hidden) closeExportModal();
+    }
+  });
 
   function updatePolicyFieldsState() {
     const mode = fMode.value || "full";

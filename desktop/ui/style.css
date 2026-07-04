@@ -507,3 +507,71 @@ details#dns-advanced label {
   line-height: 1;
   padding: 0;
 }
+
+/* ---------- Modals (import / export URI) ---------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  padding: 24px;
+}
+
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal {
+  width: 100%;
+  max-width: 520px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+
+.modal h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.modal .help-text {
+  margin: 0 0 12px;
+}
+
+.modal textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.modal .form-actions {
+  margin-top: 14px;
+}
+
+.modal button {
+  padding: 7px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--input-border);
+  background: var(--panel-bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12.5px;
+}
+
+.modal button:hover {
+  background: rgba(128, 128, 128, 0.12);
+}
+
+#import-uri-confirm,
+#export-uri-copy {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: transparent;
+}

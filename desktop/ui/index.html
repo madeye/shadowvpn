@@ -22,6 +22,7 @@
 
         <div id="sidebar-actions">
           <button id="new-profile-btn" type="button">+ New Profile</button>
+          <button id="import-uri-btn" type="button">Import URI</button>
           <button id="settings-btn" type="button">Settings</button>
         </div>
       </aside>
@@ -204,6 +205,7 @@
             <div class="form-actions">
               <button id="save-profile-btn" type="submit">Save</button>
               <button id="duplicate-profile-btn" type="button">Duplicate</button>
+              <button id="export-uri-btn" type="button">Export URI</button>
               <button id="delete-profile-btn" type="button" class="btn-danger">Delete</button>
             </div>
           </form>
@@ -236,6 +238,39 @@
           </div>
         </section>
       </main>
+    </div>
+
+    <!-- Modal: import a shadowvpn:// URI -->
+    <div id="import-modal" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="import-modal-title">
+        <h2 id="import-modal-title">Import from URI</h2>
+        <p class="help-text">
+          Paste a <code>shadowvpn://</code> URI. It opens as a new profile for
+          review — re-point any file paths (GFWList / CHNRoute / GeoIP) for this
+          machine, then Save.
+        </p>
+        <textarea id="import-uri-input" rows="4" placeholder="shadowvpn://…" autocomplete="off" spellcheck="false"></textarea>
+        <div class="form-actions">
+          <button id="import-uri-confirm" type="button">Import</button>
+          <button id="import-uri-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: export the current profile as a shadowvpn:// URI -->
+    <div id="export-modal" class="modal-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">
+        <h2 id="export-modal-title">Export URI</h2>
+        <p class="help-text">
+          Share this URI to import the profile elsewhere. It contains the
+          password in an unencrypted (Base64) payload — treat it as a secret.
+        </p>
+        <textarea id="export-uri-output" rows="4" readonly spellcheck="false"></textarea>
+        <div class="form-actions">
+          <button id="export-uri-copy" type="button">Copy</button>
+          <button id="export-uri-close" type="button">Close</button>
+        </div>
+      </div>
     </div>
 
     <div id="toast-container"></div>

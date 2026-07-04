@@ -13,12 +13,13 @@ app just supervises the client process.
 </p>
 
 > **Status:** this is an early, in-progress build. Profile management
-> (list/create/edit/delete), status derivation, log tailing, and the
-> `connect`/`disconnect` elevation flow described below (osascript / pkexec /
-> PowerShell `Start-Process -Verb RunAs`) are all implemented. No bundled
-> app/icon yet — run it with `cargo run` as described under Build & run.
-> Everything in this document (paths, IPC shapes, security caveats) reflects
-> the code as it stands today.
+> (list/create/edit/delete, plus **`shadowvpn://` URI import/export**), status
+> derivation, log tailing, and the `connect`/`disconnect` elevation flow
+> described below (osascript / pkexec / PowerShell `Start-Process -Verb RunAs`)
+> are all implemented. `cargo tauri build` produces a bundled app + icon (a
+> `.app`/`.dmg` on macOS); `cargo run` / `cargo tauri dev` also work for
+> iteration. Everything in this document (paths, IPC shapes, security caveats)
+> reflects the code as it stands today.
 
 ---
 
@@ -100,6 +101,24 @@ On macOS these resolve under
 `~/.config/io.github.madeye.shadowvpn.desktop/` (config) and
 `~/.local/share/io.github.madeye.shadowvpn.desktop/` (data); on Windows, both
 under `%APPDATA%\io.github.madeye.shadowvpn.desktop\`.
+
+### Import / export via `shadowvpn://` URI
+
+**Import URI** (sidebar) decodes a `shadowvpn://<base64url(JSON)>` URI — the same
+opaque, lossless format the standalone
+[`shadowvpn-uri`](../src/uri.rs) tool and other ShadowVPN clients emit — and
+opens it in the editor as a **new, unsaved** profile. Nothing is written until
+you name it and click Save (which runs the same validation as any profile), so
+you get a chance to re-point host-specific paths (`gfwlist` / `chnroute` /
+`geoip` / `cache_file`) that a URI exported on another machine may reference.
+Decoding is strict: `deny_unknown_fields` rejects a URI carrying a field this
+build doesn't know, exactly like the client.
+
+**Export URI** (in the profile editor) is the inverse — it encodes the profile
+currently in the form. The payload is Base64, **not encryption**: it contains
+the password in the clear, so treat an exported URI as a secret. The two
+commands (`import_uri`, `export_uri`) are byte-for-byte compatible with
+`shadowvpn-uri`, so a URI/QR made by that tool imports here and vice-versa.
 
 ### Client binary resolution
 

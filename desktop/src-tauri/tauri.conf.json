@@ -23,7 +23,17 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": ["icons/icon.png"]
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "public.app-category.utilities",
+    "shortDescription": "Controller GUI for the ShadowVPN client",
+    "longDescription": "A cross-platform desktop UI that manages ShadowVPN client profiles and runs the encrypted UDP tunnel with per-connection privilege elevation.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }
