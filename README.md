@@ -465,6 +465,19 @@ is graceful — it restores the system resolver, removes the tunnel routes, and
 saves the DNS cache. On **Windows**, use the launcher in [`scripts/`](scripts/)
 (foreground; stop with Ctrl-C).
 
+### Desktop GUI (experimental)
+
+[`desktop/`](desktop/) has a small [Tauri v2](https://v2.tauri.app/) app that
+wraps `shadowvpn-client` with a profile manager, an elevated launch/kill flow,
+and a live log viewer — no separate reimplementation of the tunnel. It's an
+early, in-progress build (see [`desktop/README.md`](desktop/README.md) for
+current status, prerequisites per OS, and the elevation model). Build and run
+it with:
+
+```sh
+cd desktop/src-tauri && cargo run
+```
+
 ---
 
 ## Policy routing (gfwlist / chinadns) — client, Linux + macOS + Windows

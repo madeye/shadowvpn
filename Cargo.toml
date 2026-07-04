@@ -12,7 +12,7 @@ keywords = ["vpn", "tunnel", "shadowsocks", "udp", "aead"]
 categories = ["network-programming", "command-line-utilities"]
 # Keep the published package lean: ship the crate sources, README, and LICENSE,
 # but not the CI / Docker test harness or platform launcher scripts.
-exclude = ["/docker", "/.github", "/scripts"]
+exclude = ["/docker", "/.github", "/scripts", "/desktop"]
 
 # docs.rs builds with all features so the optional `uri` module is documented.
 [package.metadata.docs.rs]
