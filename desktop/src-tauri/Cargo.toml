@@ -12,6 +12,10 @@ default-run = "shadowvpn-desktop"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[target.'cfg(target_os = "macos")'.build-dependencies]
+# Compiles macos/native_auth.m (SMAppService + LAContext glue).
+cc = "1"
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"

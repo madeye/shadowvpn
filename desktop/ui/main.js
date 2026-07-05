@@ -209,6 +209,7 @@
     viewLog.hidden = true;
     viewSettings.hidden = false;
     loadSettings();
+    refreshDaemon();
   }
 
   tabBtns.forEach((btn) => {
@@ -813,6 +814,75 @@
     } catch (_err) {
       // already toasted
     }
+  });
+
+  // ---------------------------------------------------------------------
+  // macOS privileged daemon (SMAppService + Touch ID)
+  // ---------------------------------------------------------------------
+
+  const daemonSection = document.getElementById("daemon-section");
+  const daemonStatusEl = document.getElementById("daemon-status");
+  const daemonInstallBtn = document.getElementById("daemon-install-btn");
+  const daemonUninstallBtn = document.getElementById("daemon-uninstall-btn");
+
+  const DAEMON_STATUS_TEXT = {
+    enabled: "Status: enabled — connect uses Touch ID, no password prompts.",
+    requires_approval:
+      "Status: waiting for approval — enable “ShadowVPN” under System Settings > General > Login Items > Allow in the Background.",
+    not_registered: "Status: not installed.",
+    not_found:
+      "Status: unavailable in this build (daemon definition not bundled).",
+    unavailable: "Status: unavailable (requires macOS 13 or later).",
+  };
+
+  function renderDaemon(info) {
+    if (!info || !info.supported) {
+      daemonSection.hidden = true;
+      return;
+    }
+    daemonSection.hidden = false;
+    daemonStatusEl.textContent =
+      DAEMON_STATUS_TEXT[info.status] || `Status: ${info.status}`;
+    const installed =
+      info.status === "enabled" || info.status === "requires_approval";
+    daemonInstallBtn.hidden = installed;
+    daemonUninstallBtn.hidden = !installed;
+  }
+
+  async function refreshDaemon() {
+    if (!invoke) return;
+    try {
+      renderDaemon(await invoke("daemon_info"));
+    } catch (_err) {
+      daemonSection.hidden = true;
+    }
+  }
+
+  daemonInstallBtn.addEventListener("click", async () => {
+    try {
+      const status = await callInvoke("daemon_install");
+      if (status === "requires_approval") {
+        toast(
+          "Almost done — allow ShadowVPN under Login Items, then reopen Settings.",
+          "info",
+        );
+      } else if (status === "enabled") {
+        toast("Daemon enabled — no more password prompts.", "info");
+      }
+    } catch (_err) {
+      // already toasted
+    }
+    refreshDaemon();
+  });
+
+  daemonUninstallBtn.addEventListener("click", async () => {
+    try {
+      await callInvoke("daemon_uninstall");
+      toast("Daemon uninstalled.", "info");
+    } catch (_err) {
+      // already toasted
+    }
+    refreshDaemon();
   });
 
   // ---------------------------------------------------------------------

@@ -18,6 +18,16 @@
 //! missing for ~30s while no client child is running (a crashed/closed GUI
 //! that cleaned up). While a client it started is still running it stays
 //! alive, so a later GUI session can disconnect gracefully with no prompt.
+//!
+//! macOS daemon mode (`SHADOWVPN_HELPER_DAEMON=1`, set by the launchd plist
+//! registered via SMAppService): instead of GUI-supplied arguments it
+//! self-configures — the client binary is the `shadowvpn-client` sitting
+//! next to it inside the app bundle (never anything else), the port/token
+//! files live under /Library/Application Support/<app id>/, and the token is
+//! GENERATED HERE and published root:admin 0640, so only admin-group users
+//! (who could obtain root anyway) can command the always-running daemon.
+//! launchd owns the lifecycle: `shutdown` only stops the client child, and
+//! the token-file janitor is disabled.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -37,6 +47,9 @@ struct Args {
     token_file: PathBuf,
     port_file: PathBuf,
     client_bin: String,
+    /// launchd daemon mode (macOS): launchd owns the lifecycle — never exit
+    /// on `shutdown`, never remove the port file, no token-file janitor.
+    daemon: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -57,7 +70,87 @@ fn parse_args() -> Result<Args, String> {
         token_file: token_file.ok_or("--token-file is required")?,
         port_file: port_file.ok_or("--port-file is required")?,
         client_bin: client_bin.ok_or("--client-bin is required")?,
+        daemon: false,
     })
+}
+
+/// Self-configuration for macOS launchd daemon mode: fixed publish paths, a
+/// freshly generated root:admin 0640 token, and the bundle-sibling client
+/// binary as the ONLY program this daemon will ever execute.
+#[cfg(target_os = "macos")]
+fn daemon_args() -> Result<Args, String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own executable: {e}"))?;
+    let client = exe
+        .parent()
+        .ok_or("helper executable has no parent directory")?
+        .join("shadowvpn-client");
+    if !client.is_file() {
+        return Err(format!(
+            "bundled shadowvpn-client not found at {}",
+            client.display()
+        ));
+    }
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o755);
+    builder
+        .create(helper_ipc::DAEMON_DIR)
+        .map_err(|e| format!("cannot create {}: {e}", helper_ipc::DAEMON_DIR))?;
+
+    // Fresh token per daemon start. Written 0600 first, then handed to
+    // root:admin 0640 so there is no window where a broader group can read
+    // an unowned file.
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).map_err(|e| format!("cannot generate session token: {e}"))?;
+    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let token_file = PathBuf::from(helper_ipc::DAEMON_TOKEN_FILE);
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&token_file)
+            .map_err(|e| format!("cannot write token file: {e}"))?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot tighten token file: {e}"))?;
+        f.write_all(token.as_bytes())
+            .map_err(|e| format!("cannot write token file: {e}"))?;
+    }
+    let path_c = std::ffi::CString::new(helper_ipc::DAEMON_TOKEN_FILE)
+        .map_err(|_| "token path contains NUL")?;
+    if unsafe { libc::chown(path_c.as_ptr(), 0, admin_gid()) } != 0 {
+        return Err(format!(
+            "cannot chown token file: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o640))
+        .map_err(|e| format!("cannot set token file mode: {e}"))?;
+
+    Ok(Args {
+        token_file,
+        port_file: PathBuf::from(helper_ipc::DAEMON_PORT_FILE),
+        client_bin: client.to_string_lossy().to_string(),
+        daemon: true,
+    })
+}
+
+/// gid of the `admin` group (80 on every macOS release; looked up anyway).
+#[cfg(target_os = "macos")]
+fn admin_gid() -> libc::gid_t {
+    // Safe: "admin" contains no NUL bytes.
+    let name = std::ffi::CString::new("admin").unwrap();
+    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
+    if grp.is_null() {
+        80
+    } else {
+        unsafe { (*grp).gr_gid }
+    }
 }
 
 fn read_token(path: &Path) -> Option<String> {
@@ -93,9 +186,17 @@ fn spawn_client(
     log: &str,
     pid_file: &str,
 ) -> Result<Child, String> {
-    let log_out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    // O_NOFOLLOW (Unix): the log/pid paths come from the GUI request and this
+    // process runs as root — refuse to be tricked into writing through a
+    // symlink planted at a user-controlled path.
+    let mut log_opts = std::fs::OpenOptions::new();
+    log_opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let log_out = log_opts
         .open(log)
         .map_err(|e| format!("cannot open log file {log}: {e}"))?;
     let log_err = log_out
@@ -118,7 +219,7 @@ fn spawn_client(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start {client_bin}: {e}"))?;
-    if let Err(e) = std::fs::write(pid_file, format!("{}\n", child.id())) {
+    if let Err(e) = write_nofollow(pid_file, format!("{}\n", child.id()).as_bytes()) {
         // Without the pidfile the GUI can neither show nor stop this run;
         // don't leave an orphaned root client behind.
         let _ = child.kill();
@@ -126,6 +227,21 @@ fn spawn_client(
         return Err(format!("cannot write pid file {pid_file}: {e}"));
     }
     Ok(child)
+}
+
+/// `fs::write` that refuses to follow a symlink at `path` (see the note in
+/// `spawn_client`; no-op difference on Windows, where the per-user ACLs
+/// already protect these paths).
+fn write_nofollow(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)?.write_all(data)
 }
 
 /// Stop the child: graceful where possible, forced as the backstop.
@@ -263,24 +379,47 @@ fn respond(line: &str, args: &Args, slot: &ChildSlot) -> (Response, bool) {
             if let Some(mut child) = guard.take() {
                 let _ = stop_child(&mut child);
             }
-            let _ = std::fs::remove_file(&args.port_file);
+            // Daemon mode: launchd owns the lifecycle (and would immediately
+            // restart us) — treat shutdown as "stop the client" only, and
+            // keep the port file published.
+            if !args.daemon {
+                let _ = std::fs::remove_file(&args.port_file);
+            }
             (
                 Response {
                     ok: true,
                     ..Default::default()
                 },
-                true,
+                !args.daemon,
             )
         }
     }
 }
 
 fn main() {
-    let args = match parse_args() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("shadowvpn-desktop-helper: {e}");
-            std::process::exit(2);
+    #[cfg(target_os = "macos")]
+    let daemon_mode = std::env::var_os("SHADOWVPN_HELPER_DAEMON").is_some_and(|v| v == "1");
+    #[cfg(not(target_os = "macos"))]
+    let daemon_mode = false;
+
+    let args = if daemon_mode {
+        #[cfg(target_os = "macos")]
+        match daemon_args() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("shadowvpn-desktop-helper (daemon): {e}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        unreachable!()
+    } else {
+        match parse_args() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("shadowvpn-desktop-helper: {e}");
+                std::process::exit(2);
+            }
         }
     };
     // The GUI writes the token file before requesting elevation; refuse to
@@ -320,7 +459,9 @@ fn main() {
     // Janitor: exit once the token file has been gone for ~30s with no client
     // running (the GUI closed and cleaned up, or the user revoked us). With a
     // client still up we stay, so a later session can stop it promptly.
-    {
+    // Daemon mode: the token file is our own (root-owned, never GUI-removed)
+    // and launchd owns the lifecycle — no janitor.
+    if !args.daemon {
         let slot = Arc::clone(&slot);
         let token_file = args.token_file.clone();
         let port_file = args.port_file.clone();

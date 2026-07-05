@@ -3,6 +3,8 @@
 
 mod helper;
 mod helper_ipc;
+#[cfg(target_os = "macos")]
+mod macos_native;
 mod paths;
 mod profiles;
 mod runner;
@@ -24,6 +26,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             helper::init_privileges,
+            helper::daemon_info,
+            helper::daemon_install,
+            helper::daemon_uninstall,
             profiles::list_profiles,
             profiles::get_profile,
             profiles::save_profile,

@@ -6,7 +6,17 @@
 //! none is running. Called at UI startup (`init_privileges`) so the session
 //! is authorized once up front, and again by `connect` as the safety net if
 //! the user declined the startup prompt.
+//!
+//! macOS has a second, preferred transport to the same helper protocol: the
+//! helper registered as a launchd LaunchDaemon via SMAppService (see
+//! `macos_native.rs` and the plist under `macos/`). Once the user approves
+//! it in System Settings > Login Items there are NO password prompts at all;
+//! the GUI instead proves user presence once per app session with Touch ID /
+//! Apple Watch (login-password fallback) before using the always-root
+//! daemon. Every daemon precondition failure falls back to the legacy
+//! osascript per-session prompt, so the app never hard-depends on it.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::helper_ipc::{self, Cmd, Request, Response};
@@ -17,40 +27,104 @@ use crate::settings;
 /// approved the elevation dialog.
 const SPAWN_WAIT_MS: u64 = 15_000;
 
-fn read_port(app: &tauri::AppHandle) -> Option<u16> {
-    let port_path = paths::helper_port_file(app).ok()?;
-    std::fs::read_to_string(port_path).ok()?.trim().parse().ok()
+/// Which helper instance to talk to. Ordered by preference.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Endpoint {
+    /// macOS launchd daemon (fixed root-published port/token files).
+    #[cfg(target_os = "macos")]
+    Daemon,
+    /// Per-session helper spawned via osascript/pkexec/UAC (files under the
+    /// user's app-data dir).
+    Session,
 }
 
-fn read_token(app: &tauri::AppHandle) -> Option<String> {
-    let token_path = paths::helper_token_file(app).ok()?;
-    let tok = std::fs::read_to_string(token_path).ok()?;
+const ENDPOINTS: &[Endpoint] = &[
+    #[cfg(target_os = "macos")]
+    Endpoint::Daemon,
+    Endpoint::Session,
+];
+
+/// (port file, token file) for an endpoint.
+fn endpoint_files(app: &tauri::AppHandle, ep: Endpoint) -> Result<(PathBuf, PathBuf), String> {
+    match ep {
+        #[cfg(target_os = "macos")]
+        Endpoint::Daemon => Ok((
+            PathBuf::from(helper_ipc::DAEMON_PORT_FILE),
+            PathBuf::from(helper_ipc::DAEMON_TOKEN_FILE),
+        )),
+        Endpoint::Session => Ok((
+            paths::helper_port_file(app)?,
+            paths::helper_token_file(app)?,
+        )),
+    }
+}
+
+fn read_port_at(path: &std::path::Path) -> Option<u16> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_token_at(path: &std::path::Path) -> Option<String> {
+    let tok = std::fs::read_to_string(path).ok()?;
     let tok = tok.trim().to_string();
     (!tok.is_empty()).then_some(tok)
 }
 
-/// Send `cmd` to the helper using the session token. Errors if either the
-/// port or token file is missing or the helper doesn't answer.
-pub fn call(app: &tauri::AppHandle, cmd: Cmd) -> Result<Response, String> {
-    let port = read_port(app).ok_or("helper port file missing")?;
-    let token = read_token(app).ok_or("helper token file missing")?;
+/// Send `cmd` to one specific endpoint. Errors if either the port or token
+/// file is missing or the helper doesn't answer.
+fn call_endpoint(app: &tauri::AppHandle, ep: Endpoint, cmd: Cmd) -> Result<Response, String> {
+    let (port_path, token_path) = endpoint_files(app, ep)?;
+    let port = read_port_at(&port_path).ok_or("helper port file missing")?;
+    let token = read_token_at(&token_path).ok_or("helper token file missing")?;
     helper_ipc::call(port, &Request { token, cmd })
 }
 
-/// Ping the helper; `Some(response)` only for a live helper that accepted
+fn ping_endpoint(app: &tauri::AppHandle, ep: Endpoint) -> Option<Response> {
+    call_endpoint(app, ep, Cmd::Ping).ok().filter(|r| r.ok)
+}
+
+/// First endpoint (daemon before session helper) that answers a ping with
 /// our token.
+fn live_endpoint(app: &tauri::AppHandle) -> Option<(Endpoint, Response)> {
+    ENDPOINTS
+        .iter()
+        .find_map(|&ep| ping_endpoint(app, ep).map(|r| (ep, r)))
+}
+
+/// Send `cmd` to whichever helper is live (daemon preferred).
+pub fn call(app: &tauri::AppHandle, cmd: Cmd) -> Result<Response, String> {
+    let (ep, _) = live_endpoint(app).ok_or("no running helper")?;
+    call_endpoint(app, ep, cmd)
+}
+
+/// Ping any live helper; `Some(response)` only for one that accepted our
+/// token.
 pub fn ping(app: &tauri::AppHandle) -> Option<Response> {
-    call(app, Cmd::Ping).ok().filter(|r| r.ok)
+    live_endpoint(app).map(|(_, r)| r)
 }
 
 /// Ensure a live helper for `client_bin` and return its port.
-/// Prompts for credentials (once) only when no usable helper is running.
+///
+/// macOS: served by the approved launchd daemon (Touch ID gate, no password)
+/// whenever it can run this exact `client_bin`; otherwise — and on every
+/// other OS — by the per-session helper (one credential prompt when none is
+/// running).
 pub fn ensure(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
-    if let Some(resp) = ping(app) {
+    #[cfg(target_os = "macos")]
+    if let Some(port) = daemon_ensure(app, client_bin)? {
+        return Ok(port);
+    }
+    ensure_session(app, client_bin)
+}
+
+fn ensure_session(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
+    let session_port = |app: &tauri::AppHandle| -> Result<u16, String> {
+        let (port_path, _) = endpoint_files(app, Endpoint::Session)?;
+        read_port_at(&port_path).ok_or("helper port file vanished".to_string())
+    };
+    if let Some(resp) = ping_endpoint(app, Endpoint::Session) {
         if resp.client_bin.as_deref() == Some(client_bin) {
-            // Safe: ping() only returns Some for a live helper, which always
-            // has a port file behind it.
-            return read_port(app).ok_or("helper port file vanished".to_string());
+            // Safe: a live ping always has a port file behind it.
+            return session_port(app);
         }
         // The resolved client binary changed since the helper was spawned. A
         // helper only ever runs its spawn-time binary, so re-elevate — but
@@ -61,10 +135,73 @@ pub fn ensure(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
                     .to_string(),
             );
         }
-        let _ = call(app, Cmd::Shutdown);
+        let _ = call_endpoint(app, Endpoint::Session, Cmd::Shutdown);
     }
 
     spawn(app, client_bin)
+}
+
+// --- macOS launchd daemon path ----------------------------------------------
+
+/// Once per GUI session: has the Touch ID / user-presence gate been passed?
+#[cfg(target_os = "macos")]
+static PRESENCE_PROVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The only client binary the daemon will ever run: the `shadowvpn-client`
+/// bundled next to this app executable (`Contents/MacOS/` in the bundle).
+#[cfg(target_os = "macos")]
+fn daemon_client_bin() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join("shadowvpn-client");
+    candidate
+        .is_file()
+        .then(|| candidate.to_string_lossy().to_string())
+}
+
+/// `Ok(Some(port))` when the approved daemon serves this `client_bin`;
+/// `Ok(None)` to fall back to the per-session helper; `Err` only when the
+/// user actively failed the Touch ID gate.
+#[cfg(target_os = "macos")]
+fn daemon_ensure(app: &tauri::AppHandle, client_bin: &str) -> Result<Option<u16>, String> {
+    use crate::macos_native as native;
+
+    if native::daemon_status() != native::DaemonStatus::Enabled
+        || daemon_client_bin().as_deref() != Some(client_bin)
+    {
+        return Ok(None);
+    }
+    // Enabled daemons are KeepAlive-launched by launchd; a couple of retries
+    // cover a just-approved daemon still starting up.
+    let mut live = None;
+    for _ in 0..10 {
+        if let Some(resp) = ping_endpoint(app, Endpoint::Daemon) {
+            live = Some(resp);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let Some(resp) = live else {
+        return Ok(None); // enabled but unreachable — legacy prompt instead
+    };
+    if resp.client_bin.as_deref() != Some(client_bin) {
+        // A daemon from a different install/version of the bundle; don't
+        // fight it, just use the per-session path.
+        return Ok(None);
+    }
+
+    // The daemon is always root — restore the "deliberate user action" the
+    // password prompt used to provide, once per GUI session, with Touch ID /
+    // Apple Watch (login-password fallback).
+    use std::sync::atomic::Ordering;
+    if !PRESENCE_PROVED.load(Ordering::Relaxed) {
+        native::authenticate_user("authorize ShadowVPN to manage VPN connections this session")?;
+        PRESENCE_PROVED.store(true, Ordering::Relaxed);
+    }
+
+    let (port_path, _) = endpoint_files(app, Endpoint::Daemon)?;
+    Ok(Some(
+        read_port_at(&port_path).ok_or("daemon port file vanished")?,
+    ))
 }
 
 /// Generate a fresh session token, write it 0600, and spawn the helper via
@@ -96,9 +233,10 @@ fn spawn(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
     // backgrounded); give it a moment to bind and publish its port.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SPAWN_WAIT_MS);
     while std::time::Instant::now() < deadline {
-        if let Some(resp) = ping(app) {
+        if let Some(resp) = ping_endpoint(app, Endpoint::Session) {
             if resp.client_bin.as_deref() == Some(client_bin) {
-                return read_port(app).ok_or("helper port file vanished".to_string());
+                let (port_path, _) = endpoint_files(app, Endpoint::Session)?;
+                return read_port_at(&port_path).ok_or("helper port file vanished".to_string());
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -106,14 +244,18 @@ fn spawn(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
     Err("elevated helper did not start (no response within 15s)".to_string())
 }
 
-/// On app exit: tear the helper down when idle; leave it supervising a live
-/// connection (a relaunched GUI reuses it — and can disconnect — promptless).
+/// On app exit: tear the per-session helper down when idle; leave it
+/// supervising a live connection (a relaunched GUI reuses it — and can
+/// disconnect — promptless). The macOS launchd daemon is never torn down
+/// here: launchd owns it and it is the whole point of prompt-free sessions.
 pub fn on_app_exit(app: &tauri::AppHandle) {
-    let Some(resp) = ping(app) else { return };
+    let Some(resp) = ping_endpoint(app, Endpoint::Session) else {
+        return;
+    };
     if resp.running == Some(true) {
         return;
     }
-    let _ = call(app, Cmd::Shutdown);
+    let _ = call_endpoint(app, Endpoint::Session, Cmd::Shutdown);
     if let Ok(token_path) = paths::helper_token_file(app) {
         let _ = std::fs::remove_file(token_path);
     }
@@ -272,6 +414,12 @@ fn spawn_elevated_helper(
 }
 
 /// UI-invoked at startup: acquire the session's admin authority up front.
+///
+/// macOS with the launchd daemon in play: no prompt of any kind at startup —
+/// an enabled daemon means the session already has authority (Touch ID
+/// happens at the first connect), and a pending approval means the user
+/// should not ALSO get a password dialog. Everything else falls through to
+/// the classic one-prompt `ensure`.
 #[tauri::command]
 pub fn init_privileges(app: tauri::AppHandle) -> Result<bool, String> {
     let settings_info = settings::get_settings(app.clone())?;
@@ -280,6 +428,87 @@ pub fn init_privileges(app: tauri::AppHandle) -> Result<bool, String> {
         // elevate for; connect will surface the real error later.
         return Ok(false);
     };
+    #[cfg(target_os = "macos")]
+    {
+        use crate::macos_native as native;
+        if daemon_client_bin().as_deref() == Some(bin.as_str()) {
+            match native::daemon_status() {
+                native::DaemonStatus::Enabled => return Ok(true),
+                native::DaemonStatus::RequiresApproval => return Ok(false),
+                native::DaemonStatus::NotRegistered => {
+                    // First run from a real bundle: registering is silent (no
+                    // password) and just flips the daemon to
+                    // requires-approval; the user approves it in System
+                    // Settings whenever they like. Meanwhile this session
+                    // keeps the classic prompt-at-connect behavior.
+                    let _ = native::daemon_register();
+                    return Ok(false);
+                }
+                _ => {} // unavailable / not bundled — classic path below
+            }
+        }
+    }
     ensure(&app, &bin)?;
     Ok(true)
+}
+
+// --- Settings-surface commands for the macOS daemon -------------------------
+
+#[derive(serde::Serialize)]
+pub struct DaemonInfo {
+    /// Whether this build/OS can use the launchd daemon at all.
+    pub supported: bool,
+    /// "enabled" | "requires_approval" | "not_registered" | "not_found" |
+    /// "unavailable" | "unsupported"
+    pub status: String,
+}
+
+#[tauri::command]
+pub fn daemon_info() -> DaemonInfo {
+    #[cfg(target_os = "macos")]
+    {
+        let status = crate::macos_native::daemon_status();
+        use crate::macos_native::DaemonStatus;
+        DaemonInfo {
+            supported: !matches!(status, DaemonStatus::Unavailable | DaemonStatus::NotFound),
+            status: status.as_str().to_string(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    DaemonInfo {
+        supported: false,
+        status: "unsupported".to_string(),
+    }
+}
+
+/// Register the launchd daemon; when macOS wants explicit consent, jump the
+/// user straight to System Settings > Login Items. Returns the new status.
+#[tauri::command]
+pub fn daemon_install() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::macos_native as native;
+        let register_result = native::daemon_register();
+        let status = native::daemon_status();
+        if status == native::DaemonStatus::RequiresApproval {
+            native::open_login_items();
+        } else if status != native::DaemonStatus::Enabled {
+            register_result?;
+        }
+        Ok(status.as_str().to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err("the privileged daemon is only supported on macOS".to_string())
+}
+
+#[tauri::command]
+pub fn daemon_uninstall() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::macos_native as native;
+        native::daemon_unregister()?;
+        Ok(native::daemon_status().as_str().to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err("the privileged daemon is only supported on macOS".to_string())
 }
