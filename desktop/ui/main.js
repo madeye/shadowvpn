@@ -68,6 +68,11 @@
   const fChnroute = document.getElementById("f-chnroute");
   const fGeoip = document.getElementById("f-geoip");
   const fGeoipCountry = document.getElementById("f-geoip_country");
+
+  // Full paths to policy data files bundled next to the resolved client binary
+  // (from get_settings). Shown as the effective path when the matching field is
+  // left blank, so the user sees the real file the client auto-discovers.
+  let bundledPaths = { gfwlist: null, chnroute: null, geoip: null };
   const fSetDns = document.getElementById("f-set_dns");
 
   const fDnsTimeoutMs = document.getElementById("f-dns_timeout_ms");
@@ -464,8 +469,11 @@
   function updatePolicyFieldsState() {
     const mode = fMode.value || "full";
     document.querySelectorAll(".policy-field").forEach((label) => {
-      const forMode = label.dataset.forMode;
-      const enabled = forMode === mode;
+      // `data-for-mode` may list several modes (space-separated), e.g. the
+      // gfwlist path is used by gfwlist mode and as a chinadns force-tunnel
+      // override.
+      const modes = (label.dataset.forMode || "").split(/\s+/).filter(Boolean);
+      const enabled = modes.includes(mode);
       label.classList.toggle("field-disabled", !enabled);
       label.querySelectorAll("input").forEach((input) => {
         input.disabled = !enabled;
@@ -474,9 +482,50 @@
         btn.disabled = !enabled;
       });
     });
+    updatePathHints();
+  }
+
+  // Show, under each policy path field, the real file the client will use: the
+  // typed path already shows in the input, so the hint surfaces the bundled
+  // fallback (next to the client binary) that would be auto-discovered when the
+  // field is left blank.
+  function setPathHint(hintId, inputEl, bundled) {
+    const el = document.getElementById(hintId);
+    if (!el) return;
+    const typed = inputEl.value.trim();
+    if (typed) {
+      el.textContent = "";
+    } else if (bundled) {
+      el.textContent = `Auto (bundled): ${bundled}`;
+    } else {
+      el.textContent = "";
+    }
+  }
+
+  function updatePathHints() {
+    setPathHint("hint-gfwlist", fGfwlist, bundledPaths.gfwlist);
+    setPathHint("hint-chnroute", fChnroute, bundledPaths.chnroute);
+    setPathHint("hint-geoip", fGeoip, bundledPaths.geoip);
+  }
+
+  async function refreshBundledPaths() {
+    try {
+      const info = await callInvoke("get_settings");
+      bundledPaths = {
+        gfwlist: info.bundled_gfwlist || null,
+        chnroute: info.bundled_chnroute || null,
+        geoip: info.bundled_geoip || null,
+      };
+    } catch (_err) {
+      bundledPaths = { gfwlist: null, chnroute: null, geoip: null };
+    }
+    updatePathHints();
   }
 
   fMode.addEventListener("change", updatePolicyFieldsState);
+  [fGfwlist, fChnroute, fGeoip].forEach((input) => {
+    input.addEventListener("input", updatePathHints);
+  });
 
   passwordToggleBtn.addEventListener("click", () => {
     const showing = fPassword.type === "text";
@@ -740,6 +789,14 @@
         ? `Resolved: ${info.resolved_client_bin} (from ${info.resolved_from || "unknown"})`
         : "No client binary could be resolved.";
       settingsResolved.textContent = resolved;
+      // The bundled-data paths hang off the resolved client bin; refresh the
+      // policy-field hints from the same response.
+      bundledPaths = {
+        gfwlist: info.bundled_gfwlist || null,
+        chnroute: info.bundled_chnroute || null,
+        geoip: info.bundled_geoip || null,
+      };
+      updatePathHints();
     } catch (_err) {
       // already toasted
     }
@@ -763,6 +820,7 @@
   // ---------------------------------------------------------------------
 
   document.addEventListener("DOMContentLoaded", () => {
+    refreshBundledPaths();
     updatePolicyFieldsState();
     loadProfiles();
     pollStatus();

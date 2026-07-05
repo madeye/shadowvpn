@@ -140,12 +140,13 @@
                 <input id="f-dns_remote" type="text" placeholder="8.8.8.8:53" />
               </label>
 
-              <label class="policy-field" data-for-mode="gfwlist">
+              <label class="policy-field" data-for-mode="gfwlist chinadns">
                 GFWList path
                 <span class="input-with-btn">
-                  <input id="f-gfwlist" type="text" placeholder="/path/to/gfwlist.txt" />
+                  <input id="f-gfwlist" type="text" placeholder="/path/to/gfwlist.txt (optional in chinadns)" />
                   <button type="button" class="btn-inline" data-browse="f-gfwlist">Browse…</button>
                 </span>
+                <small class="field-hint" id="hint-gfwlist"></small>
               </label>
 
               <label class="policy-field" data-for-mode="chinadns">
@@ -154,6 +155,7 @@
                   <input id="f-chnroute" type="text" placeholder="/path/to/chnroute.txt" />
                   <button type="button" class="btn-inline" data-browse="f-chnroute">Browse…</button>
                 </span>
+                <small class="field-hint" id="hint-chnroute"></small>
               </label>
 
               <label class="policy-field" data-for-mode="chinadns">
@@ -162,6 +164,7 @@
                   <input id="f-geoip" type="text" placeholder="/path/to/GeoLite2-Country.mmdb" />
                   <button type="button" class="btn-inline" data-browse="f-geoip">Browse…</button>
                 </span>
+                <small class="field-hint" id="hint-geoip"></small>
               </label>
 
               <label class="policy-field" data-for-mode="chinadns">

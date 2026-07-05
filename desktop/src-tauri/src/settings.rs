@@ -15,6 +15,19 @@ pub struct SettingsInfo {
     pub resolved_client_bin: Option<String>,
     /// "settings" | "app_dir" | "dev_default" | null
     pub resolved_from: Option<String>,
+    /// Full paths to policy data files bundled next to the resolved client
+    /// binary, when present. These are what the client auto-discovers (and the
+    /// UI shows) when a profile leaves the corresponding path field blank.
+    pub bundled_gfwlist: Option<String>,
+    pub bundled_chnroute: Option<String>,
+    pub bundled_geoip: Option<String>,
+}
+
+/// The full path to `name` next to the resolved client binary, if it exists.
+fn bundled_path(resolved_client_bin: Option<&str>, name: &str) -> Option<String> {
+    let dir = std::path::Path::new(resolved_client_bin?).parent()?;
+    let path = dir.join(name);
+    path.is_file().then(|| path.to_string_lossy().to_string())
 }
 
 fn load_settings(app: &tauri::AppHandle) -> Result<Settings, String> {
@@ -67,10 +80,17 @@ pub fn resolve_client_bin(settings: &Settings) -> (Option<String>, Option<String
 pub fn get_settings(app: tauri::AppHandle) -> Result<SettingsInfo, String> {
     let settings = load_settings(&app)?;
     let (resolved_client_bin, resolved_from) = resolve_client_bin(&settings);
+    let bin = resolved_client_bin.as_deref();
+    let bundled_gfwlist = bundled_path(bin, "gfwlist.txt");
+    let bundled_chnroute = bundled_path(bin, "chnroute.txt");
+    let bundled_geoip = bundled_path(bin, "GeoLite2-Country.mmdb");
     Ok(SettingsInfo {
         client_bin: settings.client_bin,
         resolved_client_bin,
         resolved_from,
+        bundled_gfwlist,
+        bundled_chnroute,
+        bundled_geoip,
     })
 }
 

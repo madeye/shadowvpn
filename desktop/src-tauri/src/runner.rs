@@ -419,7 +419,9 @@ fn spawn_elevated_connect(
 
 #[cfg(target_os = "macos")]
 fn kill_elevated(pid: u32) -> Result<(), String> {
-    let script = format!("do shell script \"/bin/kill -TERM {pid}\" with administrator privileges");
+    // SIGKILL: unlike SIGTERM/SIGINT it cannot be caught, blocked, or ignored,
+    // so the client always stops (see `disconnect`).
+    let script = format!("do shell script \"/bin/kill -KILL {pid}\" with administrator privileges");
     let output = Command::new("/usr/bin/osascript")
         .arg("-e")
         .arg(&script)
@@ -439,7 +441,7 @@ fn kill_elevated(pid: u32) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn kill_elevated(pid: u32) -> Result<(), String> {
     let output = Command::new("pkexec")
-        .args(["/bin/kill", "-TERM", &pid.to_string()])
+        .args(["/bin/kill", "-KILL", &pid.to_string()])
         .output()
         .map_err(|e| format!("failed to launch pkexec: {e}"))?;
     if !output.status.success() {
@@ -457,6 +459,8 @@ fn kill_elevated(pid: u32) -> Result<(), String> {
 fn kill_elevated(pid: u32) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // taskkill /F force-terminates the process tree — the Windows equivalent of
+    // the SIGKILL used on Unix.
     let cmd = format!(
         "Start-Process -Verb RunAs -WindowStyle Hidden -Wait taskkill.exe -ArgumentList '/PID','{pid}','/T','/F'"
     );
@@ -581,19 +585,16 @@ pub fn disconnect(
         return Err("nothing running".to_string());
     };
 
+    // Stop the client with SIGKILL. A graceful SIGTERM is unreliable here: the
+    // elevated launcher (`osascript "do shell script … &"`) starts the client
+    // in a context where SIGTERM/SIGINT are never delivered to it, so it would
+    // hang until a 10s timeout on every disconnect. SIGKILL cannot be caught,
+    // blocked, or ignored, so "Disconnect" always actually disconnects.
     kill_elevated(pid)?;
-
-    // SIGTERM/taskkill cleanup (DNS restore, route removal, cache save) takes
-    // a moment; poll for death up to 10s.
-    for _ in 0..50 {
-        if !pid_alive(pid) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-
-    if pid_alive(pid) {
-        return Err(format!("process {pid} still alive after 10s grace period"));
+    if !wait_for_exit(pid, 25) {
+        return Err(format!(
+            "process {pid} still alive 5s after SIGKILL; it may need to be stopped manually"
+        ));
     }
 
     if let Ok(pid_path) = paths::pid_file(&app) {
@@ -604,4 +605,16 @@ pub fn disconnect(
     }
 
     Ok(current_status(&app))
+}
+
+/// Poll `pid_alive` every 200ms up to `ticks` times; return true as soon as the
+/// process is gone, false if it is still alive after the whole window.
+fn wait_for_exit(pid: u32, ticks: u32) -> bool {
+    for _ in 0..ticks {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    !pid_alive(pid)
 }
