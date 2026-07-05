@@ -158,6 +158,28 @@ fn daemon_client_bin() -> Option<String> {
         .then(|| candidate.to_string_lossy().to_string())
 }
 
+/// Whether this build carries the daemon definition
+/// (`Contents/Library/LaunchDaemons/<plist>` relative to the app bundle).
+/// Needed because SMAppService reports a never-registered daemon as
+/// `NotFound` — the same status as a dev build without a bundle — so "can we
+/// offer the daemon at all" must be decided from the bundle on disk.
+#[cfg(target_os = "macos")]
+fn daemon_plist_bundled() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    // Contents/MacOS/<exe> → Contents/Library/LaunchDaemons/<plist>
+    exe.parent()
+        .and_then(|macos_dir| macos_dir.parent())
+        .map(|contents| {
+            contents
+                .join("Library/LaunchDaemons")
+                .join(helper_ipc::DAEMON_PLIST_NAME)
+                .is_file()
+        })
+        .unwrap_or(false)
+}
+
 /// `Ok(Some(port))` when the approved daemon serves this `client_bin`;
 /// `Ok(None)` to fall back to the per-session helper; `Err` only when the
 /// user actively failed the Touch ID gate.
@@ -431,11 +453,14 @@ pub fn init_privileges(app: tauri::AppHandle) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
         use crate::macos_native as native;
-        if daemon_client_bin().as_deref() == Some(bin.as_str()) {
+        if daemon_client_bin().as_deref() == Some(bin.as_str()) && daemon_plist_bundled() {
             match native::daemon_status() {
                 native::DaemonStatus::Enabled => return Ok(true),
                 native::DaemonStatus::RequiresApproval => return Ok(false),
-                native::DaemonStatus::NotRegistered => {
+                // NotFound with the plist on disk is just "never registered"
+                // (SMAppService only distinguishes them after a first
+                // register call).
+                native::DaemonStatus::NotRegistered | native::DaemonStatus::NotFound => {
                     // First run from a real bundle: registering is silent (no
                     // password) and just flips the daemon to
                     // requires-approval; the user approves it in System
@@ -444,7 +469,7 @@ pub fn init_privileges(app: tauri::AppHandle) -> Result<bool, String> {
                     let _ = native::daemon_register();
                     return Ok(false);
                 }
-                _ => {} // unavailable / not bundled — classic path below
+                native::DaemonStatus::Unavailable => {} // macOS < 13 — classic path below
             }
         }
     }
@@ -467,10 +492,16 @@ pub struct DaemonInfo {
 pub fn daemon_info() -> DaemonInfo {
     #[cfg(target_os = "macos")]
     {
-        let status = crate::macos_native::daemon_status();
         use crate::macos_native::DaemonStatus;
+        let mut status = crate::macos_native::daemon_status();
+        let bundled = daemon_plist_bundled();
+        // Never-registered daemons report NotFound (see daemon_plist_bundled)
+        // — with the plist actually bundled that just means "not installed".
+        if status == DaemonStatus::NotFound && bundled {
+            status = DaemonStatus::NotRegistered;
+        }
         DaemonInfo {
-            supported: !matches!(status, DaemonStatus::Unavailable | DaemonStatus::NotFound),
+            supported: status != DaemonStatus::Unavailable && bundled,
             status: status.as_str().to_string(),
         }
     }
