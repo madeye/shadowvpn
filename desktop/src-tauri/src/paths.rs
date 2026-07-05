@@ -128,3 +128,15 @@ pub fn log_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 pub fn pid_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(runs_dir(app)?.join("shadowvpn.pid"))
 }
+
+/// `app_data_dir()/runs/helper.token` — the per-session shared secret for the
+/// elevated helper, written 0600 by the GUI before requesting elevation.
+pub fn helper_token_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(runs_dir(app)?.join("helper.token"))
+}
+
+/// `app_data_dir()/runs/helper.port` — where the elevated helper publishes
+/// its 127.0.0.1 listening port.
+pub fn helper_port_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(runs_dir(app)?.join("helper.port"))
+}

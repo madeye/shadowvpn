@@ -819,7 +819,24 @@
   // Boot
   // ---------------------------------------------------------------------
 
+  // Acquire the session's admin authority once, up front: spawns the
+  // elevated helper (one credential prompt) so connect/disconnect never
+  // prompt again this session. Declining is fine — the same single prompt
+  // simply happens at the first Connect instead.
+  async function initPrivileges() {
+    if (!invoke) return;
+    try {
+      await invoke("init_privileges");
+    } catch (_err) {
+      toast(
+        "Administrator access not granted — you'll be asked when connecting.",
+        "info",
+      );
+    }
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
+    initPrivileges();
     refreshBundledPaths();
     updatePolicyFieldsState();
     loadProfiles();

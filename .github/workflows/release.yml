@@ -261,10 +261,19 @@ jobs:
       - name: Build shadowvpn-client
         run: cargo build --release --locked --bin shadowvpn-client --target ${{ matrix.target }}
 
-      # Stage the sidecar + data files and write the CI bundle-config overlay
+      # The elevated helper (one credential prompt per session; see
+      # desktop/README.md §Elevation model). It's a second bin of the desktop
+      # crate, but externalBin staging happens before `tauri build` compiles
+      # anything, so build it explicitly here; `tauri build` then reuses the
+      # compilation cache.
+      - name: Build shadowvpn-desktop-helper
+        working-directory: desktop/src-tauri
+        run: cargo build --release --locked --bin shadowvpn-desktop-helper --target ${{ matrix.target }}
+
+      # Stage the sidecars + data files and write the CI bundle-config overlay
       # (Unix). Tauri's externalBin looks for `<name>-<target-triple>` and
       # installs it as `<name>` next to the app executable.
-      - name: Stage sidecar and overlay (Unix)
+      - name: Stage sidecars and overlay (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
@@ -272,6 +281,8 @@ jobs:
           mkdir -p desktop/src-tauri/binaries
           cp "target/${{ matrix.target }}/release/shadowvpn-client" \
             "desktop/src-tauri/binaries/shadowvpn-client-${{ matrix.target }}"
+          cp "desktop/src-tauri/target/${{ matrix.target }}/release/shadowvpn-desktop-helper" \
+            "desktop/src-tauri/binaries/shadowvpn-desktop-helper-${{ matrix.target }}"
           # On a tag, stamp the app/installer metadata with the release version
           # (tauri.conf.json carries a placeholder); sha builds keep the
           # placeholder since deb/bundle versions must be semver.
@@ -283,7 +294,7 @@ jobs:
           cat > desktop/src-tauri/ci-overlay.json <<EOF
           {
             $ver_line
-            "bundle": { "externalBin": ["binaries/shadowvpn-client"] }
+            "bundle": { "externalBin": ["binaries/shadowvpn-client", "binaries/shadowvpn-desktop-helper"] }
           }
           EOF
 
@@ -291,7 +302,7 @@ jobs:
       # data files ride as bundle resources — on Windows the resource dir IS
       # the install dir, so they land next to the exe where the client
       # auto-discovers them.
-      - name: Stage sidecar and overlay (Windows)
+      - name: Stage sidecars and overlay (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -299,6 +310,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path desktop/src-tauri/binaries, desktop/src-tauri/data | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/shadowvpn-client.exe" `
             "desktop/src-tauri/binaries/shadowvpn-client-${{ matrix.target }}.exe"
+          Copy-Item "desktop/src-tauri/target/${{ matrix.target }}/release/shadowvpn-desktop-helper.exe" `
+            "desktop/src-tauri/binaries/shadowvpn-desktop-helper-${{ matrix.target }}.exe"
           Copy-Item assets/gfwlist.txt desktop/src-tauri/data/
 
           # Matching-arch wintun.dll (see the CLI package job for the mapping).
@@ -336,7 +349,7 @@ jobs:
 
           $overlay = [ordered]@{
             bundle = [ordered]@{
-              externalBin = @("binaries/shadowvpn-client")
+              externalBin = @("binaries/shadowvpn-client", "binaries/shadowvpn-desktop-helper")
               resources = [ordered]@{
                 "data/gfwlist.txt" = "gfwlist.txt"
                 "data/GeoLite2-Country.mmdb" = "GeoLite2-Country.mmdb"
