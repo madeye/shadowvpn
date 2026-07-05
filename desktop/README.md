@@ -65,10 +65,19 @@ cargo run
 
 This compiles `shadowvpn-desktop` (a standalone crate — it has its own
 `Cargo.toml`/`Cargo.lock` and an empty `[workspace]` table so it never attaches
-to the root `shadowvpn` package) and opens the window. There is nothing to
-bundle yet (`bundle.active: false` in `tauri.conf.json`), so this is the only
-supported way to run the app for now; a signed, installable build (via
-`cargo tauri build`, which does need `tauri-cli`) is future work.
+to the root `shadowvpn` package) and opens the window.
+
+Installable packages are built by the `desktop` job in
+[`.github/workflows/release.yml`](../.github/workflows/release.yml): a `.dmg`
+on macOS (arm64 + x86_64), `.deb`/`.AppImage` on Linux (x86_64), and an NSIS
+`-setup.exe` on Windows (x64 + ARM64). Each package bundles the matching-arch
+`shadowvpn-client` next to the app executable (resolved as `app_dir`), and —
+on macOS and Windows — the `gfwlist.txt` + `GeoLite2-Country.mmdb` policy data
+(plus `wintun.dll` on Windows) beside it. The bundle wiring (Tauri
+`externalBin`/`resources`) lives in a CI-generated config overlay, not in
+`tauri.conf.json`, so a plain `cargo run` needs no pre-staged files. Packages
+are unsigned (macOS is ad-hoc signed): expect the usual Gatekeeper /
+SmartScreen prompts.
 
 Useful variants:
 

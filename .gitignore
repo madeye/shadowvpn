@@ -1,3 +1,7 @@
 /target
 /desktop/src-tauri/target
 /desktop/src-tauri/gen
+# CI-staged desktop bundle inputs (sidecar client, policy data, config overlay)
+/desktop/src-tauri/binaries
+/desktop/src-tauri/data
+/desktop/src-tauri/ci-overlay.json
