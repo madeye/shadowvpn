@@ -1,6 +1,10 @@
 // Prevents an additional console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod helper;
+mod helper_ipc;
+#[cfg(target_os = "macos")]
+mod macos_native;
 mod paths;
 mod profiles;
 mod runner;
@@ -21,6 +25,10 @@ fn main() {
             lock: Mutex::new(()),
         })
         .invoke_handler(tauri::generate_handler![
+            helper::init_privileges,
+            helper::daemon_info,
+            helper::daemon_install,
+            helper::daemon_uninstall,
             profiles::list_profiles,
             profiles::get_profile,
             profiles::save_profile,
@@ -34,6 +42,13 @@ fn main() {
             uri::import_uri,
             uri::export_uri,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Tear the elevated helper down when the app exits idle; it stays
+            // alive (promptless reconnect/disconnect) while a tunnel runs.
+            if let tauri::RunEvent::Exit = event {
+                helper::on_app_exit(app_handle);
+            }
+        });
 }

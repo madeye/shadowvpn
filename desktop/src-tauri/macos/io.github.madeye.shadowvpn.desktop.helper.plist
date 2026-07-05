@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon definition for the ShadowVPN elevated helper, registered from
+  the GUI via SMAppService (System Settings > Login Items approval instead of
+  a per-session admin password prompt). Bundled by tauri.conf.json into
+  Contents/Library/LaunchDaemons/.
+
+  SHADOWVPN_HELPER_DAEMON=1 switches the helper binary into daemon mode: it
+  self-generates its session token (root:admin 0640) and publishes its port
+  under /Library/Application Support/io.github.madeye.shadowvpn.desktop/,
+  and only ever executes the shadowvpn-client sitting next to it inside this
+  same app bundle.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.madeye.shadowvpn.desktop.helper</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/shadowvpn-desktop-helper</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SHADOWVPN_HELPER_DAEMON</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>io.github.madeye.shadowvpn.desktop</string>
+    </array>
+</dict>
+</plist>

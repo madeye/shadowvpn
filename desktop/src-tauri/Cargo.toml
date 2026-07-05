@@ -3,17 +3,26 @@ name = "shadowvpn-desktop"
 version = "0.3.0"
 edition = "2021"
 publish = false
+# The crate has a second bin (the elevated helper); keep `cargo run` pointed
+# at the GUI.
+default-run = "shadowvpn-desktop"
 
 [workspace]   # keep this crate standalone; do not attach to any parent
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[target.'cfg(target_os = "macos")'.build-dependencies]
+# Compiles macos/native_auth.m (SMAppService + LAContext glue).
+cc = "1"
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# OS-entropy token for authenticating GUI<->elevated-helper RPCs.
+getrandom = "0.3"
 # Decode/encode the `shadowvpn://<base64url(JSON)>` config URI (same URL-safe,
 # unpadded alphabet the root crate's `uri` module uses).
 base64 = "0.22"

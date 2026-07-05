@@ -239,6 +239,22 @@
           <div class="form-actions">
             <button id="save-settings-btn" type="button">Save</button>
           </div>
+
+          <!-- macOS only: SMAppService background daemon (hidden elsewhere) -->
+          <div id="daemon-section" hidden>
+            <h2>Privileged daemon (macOS)</h2>
+            <p class="help-text">
+              Install the helper as a background daemon to replace the
+              per-session administrator password prompt with a Touch&nbsp;ID
+              confirmation at connect time. Approve it once in System Settings
+              &gt; General &gt; Login&nbsp;Items after installing.
+            </p>
+            <p id="daemon-status" class="help-text"></p>
+            <div class="form-actions">
+              <button id="daemon-install-btn" type="button">Install daemon</button>
+              <button id="daemon-uninstall-btn" type="button" hidden>Uninstall daemon</button>
+            </div>
+          </div>
         </section>
       </main>
     </div>

@@ -1,17 +1,20 @@
-//! `connect` / `disconnect` / `status` / `read_log` commands: spawning the
-//! elevated `shadowvpn-client` wrapper and deriving status purely from disk
-//! state (pidfile + state.json), so it survives GUI restarts.
+//! `connect` / `disconnect` / `status` / `read_log` commands, and deriving
+//! status purely from disk state (pidfile + state.json), so it survives GUI
+//! restarts.
 //!
-//! Per-OS elevation (blueprint §3-4):
-//! - macOS: `osascript ... with administrator privileges`.
-//! - Linux: `pkexec`, falling back to an actionable manual `sudo` command
-//!   when `pkexec` is not on `PATH`.
-//! - Windows: `powershell.exe Start-Process -Verb RunAs` (UAC).
+//! Elevation happens ONCE per session: `helper::ensure` spawns the elevated
+//! helper process (macOS `osascript`, Linux `pkexec`, Windows UAC — see
+//! helper.rs), and connect/disconnect are then RPCs to it. The only elevated
+//! command this module still issues itself is the `kill_elevated` fallback,
+//! for stopping a client that outlived its helper (e.g. after an app
+//! upgrade or a helper crash).
 
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::helper;
+use crate::helper_ipc::Cmd;
 use crate::paths;
 use crate::settings;
 use crate::AppState;
@@ -193,7 +196,7 @@ pub fn read_log(app: tauri::AppHandle, lines: usize) -> Result<Vec<String>, Stri
 /// - ASCII control characters (newline, CR, NUL, ...): these can terminate
 ///   or corrupt AppleScript/PowerShell source lines and never appear in
 ///   legitimate binary/profile/log paths.
-fn check_path_safe(label: &str, s: &str) -> Result<(), String> {
+pub fn check_path_safe(label: &str, s: &str) -> Result<(), String> {
     if s.contains('"') {
         return Err(format!(
             "{label} path contains a double-quote character, which is not supported: {s}"
@@ -211,13 +214,13 @@ fn check_path_safe(label: &str, s: &str) -> Result<(), String> {
 /// word to the shell — no `$(...)`, backtick, `$var`, glob or word-splitting
 /// expansion can occur inside it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn sh_quote(s: &str) -> String {
+pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Escape a value for use inside a single-quoted PowerShell string literal.
 #[cfg(windows)]
-fn ps_quote(s: &str) -> String {
+pub fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -265,157 +268,16 @@ fn boot_time_unix() -> Option<u64> {
     Some(now_unix().saturating_sub(uptime_ms / 1000))
 }
 
-// --- Per-OS elevated spawn (blueprint §3) --------------------------------
-
-#[cfg(target_os = "macos")]
-fn spawn_elevated_connect(
-    bin: &str,
-    profile: &str,
-    log: &str,
-    pidfile: &str,
-) -> Result<(), String> {
-    // Each untrusted path is single-quote shell-escaped, so /bin/sh (which
-    // `do shell script` always uses) treats it as one literal word — no
-    // command substitution ($(...), backticks), variable expansion, or word
-    // splitting can occur inside it.
-    let inner = format!(
-        "RUST_LOG=info {} -c {} </dev/null >>{} 2>&1 & /bin/echo $! >{}",
-        sh_quote(bin),
-        sh_quote(profile),
-        sh_quote(log),
-        sh_quote(pidfile)
-    );
-    // AppleScript-escape for `do shell script "..."`: backslashes first, then
-    // double quotes.
-    let escaped = inner.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!(
-        "do shell script \"{escaped}\" with prompt \"ShadowVPN needs administrator privileges to start the VPN client.\" with administrator privileges"
-    );
-    let output = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| format!("failed to launch osascript: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "authorization cancelled or elevation failed (osascript {}): {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(target_os = "linux")]
-fn pkexec_on_path() -> bool {
+pub fn pkexec_on_path() -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("pkexec").is_file()))
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "linux")]
-fn spawn_elevated_connect(
-    bin: &str,
-    profile: &str,
-    log: &str,
-    pidfile: &str,
-) -> Result<(), String> {
-    // The script text is a fixed constant; the untrusted paths are passed as
-    // real argv positional parameters ($1..$4), so the shell never parses
-    // them — no quoting or command-substitution injection is possible.
-    const SPAWN_SCRIPT: &str =
-        r#"RUST_LOG=info "$1" -c "$2" </dev/null >>"$3" 2>&1 & echo $! >"$4""#;
-    if !pkexec_on_path() {
-        return Err(format!(
-            "pkexec not found on PATH; run this manually instead:\nsudo sh -c '{SPAWN_SCRIPT}' sh {} {} {} {}",
-            sh_quote(bin),
-            sh_quote(profile),
-            sh_quote(log),
-            sh_quote(pidfile)
-        ));
-    }
-    let output = Command::new("pkexec")
-        .args([
-            "/bin/sh",
-            "-c",
-            SPAWN_SCRIPT,
-            "sh",
-            bin,
-            profile,
-            log,
-            pidfile,
-        ])
-        .output()
-        .map_err(|e| format!("failed to launch pkexec: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "authorization cancelled or elevation failed (pkexec {}): {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn spawn_elevated_connect(
-    bin: &str,
-    profile: &str,
-    log: &str,
-    pidfile: &str,
-) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    // Each untrusted path is escaped for its single-quoted PowerShell string
-    // literal ('' = literal ') BEFORE being interpolated into the inner
-    // script, so an embedded `'` (e.g. C:\Users\O'Brien\...) cannot break out
-    // of the literal and inject PowerShell into the elevated process.
-    let bin_lit = ps_quote(bin);
-    let profile_lit = ps_quote(profile);
-    let log_lit = ps_quote(log);
-    let pidfile_lit = ps_quote(pidfile);
-    let inner = format!(
-        "$env:RUST_LOG='info'; $p = Start-Process -FilePath '{bin_lit}' -ArgumentList '-c','\"{profile_lit}\"' -WindowStyle Hidden -RedirectStandardError '{log_lit}' -RedirectStandardOutput '{log_lit}.out' -PassThru; Set-Content -Path '{pidfile_lit}' -Value $p.Id"
-    );
-    // The whole INNER script is embedded as a single-quoted list element of
-    // the outer Start-Process -ArgumentList, so every embedded `'` in it
-    // (including the doubled ones above, which round-trip correctly) must be
-    // doubled again for the outer PowerShell parser.
-    let inner_escaped = inner.replace('\'', "''");
-    // -PassThru + exit propagates the ELEVATED child's exit code to the
-    // outer powershell, so a failure inside the elevated script (bad binary
-    // path, parse error, ...) surfaces as an Err here instead of leaving the
-    // UI stuck on "connecting".
-    let outer = format!(
-        "$w = Start-Process -Verb RunAs -WindowStyle Hidden -Wait -PassThru powershell.exe -ArgumentList '-NoProfile','-WindowStyle','Hidden','-Command','{inner_escaped}'; exit $w.ExitCode"
-    );
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &outer,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("failed to launch powershell: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "authorization cancelled or elevation failed (powershell {}): {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    Ok(())
-}
-
-// --- Per-OS elevated kill (blueprint §4) ----------------------------------
+// --- Per-OS elevated kill (fallback only) ----------------------------------
+// Used when a running client has no live helper to stop it gracefully (helper
+// crashed, or the client predates this GUI session's helper).
 
 #[cfg(target_os = "macos")]
 fn kill_elevated(pid: u32) -> Result<(), String> {
@@ -525,6 +387,10 @@ pub fn connect(
     check_path_safe("log file", &log_path_str)?;
     check_path_safe("pid file", &pid_path_str)?;
 
+    // One credential prompt per session lives here: reuses the live helper
+    // when there is one, spawns (and prompts for) it otherwise.
+    helper::ensure(&app, &bin)?;
+
     // Ensure runs/ exists, create-or-truncate the log as the desktop user
     // (so it stays owned/readable even though the elevated client appends to
     // it), and clear any stale pidfile left over from a previous run.
@@ -542,22 +408,29 @@ pub fn connect(
     let state_json = serde_json::to_string_pretty(&run_state).map_err(|e| e.to_string())?;
     std::fs::write(&state_path, state_json).map_err(|e| format!("cannot write state file: {e}"))?;
 
-    if let Err(e) = spawn_elevated_connect(&bin, &profile_path_str, &log_path_str, &pid_path_str) {
-        let _ = std::fs::remove_file(&state_path);
-        return Err(e);
-    }
-
-    // Poll for the pidfile to appear (the wrapper backgrounds the client and
-    // writes it) for up to 5s; if it isn't there yet, `current_status` below
-    // will correctly report "connecting" rather than "connected".
-    for _ in 0..50 {
-        if pid_path.exists() {
-            break;
+    // The helper writes the pidfile before responding, so a success here is
+    // already "connected" for `current_status` — no pidfile polling needed.
+    let resp = helper::call(
+        &app,
+        Cmd::Connect {
+            profile: profile_path_str,
+            log: log_path_str,
+            pid_file: pid_path_str,
+        },
+    );
+    match resp {
+        Ok(r) if r.ok => Ok(current_status(&app)),
+        Ok(r) => {
+            let _ = std::fs::remove_file(&state_path);
+            Err(r
+                .error
+                .unwrap_or_else(|| "helper refused connect".to_string()))
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        Err(e) => {
+            let _ = std::fs::remove_file(&state_path);
+            Err(e)
+        }
     }
-
-    Ok(current_status(&app))
 }
 
 #[tauri::command]
@@ -585,15 +458,31 @@ pub fn disconnect(
         return Err("nothing running".to_string());
     };
 
-    // Stop the client with SIGKILL. A graceful SIGTERM is unreliable here: the
-    // elevated launcher (`osascript "do shell script … &"`) starts the client
-    // in a context where SIGTERM/SIGINT are never delivered to it, so it would
-    // hang until a 10s timeout on every disconnect. SIGKILL cannot be caught,
-    // blocked, or ignored, so "Disconnect" always actually disconnects.
-    kill_elevated(pid)?;
+    // Preferred path: the helper parents the client, so it can deliver a
+    // real SIGTERM (graceful: DNS restore, route removal, cache save) with a
+    // SIGKILL backstop — no credential prompt. (The old per-disconnect
+    // elevation couldn't: `osascript "… &"` launched the client somewhere
+    // SIGTERM never reached, which is why pre-helper builds used SIGKILL.)
+    let stopped_by_helper = match helper::ping(&app) {
+        Some(r) if r.running == Some(true) && r.pid == Some(pid) => {
+            match helper::call(&app, Cmd::Disconnect) {
+                Ok(r) if r.ok => true,
+                // Helper answered but couldn't stop it — fall through to the
+                // elevated kill rather than leaving the tunnel up.
+                _ => false,
+            }
+        }
+        // No helper, or it isn't supervising this pid (e.g. the client
+        // predates this session): elevated kill fallback below.
+        _ => false,
+    };
+
+    if !stopped_by_helper {
+        kill_elevated(pid)?;
+    }
     if !wait_for_exit(pid, 25) {
         return Err(format!(
-            "process {pid} still alive 5s after SIGKILL; it may need to be stopped manually"
+            "process {pid} still alive 5s after being stopped; it may need to be stopped manually"
         ));
     }
 
