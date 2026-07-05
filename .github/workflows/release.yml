@@ -185,3 +185,247 @@ jobs:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # Desktop app (Tauri GUI in desktop/): per-platform installers with the
+  # matching shadowvpn-client bundled next to the app executable (that's where
+  # the app auto-resolves it, `resolved_from: "app_dir"`), plus the policy data
+  # files the client auto-discovers next to itself (gfwlist.txt +
+  # GeoLite2-Country.mmdb; wintun.dll too on Windows).
+  #
+  # The sidecar/resources bundle config lives in a CI-generated `--config`
+  # overlay rather than tauri.conf.json, so plain `cargo run` in
+  # desktop/src-tauri keeps working locally without pre-staging binaries.
+  #
+  # aarch64 Linux is skipped: Tauri links WebKitGTK, which has no practical
+  # cross-compile story on a GitHub runner (unlike the pure-Rust CLI above).
+  desktop:
+    name: desktop ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, bundles: "deb,appimage" }
+          - { target: x86_64-apple-darwin, os: macos-latest, bundles: "app" }
+          - { target: aarch64-apple-darwin, os: macos-latest, bundles: "app" }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, bundles: "nsis", wintun_arch: amd64 }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, bundles: "nsis", wintun_arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      # WebKitGTK + GTK dev packages Tauri links against, and libfuse2 so the
+      # AppImage tooling (linuxdeploy) can run on the runner.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            patchelf libfuse2t64 || sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            libgtk-3-dev librsvg2-dev patchelf libfuse2
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/src-tauri/target
+          key: desktop-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
+          restore-keys: desktop-${{ matrix.target }}-cargo-
+
+      # Prebuilt tauri-cli via npm (compiling it from source takes ~10 min).
+      - name: Install tauri-cli
+        run: npm install -g @tauri-apps/cli@^2
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The client that gets bundled into the app. Built from the root crate
+      # for the same target as the app itself (an arch mismatch between app and
+      # client would be the Wintun error-193 class of failure on Windows).
+      - name: Build shadowvpn-client
+        run: cargo build --release --locked --bin shadowvpn-client --target ${{ matrix.target }}
+
+      # Stage the sidecar + data files and write the CI bundle-config overlay
+      # (Unix). Tauri's externalBin looks for `<name>-<target-triple>` and
+      # installs it as `<name>` next to the app executable.
+      - name: Stage sidecar and overlay (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/src-tauri/binaries
+          cp "target/${{ matrix.target }}/release/shadowvpn-client" \
+            "desktop/src-tauri/binaries/shadowvpn-client-${{ matrix.target }}"
+          # On a tag, stamp the app/installer metadata with the release version
+          # (tauri.conf.json carries a placeholder); sha builds keep the
+          # placeholder since deb/bundle versions must be semver.
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            ver_line='"version": "${{ steps.ver.outputs.version }}",'
+          else
+            ver_line=''
+          fi
+          cat > desktop/src-tauri/ci-overlay.json <<EOF
+          {
+            $ver_line
+            "bundle": { "externalBin": ["binaries/shadowvpn-client"] }
+          }
+          EOF
+
+      # Stage the sidecar, policy data, wintun.dll, and overlay (Windows). The
+      # data files ride as bundle resources — on Windows the resource dir IS
+      # the install dir, so they land next to the exe where the client
+      # auto-discovers them.
+      - name: Stage sidecar and overlay (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path desktop/src-tauri/binaries, desktop/src-tauri/data | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/shadowvpn-client.exe" `
+            "desktop/src-tauri/binaries/shadowvpn-client-${{ matrix.target }}.exe"
+          Copy-Item assets/gfwlist.txt desktop/src-tauri/data/
+
+          # Matching-arch wintun.dll (see the CLI package job for the mapping).
+          $arch = "${{ matrix.wintun_arch }}"
+          $wzip = "wintun-${env:WINTUN_VERSION}.zip"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/$wzip" -OutFile $wzip `
+            -MaximumRetryCount 3 -RetryIntervalSec 5
+          Expand-Archive -Path $wzip -DestinationPath wintun-extract -Force
+          $dll = "wintun-extract/wintun/bin/$arch/wintun.dll"
+          if (-not (Test-Path $dll)) { throw "wintun.dll for '$arch' not found in $wzip" }
+          Copy-Item $dll desktop/src-tauri/data/
+
+          Invoke-WebRequest -Uri "${env:GEOIP_MMDB_URL}" -OutFile desktop/src-tauri/data/GeoLite2-Country.mmdb `
+            -MaximumRetryCount 3 -RetryIntervalSec 5
+          if ((Get-Item desktop/src-tauri/data/GeoLite2-Country.mmdb).Length -lt 100000) {
+            throw "GeoLite2-Country.mmdb download looks too small — bad mirror?"
+          }
+
+          @"
+          This package bundles third-party files, each under its own license:
+
+          * wintun.dll (Wintun ${env:WINTUN_VERSION}, $arch) — the Wintun userspace
+            TUN driver by WireGuard LLC. https://www.wintun.net/  Redistributed
+            verbatim under its own license; not covered by ShadowVPN's LICENSE.
+
+          * GeoLite2-Country.mmdb — this product includes GeoLite2 data created by
+            MaxMind, available from https://www.maxmind.com/ , subject to the
+            GeoLite2 End User License Agreement. Updated copies / your own
+            licensed database can replace this file.
+
+          * gfwlist.txt — a domain-suffix list derived from the AutoProxy gfwlist
+            (https://github.com/gfwlist/gfwlist , LGPL-2.1), decoded and reduced to
+            plain domains. Regenerate with scripts/gen-gfwlist.sh.
+          "@ | Out-File -Encoding utf8 desktop/src-tauri/data/THIRD-PARTY-NOTICES.txt
+
+          $overlay = [ordered]@{
+            bundle = [ordered]@{
+              externalBin = @("binaries/shadowvpn-client")
+              resources = [ordered]@{
+                "data/gfwlist.txt" = "gfwlist.txt"
+                "data/GeoLite2-Country.mmdb" = "GeoLite2-Country.mmdb"
+                "data/wintun.dll" = "wintun.dll"
+                "data/THIRD-PARTY-NOTICES.txt" = "THIRD-PARTY-NOTICES.txt"
+              }
+            }
+          }
+          if ("${env:GITHUB_REF}" -like "refs/tags/*") {
+            $overlay.Insert(0, "version", "${{ steps.ver.outputs.version }}")
+          }
+          $overlay | ConvertTo-Json -Depth 5 | Out-File -Encoding utf8 desktop/src-tauri/ci-overlay.json
+
+      - name: Build desktop app
+        working-directory: desktop/src-tauri
+        run: tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config ci-overlay.json
+
+      # macOS: the bundler placed the client sidecar in Contents/MacOS; drop the
+      # policy data files next to it (that's where the client auto-discovers
+      # them), re-sign ad-hoc (adding files breaks the bundler's seal), and
+      # build the .dmg by hand — hdiutil is more reliable on CI than the
+      # bundler's AppleScript-driven dmg step.
+      - name: Package (macOS dmg)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/ShadowVPN.app"
+          cp assets/gfwlist.txt "$app/Contents/MacOS/"
+          curl -fsSL --retry 3 --retry-delay 5 "$GEOIP_MMDB_URL" \
+            -o "$app/Contents/MacOS/GeoLite2-Country.mmdb"
+          size=$(stat -f%z "$app/Contents/MacOS/GeoLite2-Country.mmdb")
+          if (( size < 100000 )); then
+            echo "GeoLite2-Country.mmdb download looks too small — bad mirror?" >&2
+            exit 1
+          fi
+          codesign --force --deep --sign - "$app"
+          stage="dmg-stage"
+          mkdir -p "$stage"
+          cp -R "$app" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          cat > "$stage/THIRD-PARTY-NOTICES.txt" <<'EOF'
+          This app bundles third-party files, each under its own license:
+
+          * GeoLite2-Country.mmdb — this product includes GeoLite2 data created by
+            MaxMind, available from https://www.maxmind.com/ , subject to the
+            GeoLite2 End User License Agreement.
+
+          * gfwlist.txt — a domain-suffix list derived from the AutoProxy gfwlist
+            (https://github.com/gfwlist/gfwlist , LGPL-2.1), decoded and reduced to
+            plain domains. Regenerate with scripts/gen-gfwlist.sh.
+          EOF
+          mkdir -p desktop-dist
+          asset="desktop-dist/shadowvpn-desktop-${{ steps.ver.outputs.version }}-${{ matrix.target }}.dmg"
+          hdiutil create -volname "ShadowVPN" -srcfolder "$stage" -ov -format UDZO "$asset"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          v="${{ steps.ver.outputs.version }}"
+          t="${{ matrix.target }}"
+          mkdir -p desktop-dist
+          cp "$bundle"/deb/*.deb "desktop-dist/shadowvpn-desktop-$v-$t.deb"
+          cp "$bundle"/appimage/*.AppImage "desktop-dist/shadowvpn-desktop-$v-$t.AppImage"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = "desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          New-Item -ItemType Directory -Force -Path desktop-dist | Out-Null
+          $setup = Get-ChildItem "$bundle/nsis/*-setup.exe" | Select-Object -First 1
+          Copy-Item $setup.FullName `
+            "desktop-dist/shadowvpn-desktop-${{ steps.ver.outputs.version }}-${{ matrix.target }}-setup.exe"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowvpn-desktop-${{ matrix.target }}
+          path: desktop-dist/*
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop-dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
