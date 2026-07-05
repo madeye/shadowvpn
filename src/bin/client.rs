@@ -185,9 +185,15 @@ async fn run(cfg: ClientConfig) -> Result<()> {
             cfg.policy.mode.name()
         );
         Some(
-            shadowvpn::policy::spawn(&cfg.policy, &iface_name, cfg.tun.ip, direct_src)
-                .await
-                .context("failed to start policy routing")?,
+            shadowvpn::policy::spawn(
+                &cfg.policy,
+                &iface_name,
+                cfg.tun.ip,
+                server_addr.ip(),
+                direct_src,
+            )
+            .await
+            .context("failed to start policy routing")?,
         )
     } else {
         // Tell the user how to actually route traffic through the tunnel; in
