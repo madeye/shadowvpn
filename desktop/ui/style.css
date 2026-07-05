@@ -374,6 +374,18 @@ textarea {
   pointer-events: none;
 }
 
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.field-hint:empty {
+  display: none;
+}
+
 details#dns-advanced {
   border: 1px solid var(--border);
   border-radius: 8px;

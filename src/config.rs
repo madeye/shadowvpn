@@ -599,11 +599,15 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
     // Explicit `geoip` (CLI or file) wins; otherwise, in chinadns mode with no
     // `chnroute` either, fall back to a bundled GeoLite2-Country.mmdb so the
     // China set works with no configured path.
-    let geoip = args.geoip.clone().or_else(|| file.geoip.clone()).or_else(|| {
-        bundle_dir
-            .as_deref()
-            .and_then(|d| bundled_geoip(mode, chnroute.is_some(), d))
-    });
+    let geoip = args
+        .geoip
+        .clone()
+        .or_else(|| file.geoip.clone())
+        .or_else(|| {
+            bundle_dir
+                .as_deref()
+                .and_then(|d| bundled_geoip(mode, chnroute.is_some(), d))
+        });
 
     // `--no-set-dns` wins over `--set-dns`; otherwise file value; default on.
     let set_dns = if args.no_set_dns {
