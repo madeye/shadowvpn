@@ -31,4 +31,6 @@ done
 
 echo "[server] tun0 up; starting iperf3 server (foreground)"
 # iperf3 in the foreground keeps the container alive for the client's test run.
-exec iperf3 --server --interval 0
+# No `exec`: replacing the shell would drop the EXIT trap above, leaving the
+# ShadowVPN server without a clean shutdown when iperf3 exits.
+iperf3 --server --interval 0

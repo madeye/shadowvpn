@@ -30,11 +30,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Run every requested mode even if an earlier one fails, and report each
+# result explicitly — a bare `set -e` abort would never say WHICH mode broke.
+failed_modes=""
 for mode in "${MODES[@]}"; do
     echo "==> ShadowVPN policy-routing E2E test (mode=${mode})"
     $COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
-    MODE="$mode" $COMPOSE up --build --abort-on-container-exit --exit-code-from client
-    echo "==> mode=${mode} PASSED"
+    if MODE="$mode" $COMPOSE up --build --abort-on-container-exit --exit-code-from client; then
+        echo "==> mode=${mode} PASSED"
+    else
+        echo "==> mode=${mode} FAILED" >&2
+        failed_modes="${failed_modes:+$failed_modes }$mode"
+    fi
 done
 
+if [ -n "$failed_modes" ]; then
+    echo "==> FAILED modes: $failed_modes" >&2
+    exit 1
+fi
 echo "==> all policy-routing modes passed"

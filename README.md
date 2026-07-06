@@ -327,7 +327,7 @@ out is via ShadowVPN) and fetches a QUIC site with an HTTP/3-only `curl`:
 
 ```sh
 ./docker/run-e2e-http3.sh                       # default: https://www.cloudflare-quic.com/
-TARGET_URL=https://cloudflare-quic.com/ ./docker/run-e2e-http3.sh aes-256-gcm
+TARGET_URL=https://www.cloudflare-quic.com/ ./docker/run-e2e-http3.sh aes-256-gcm
 ```
 
 The test passes when the response is delivered over **HTTP/3** (`http_version=3`);
