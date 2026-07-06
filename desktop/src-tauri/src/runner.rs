@@ -353,9 +353,21 @@ pub fn connect(
         .lock()
         .map_err(|_| "internal state lock poisoned".to_string())?;
 
-    paths::validate_profile_name(&name)?;
+    let status = do_connect(&app, &name)?;
+    // Record the intent: this profile should stay up. The reconnect watcher
+    // uses it to restart a client that dies without a user disconnect.
+    if let Ok(mut active) = state.active_profile.lock() {
+        *active = Some(name);
+    }
+    Ok(status)
+}
 
-    let current = current_status(&app);
+/// The connect body shared by the `connect` command and the auto-reconnect
+/// watcher. The caller is responsible for holding `AppState.lock`.
+pub fn do_connect(app: &tauri::AppHandle, name: &str) -> Result<StatusInfo, String> {
+    paths::validate_profile_name(name)?;
+
+    let current = current_status(app);
     if current.state != "disconnected" {
         return Err(format!("already {}", current.state));
     }
@@ -371,14 +383,14 @@ pub fn connect(
         );
     };
 
-    let profile_path = paths::profile_path(&app, &name)?;
+    let profile_path = paths::profile_path(app, name)?;
     if !profile_path.exists() {
         return Err(format!("profile '{name}' not found"));
     }
     let profile_path_str = profile_path.to_string_lossy().to_string();
 
-    let log_path = paths::log_file(&app)?;
-    let pid_path = paths::pid_file(&app)?;
+    let log_path = paths::log_file(app)?;
+    let pid_path = paths::pid_file(app)?;
     let log_path_str = log_path.to_string_lossy().to_string();
     let pid_path_str = pid_path.to_string_lossy().to_string();
 
@@ -389,29 +401,32 @@ pub fn connect(
 
     // One credential prompt per session lives here: reuses the live helper
     // when there is one, spawns (and prompts for) it otherwise.
-    helper::ensure(&app, &bin)?;
+    helper::ensure(app, &bin)?;
 
-    // Ensure runs/ exists, create-or-truncate the log as the desktop user
-    // (so it stays owned/readable even though the elevated client appends to
-    // it), and clear any stale pidfile left over from a previous run.
-    paths::runs_dir(&app)?;
+    // Ensure runs/ exists, rotate the previous run's log aside (its tail —
+    // the reason that run ended — is the only post-mortem there is; a plain
+    // truncate here used to destroy it), create the fresh log as the desktop
+    // user (so it stays owned/readable even though the elevated client
+    // appends to it), and clear any stale pidfile from a previous run.
+    paths::runs_dir(app)?;
+    rotate_log(&log_path);
     std::fs::File::create(&log_path).map_err(|e| format!("cannot create log file: {e}"))?;
     let _ = std::fs::remove_file(&pid_path);
 
     let run_state = RunState {
-        profile: name.clone(),
+        profile: name.to_string(),
         started_unix: now_unix(),
         log_file: log_path_str.clone(),
         pid_file: pid_path_str.clone(),
     };
-    let state_path = paths::state_file(&app)?;
+    let state_path = paths::state_file(app)?;
     let state_json = serde_json::to_string_pretty(&run_state).map_err(|e| e.to_string())?;
     std::fs::write(&state_path, state_json).map_err(|e| format!("cannot write state file: {e}"))?;
 
     // The helper writes the pidfile before responding, so a success here is
     // already "connected" for `current_status` — no pidfile polling needed.
     let resp = helper::call(
-        &app,
+        app,
         Cmd::Connect {
             profile: profile_path_str,
             log: log_path_str,
@@ -419,7 +434,7 @@ pub fn connect(
         },
     );
     match resp {
-        Ok(r) if r.ok => Ok(current_status(&app)),
+        Ok(r) if r.ok => Ok(current_status(app)),
         Ok(r) => {
             let _ = std::fs::remove_file(&state_path);
             Err(r
@@ -442,6 +457,12 @@ pub fn disconnect(
         .lock
         .lock()
         .map_err(|_| "internal state lock poisoned".to_string())?;
+
+    // Clear the intent up front (even if the stop below fails): the user asked
+    // for the tunnel to be down, so the watcher must not bring it back.
+    if let Ok(mut active) = state.active_profile.lock() {
+        *active = None;
+    }
 
     let current = current_status(&app);
 
@@ -494,6 +515,22 @@ pub fn disconnect(
     }
 
     Ok(current_status(&app))
+}
+
+/// Keep the previous run's log around as `<log>.1` (best-effort; one
+/// generation is enough for a post-mortem).
+fn rotate_log(path: &std::path::Path) {
+    if std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let rotated = std::path::PathBuf::from(rotated);
+        // Windows `rename` refuses to replace an existing file.
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(path, &rotated);
+    }
 }
 
 /// Poll `pid_alive` every 200ms up to `ticks` times; return true as soon as the

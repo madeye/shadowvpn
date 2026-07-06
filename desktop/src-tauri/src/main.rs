@@ -7,6 +7,7 @@ mod helper_ipc;
 mod macos_native;
 mod paths;
 mod profiles;
+mod reconnect;
 mod runner;
 mod settings;
 mod uri;
@@ -16,6 +17,10 @@ use std::sync::Mutex;
 /// Shared app state: serializes connect/disconnect so two calls can't race.
 pub struct AppState {
     pub lock: Mutex<()>,
+    /// The profile that is *supposed* to be up: set by `connect`, cleared by
+    /// `disconnect`. When the client dies while this is set, the reconnect
+    /// watcher brings it back (see `reconnect`).
+    pub active_profile: Mutex<Option<String>>,
 }
 
 fn main() {
@@ -23,6 +28,11 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             lock: Mutex::new(()),
+            active_profile: Mutex::new(None),
+        })
+        .setup(|app| {
+            reconnect::spawn(app.handle().clone());
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             helper::init_privileges,
