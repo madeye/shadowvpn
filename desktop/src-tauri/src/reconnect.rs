@@ -87,7 +87,10 @@ fn watch(app: tauri::AppHandle) {
                 }
                 // Reconnect only through a live helper (promptless). With the
                 // helper gone, a reconnect would raise a credential dialog out
-                // of nowhere — drop the intent and leave it to the user.
+                // of nowhere — drop the intent and leave it to the user. The
+                // promptless connect below re-checks this itself (the helper
+                // can die between this ping and the connect), so this early
+                // check only decides whether to drop the intent.
                 if helper::ping(&app).is_none() {
                     eprintln!(
                         "[reconnect] client for profile '{profile}' is down and the \
@@ -96,7 +99,7 @@ fn watch(app: tauri::AppHandle) {
                     *active = None;
                     continue;
                 }
-                match runner::do_connect(&app, &profile) {
+                match runner::do_connect(&app, &profile, false) {
                     Ok(_) => {
                         eprintln!("[reconnect] client for profile '{profile}' died; reconnected");
                         backoff = BACKOFF_START;

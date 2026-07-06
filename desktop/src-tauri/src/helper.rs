@@ -116,6 +116,38 @@ pub fn ensure(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
     ensure_session(app, client_bin)
 }
 
+/// Promptless variant of [`ensure`] for the auto-reconnect watcher: only ever
+/// reuses an already-authorized live helper. It never spawns one (no
+/// osascript/UAC/pkexec dialog) and never raises the macOS Touch ID gate, so
+/// it cannot pop a credential prompt at a random moment — even if the helper
+/// died between the caller's liveness check and this call.
+pub fn ensure_existing(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        // The daemon is only usable promptlessly once this session already
+        // passed the user-presence gate; before that, using it would raise
+        // the Touch ID dialog — exactly the surprise this path forbids.
+        if PRESENCE_PROVED.load(Ordering::Relaxed) {
+            if let Some(resp) = ping_endpoint(app, Endpoint::Daemon) {
+                if resp.client_bin.as_deref() == Some(client_bin) {
+                    let (port_path, _) = endpoint_files(app, Endpoint::Daemon)?;
+                    if let Some(port) = read_port_at(&port_path) {
+                        return Ok(port);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(resp) = ping_endpoint(app, Endpoint::Session) {
+        if resp.client_bin.as_deref() == Some(client_bin) {
+            let (port_path, _) = endpoint_files(app, Endpoint::Session)?;
+            return read_port_at(&port_path).ok_or("helper port file vanished".to_string());
+        }
+    }
+    Err("no live elevated helper for this client binary; refusing to elevate without a user-initiated prompt".to_string())
+}
+
 fn ensure_session(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
     let session_port = |app: &tauri::AppHandle| -> Result<u16, String> {
         let (port_path, _) = endpoint_files(app, Endpoint::Session)?;
@@ -270,6 +302,13 @@ fn spawn(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
 /// supervising a live connection (a relaunched GUI reuses it — and can
 /// disconnect — promptless). The macOS launchd daemon is never torn down
 /// here: launchd owns it and it is the whole point of prompt-free sessions.
+///
+/// This runs synchronously on the main thread during `RunEvent::Exit`, so it
+/// is bounded: the ping is capped by `CONNECT_TIMEOUT` (2s) and the Shutdown
+/// round-trip by [`EXIT_SHUTDOWN_TIMEOUT`] — never the general 30s
+/// `IO_TIMEOUT`. The token/port files are removed even when the Shutdown
+/// call fails, so a helper that missed the request is still reaped by its
+/// token-file janitor (~30s) instead of lingering until reboot.
 pub fn on_app_exit(app: &tauri::AppHandle) {
     let Some(resp) = ping_endpoint(app, Endpoint::Session) else {
         return;
@@ -277,14 +316,25 @@ pub fn on_app_exit(app: &tauri::AppHandle) {
     if resp.running == Some(true) {
         return;
     }
-    let _ = call_endpoint(app, Endpoint::Session, Cmd::Shutdown);
-    if let Ok(token_path) = paths::helper_token_file(app) {
-        let _ = std::fs::remove_file(token_path);
+    let Ok((port_path, token_path)) = endpoint_files(app, Endpoint::Session) else {
+        return;
+    };
+    if let (Some(port), Some(token)) = (read_port_at(&port_path), read_token_at(&token_path)) {
+        let _ = helper_ipc::call_with_io_timeout(
+            port,
+            &Request {
+                token,
+                cmd: Cmd::Shutdown,
+            },
+            EXIT_SHUTDOWN_TIMEOUT,
+        );
     }
-    if let Ok(port_path) = paths::helper_port_file(app) {
-        let _ = std::fs::remove_file(port_path);
-    }
+    let _ = std::fs::remove_file(&token_path);
+    let _ = std::fs::remove_file(&port_path);
 }
+
+/// I/O deadline for the best-effort Shutdown sent while the app is quitting.
+const EXIT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The helper ships next to the app executable (same externalBin sidecar
 /// mechanism as the bundled client; in dev it's the sibling target-dir bin).

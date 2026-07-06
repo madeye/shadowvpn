@@ -96,11 +96,22 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One request/response round-trip on a fresh connection.
 pub fn call(port: u16, req: &Request) -> Result<Response, String> {
+    call_with_io_timeout(port, req, IO_TIMEOUT)
+}
+
+/// Same round-trip with a caller-chosen I/O deadline. App-exit teardown uses
+/// a short one: quitting must never hang the UI thread for the full
+/// [`IO_TIMEOUT`] on a wedged helper.
+pub fn call_with_io_timeout(
+    port: u16,
+    req: &Request,
+    io_timeout: Duration,
+) -> Result<Response, String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| format!("cannot reach helper on 127.0.0.1:{port}: {e}"))?;
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(io_timeout));
+    let _ = stream.set_write_timeout(Some(io_timeout));
 
     let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
     line.push('\n');

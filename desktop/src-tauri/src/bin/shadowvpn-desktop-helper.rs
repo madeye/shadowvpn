@@ -219,7 +219,7 @@ fn spawn_client(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start {client_bin}: {e}"))?;
-    if let Err(e) = write_nofollow(pid_file, format!("{}\n", child.id()).as_bytes()) {
+    if let Err(e) = write_nofollow(Path::new(pid_file), format!("{}\n", child.id()).as_bytes()) {
         // Without the pidfile the GUI can neither show nor stop this run;
         // don't leave an orphaned root client behind.
         let _ = child.kill();
@@ -231,8 +231,9 @@ fn spawn_client(
 
 /// `fs::write` that refuses to follow a symlink at `path` (see the note in
 /// `spawn_client`; no-op difference on Windows, where the per-user ACLs
-/// already protect these paths).
-fn write_nofollow(path: &str, data: &[u8]) -> std::io::Result<()> {
+/// already protect these paths). Every path this elevated process writes
+/// that lives in a GUI-user-controlled directory MUST go through here.
+fn write_nofollow(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -242,6 +243,51 @@ fn write_nofollow(path: &str, data: &[u8]) -> std::io::Result<()> {
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     opts.open(path)?.write_all(data)
+}
+
+/// `Command::output()` with a deadline: this helper serves all requests on a
+/// single thread, so a child that never exits (a wedged `networksetup`, DNS
+/// I/O stuck in the kernel) must be killed rather than allowed to block every
+/// later request — including Disconnect and Shutdown — forever. Pipes are
+/// drained only after exit; a child producing more output than the pipe
+/// buffer stalls until the deadline kills it, which is fine for the tiny
+/// output these subcommands emit.
+fn output_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| format!("failed to collect output: {e}"));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "did not exit within {}s and was killed",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait failed: {e}"));
+            }
+        }
+    }
 }
 
 /// Stop the child: graceful where possible, forced as the backstop.
@@ -392,7 +438,9 @@ fn respond(line: &str, args: &Args, slot: &ChildSlot) -> (Response, bool) {
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
-            match cmd.output() {
+            // Deadline-bound: a hung restore must not wedge this
+            // single-threaded helper for every later request.
+            match output_with_timeout(&mut cmd, Duration::from_secs(10)) {
                 Ok(out) if out.status.success() => (
                     Response {
                         ok: true,
@@ -409,7 +457,7 @@ fn respond(line: &str, args: &Args, slot: &ChildSlot) -> (Response, bool) {
                     false,
                 ),
                 Err(e) => (
-                    Response::err(format!("failed to run {}: {e}", args.client_bin)),
+                    Response::err(format!("restore-dns via {}: {e}", args.client_bin)),
                     false,
                 ),
             }
@@ -485,7 +533,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(e) = std::fs::write(&args.port_file, format!("{port}\n")) {
+    // O_NOFOLLOW like every other GUI-controlled path this root process
+    // writes: a symlink planted at the port-file path must not let an
+    // unprivileged user truncate an arbitrary root-owned file.
+    if let Err(e) = write_nofollow(&args.port_file, format!("{port}\n").as_bytes()) {
         eprintln!(
             "shadowvpn-desktop-helper: cannot write port file {}: {e}",
             args.port_file.display()
