@@ -66,7 +66,19 @@ async fn main() -> Result<()> {
     // Default to `info` logging; override with `RUST_LOG`.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cfg = ClientArgs::parse()
+    let args = ClientArgs::parse();
+
+    // Journal-only recovery mode: put the resolver back after a run that died
+    // without cleaning up (typically invoked by the desktop app's elevated
+    // helper), then exit without bringing up a tunnel.
+    if args.restore_dns {
+        if !shadowvpn::policy::dnsconf::restore_from_journal()? {
+            info!("no DNS restore journal found; nothing to do");
+        }
+        return Ok(());
+    }
+
+    let cfg = args
         .resolve()
         .context("failed to resolve client configuration")?;
 
