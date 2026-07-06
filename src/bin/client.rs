@@ -48,12 +48,14 @@ use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
 use shadowvpn::tun_device::TunDevice;
 
-/// How often to send a keepalive datagram to the server.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
-
 /// Depth of the hand-off channel between each relay loop's I/O reader and its
 /// processor (see the server for the rationale). Bounded for backpressure.
 const CHANNEL_DEPTH: usize = 1024;
+
+/// Pause after a transient receive error before retrying: queued ICMP errors
+/// surface back-to-back, and without a breather a condition that persists for
+/// a few seconds would spin the receive loop.
+const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Plaintext payload of a keepalive datagram: a single zero byte. Smaller than
 /// any real IP packet header, so the server can distinguish/drop it cheaply.
@@ -208,6 +210,7 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         cipher,
         Arc::clone(&master_key),
         obfuscator.clone(),
+        cfg.keepalive,
     ));
 
     // The DNS-proxy task, when policy routing is active. When it is not (or on
@@ -282,6 +285,41 @@ fn propagate(which: &str, joined: Result<Result<()>, tokio::task::JoinError>) ->
     }
 }
 
+/// I/O errors on the connected UDP socket that reflect a transient *network*
+/// condition rather than a broken socket: an ICMP unreachable bounced back
+/// while a NAT on the path rebinds (`ECONNREFUSED`/`ECONNRESET`/
+/// `EHOSTUNREACH`/`ENETUNREACH`), the physical interface flapping
+/// (`ENETDOWN`/`EADDRNOTAVAIL`), or a momentarily full output queue
+/// (`ENOBUFS`, common on macOS under load). Exiting on one of these turns a
+/// seconds-long blip into a dead tunnel (a ~1 AM home-router NAT reset used
+/// to take the client down for the rest of the night), so the relay and
+/// keepalive loops log, drop the affected datagram, and keep going — the
+/// path heals on its own.
+fn is_transient_udp_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    // ENOBUFS has no dedicated `ErrorKind`; match the raw OS error.
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ENOBUFS) {
+        return true;
+    }
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(10055) {
+        // WSAENOBUFS
+        return true;
+    }
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::AddrNotAvailable
+            | ErrorKind::Interrupted
+    )
+}
+
 /// Loop A: read raw IP packets from TUN, encrypt, and send to the server.
 ///
 /// Pipelined so TUN reads overlap the per-packet encryption + UDP send: a
@@ -316,6 +354,9 @@ async fn tun_to_net(
 
     // Processor: encrypt, obfuscate, and send to the server.
     let processor = tokio::spawn(async move {
+        // Consecutive transient send failures (see `is_transient_udp_error`):
+        // warn once when a burst starts, then stay quiet until it clears.
+        let mut send_failures: u64 = 0;
         while let Some(pkt) = rx.recv().await {
             let n = pkt.len();
 
@@ -336,11 +377,24 @@ async fn tun_to_net(
                 None => datagram,
             };
 
-            // A failed send to a connected socket is treated as fatal.
-            socket
-                .send(&wire)
-                .await
-                .context("failed to send datagram to server")?;
+            // A transient path error drops this packet (the peers' transport
+            // protocols retransmit); anything else is fatal.
+            if let Err(e) = socket.send(&wire).await {
+                if is_transient_udp_error(&e) {
+                    send_failures += 1;
+                    if send_failures == 1 {
+                        warn!("transient send error, dropping packets until the path clears: {e}");
+                    } else {
+                        debug!("transient send error #{send_failures}: {e}");
+                    }
+                    continue;
+                }
+                return Err(e).context("failed to send datagram to server");
+            }
+            if send_failures > 0 {
+                info!("send path recovered after {send_failures} dropped packet(s)");
+                send_failures = 0;
+            }
             debug!(
                 "tun->net: {n} bytes plaintext -> {} bytes on wire",
                 wire.len()
@@ -378,11 +432,31 @@ async fn net_to_tun(
         // UDP buffer sized for the encrypted form of the largest IP packet, plus
         // headroom for the obfs prefix when obfuscation is enabled.
         let mut buf = vec![0u8; max_datagram_size(cipher) + obfs::MAX_HEADER];
+        // Consecutive transient receive failures (see `is_transient_udp_error`):
+        // warn once when a burst starts, then stay quiet until it clears.
+        let mut recv_failures: u64 = 0;
         loop {
-            let n = socket
-                .recv(&mut buf)
-                .await
-                .context("failed to receive datagram from server")?;
+            let n = match socket.recv(&mut buf).await {
+                Ok(n) => n,
+                // A transient path error (typically an ICMP unreachable queued
+                // on the connected socket) is retried, with a breather so a
+                // persistent condition doesn't spin this loop.
+                Err(e) if is_transient_udp_error(&e) => {
+                    recv_failures += 1;
+                    if recv_failures == 1 {
+                        warn!("transient receive error, retrying until the path clears: {e}");
+                    } else {
+                        debug!("transient receive error #{recv_failures}: {e}");
+                    }
+                    tokio::time::sleep(TRANSIENT_RETRY_DELAY).await;
+                    continue;
+                }
+                Err(e) => return Err(e).context("failed to receive datagram from server"),
+            };
+            if recv_failures > 0 {
+                info!("receive path recovered after {recv_failures} transient error(s)");
+                recv_failures = 0;
+            }
             if tx.send(buf[..n].to_vec()).await.is_err() {
                 return Ok(());
             }
@@ -452,15 +526,17 @@ async fn net_to_tun(
 /// Periodically send a tiny encrypted keepalive datagram to the server.
 ///
 /// This refreshes NAT mappings and lets the server learn our source address
-/// before we send real traffic. Encryption failures are logged and skipped; a
-/// send failure is fatal (the path to the server is gone).
+/// before we send real traffic. Encryption failures and transient send errors
+/// are logged and skipped (the next tick retries); any other send failure is
+/// fatal (the socket itself is broken).
 async fn keepalive_loop(
     socket: Arc<UdpSocket>,
     cipher: Cipher,
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
+    interval: Duration,
 ) -> Result<()> {
-    let mut ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
+    let mut ticker = tokio::time::interval(interval);
     // Don't fire a burst if we ever fall behind schedule.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -479,6 +555,10 @@ async fn keepalive_loop(
             None => datagram,
         };
         if let Err(e) = socket.send(&wire).await {
+            if is_transient_udp_error(&e) {
+                warn!("transient keepalive send error, retrying next tick: {e}");
+                continue;
+            }
             return Err(e).context("failed to send keepalive to server");
         }
         debug!("sent {}-byte keepalive", wire.len());

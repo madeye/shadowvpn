@@ -74,9 +74,16 @@ pub const DEFAULT_DNS_TIMEOUT_MS: u64 = 3000;
 
 /// Default idle time-to-live for a client's NAT mapping, in seconds. A mapping
 /// is refreshed by any traffic (data or keepalive) from the client and reclaimed
-/// once idle for longer than this — comfortably above the client's 25-second
-/// keepalive interval.
+/// once idle for longer than this — comfortably above the client's default
+/// keepalive interval ([`DEFAULT_KEEPALIVE_SECS`]).
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 120;
+
+/// Default client keepalive interval, in seconds. Consumer routers commonly
+/// expire idle UDP NAT mappings in as little as ~20 seconds; a keepalive
+/// slower than that rebinds the flow to a new source port on every idle gap
+/// (churning the server's per-client NAT and dropping in-flight replies), so
+/// the default sits safely below it.
+pub const DEFAULT_KEEPALIVE_SECS: u64 = 15;
 
 /// Errors raised while loading or validating configuration.
 #[derive(Debug, thiserror::Error)]
@@ -186,6 +193,13 @@ pub struct FileConfig {
     /// (default [`DEFAULT_LEASE_TTL_SECS`]). Ignored by the client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_ttl_secs: Option<u64>,
+
+    /// Client-only: keepalive interval in seconds (default
+    /// [`DEFAULT_KEEPALIVE_SECS`]). Must stay below the shortest UDP NAT
+    /// timeout on the path or the flow rebinds to a new source port whenever
+    /// it goes idle. Ignored by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_secs: Option<u64>,
 
     // --- Client-only policy routing (ignored by the server) ----------------
     /// Policy-routing mode: `full` (default), `gfwlist`, or `chinadns`.
@@ -306,6 +320,8 @@ pub struct ClientConfig {
     /// Carrier obfuscation name (`"quic"` | `"base64"`), or `None` for plain.
     /// Must match the server.
     pub obfs: Option<String>,
+    /// Interval between keepalive datagrams.
+    pub keepalive: Duration,
 }
 
 /// Command-line arguments for `shadowvpn-server`.
@@ -460,6 +476,10 @@ pub struct ClientArgs {
     /// Do NOT persist the DNS cache to disk.
     #[arg(long = "no-cache-persist")]
     pub no_cache_persist: bool,
+
+    /// Keepalive interval in seconds (keep below the path's UDP NAT timeout).
+    #[arg(long = "keepalive-secs")]
+    pub keepalive_secs: Option<u64>,
 }
 
 /// Load the optional file config referenced by a `--config` path.
@@ -763,6 +783,17 @@ impl ClientArgs {
 
         let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
 
+        let keepalive_secs = self
+            .keepalive_secs
+            .or(file.keepalive_secs)
+            .unwrap_or(DEFAULT_KEEPALIVE_SECS);
+        if keepalive_secs == 0 {
+            return Err(ConfigError::Invalid {
+                field: "keepalive_secs",
+                message: "must be at least 1 second".to_string(),
+            });
+        }
+
         Ok(ClientConfig {
             server,
             cipher,
@@ -770,6 +801,7 @@ impl ClientArgs {
             tun,
             policy,
             obfs,
+            keepalive: Duration::from_secs(keepalive_secs),
         })
     }
 }
@@ -805,6 +837,7 @@ mod tests {
                 no_prewarm: false,
                 cache_file: None,
                 no_cache_persist: false,
+                keepalive_secs: None,
             }
         }
     }
@@ -918,6 +951,38 @@ mod tests {
         let mut m = base;
         m.mode = Some("bogus".to_string());
         assert!(matches!(m.resolve(), Err(ConfigError::Policy(_))));
+    }
+
+    #[test]
+    fn keepalive_defaults_overrides_and_validates() {
+        let base = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+        let cfg = base.clone().resolve().expect("resolve default");
+        assert_eq!(cfg.keepalive, Duration::from_secs(DEFAULT_KEEPALIVE_SECS));
+
+        let mut k = base.clone();
+        k.keepalive_secs = Some(10);
+        assert_eq!(
+            k.resolve().unwrap().keepalive,
+            Duration::from_secs(10),
+            "CLI override wins"
+        );
+
+        let mut z = base;
+        z.keepalive_secs = Some(0);
+        assert!(matches!(
+            z.resolve(),
+            Err(ConfigError::Invalid {
+                field: "keepalive_secs",
+                ..
+            })
+        ));
     }
 
     #[test]
