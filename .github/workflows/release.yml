@@ -363,9 +363,16 @@ jobs:
           }
           $overlay | ConvertTo-Json -Depth 5 | Out-File -Encoding utf8 desktop/src-tauri/ci-overlay.json
 
+      # The bundle dir may hold artifacts from an older version restored via
+      # the cargo cache (restore-keys falls back across lockfile changes);
+      # stale versioned bundles alongside fresh ones break the packaging
+      # steps' globs, so start from a clean slate.
       - name: Build desktop app
         working-directory: desktop/src-tauri
-        run: tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config ci-overlay.json
+        shell: bash
+        run: |
+          rm -rf "target/${{ matrix.target }}/release/bundle"
+          tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config ci-overlay.json
 
       # macOS: the bundler placed the client sidecar in Contents/MacOS; drop the
       # policy data files next to it (that's where the client auto-discovers
