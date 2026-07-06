@@ -51,11 +51,16 @@ if [ "$connected" -ne 1 ]; then
 fi
 
 # Stronger assertion: a short burst must all get through with 0% loss.
+# `ping` exits 0 if even a single reply arrives, so the exit code alone would
+# accept up to (PING_COUNT-1) lost packets; parse the loss summary instead.
 echo "[client] tunnel is up; running ping burst to $SERVER_TUN_IP"
-if ping -c "$PING_COUNT" -i 0.3 -W 2 "$SERVER_TUN_IP"; then
-    echo "[client] PASS: end-to-end connectivity through the ShadowVPN tunnel"
+ping_out=$(ping -c "$PING_COUNT" -i 0.3 -W 2 "$SERVER_TUN_IP" || true)
+echo "$ping_out"
+loss=$(echo "$ping_out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '^[0-9]+' || true)
+if [ "${loss:-100}" -eq 0 ]; then
+    echo "[client] PASS: end-to-end connectivity through the ShadowVPN tunnel (0% loss over $PING_COUNT packets)"
     exit 0
 fi
 
-echo "[client] FAIL: ping burst to $SERVER_TUN_IP lost packets" >&2
+echo "[client] FAIL: ${loss:-100}% packet loss over the tunnel (burst of $PING_COUNT to $SERVER_TUN_IP)" >&2
 exit 1
