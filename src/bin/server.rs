@@ -240,11 +240,23 @@ async fn udp_to_tun(
 
             let now = Instant::now();
 
-            // Sub-IP-header payloads (the client keepalive) must not reach TUN, but
-            // still refresh the sender's NAT mapping so a quiet client isn't reaped.
+            // Sub-IP-header payloads (the client keepalive) must not reach TUN,
+            // but still keep the sender's routing state fresh: in Learn mode the
+            // keepalive announces the client's tunnel IP, so learn/refresh its
+            // UDP address before any real traffic flows (and across NAT
+            // rebinds); in NAT mode refresh the lease so a quiet client isn't
+            // reaped. Old clients send a bare `0x00` with no address — for
+            // those, Learn mode has nothing to update.
             if plaintext.len() < 20 {
-                if let Routing::Nat(nat) = &mut *routing.lock().unwrap() {
-                    nat.touch(peer, now);
+                match &mut *routing.lock().unwrap() {
+                    Routing::Learn(clients) => {
+                        if let Some(src) = keepalive_addr(&plaintext) {
+                            if clients.insert(src, peer) != Some(peer) {
+                                info!("client {src} reachable via {peer} (keepalive)");
+                            }
+                        }
+                    }
+                    Routing::Nat(nat) => nat.touch(peer, now),
                 }
                 debug!(
                     "dropping {}-byte sub-IP-header payload from {peer} (keepalive?)",
@@ -385,6 +397,18 @@ async fn tun_to_udp(
     }
 }
 
+/// The tunnel IP announced by a keepalive payload (`0x00` marker + 4-byte
+/// IPv4), or `None` for anything else — including the bare 1-byte `0x00`
+/// keepalive sent by older clients, which carries no address. The payload has
+/// already been AEAD-authenticated, so the announced address is exactly as
+/// trustworthy as the source field of a data packet's IP header.
+fn keepalive_addr(payload: &[u8]) -> Option<Ipv4Addr> {
+    match payload {
+        [0, a, b, c, d] => Some(Ipv4Addr::new(*a, *b, *c, *d)),
+        _ => None,
+    }
+}
+
 /// Extract the source IPv4 address from a raw IPv4 packet, or `None` if the
 /// buffer is not a well-formed IPv4 header.
 fn ipv4_src(packet: &[u8]) -> Option<Ipv4Addr> {
@@ -468,6 +492,22 @@ mod tests {
         let p = vec![0x45u8; 10];
         assert_eq!(ipv4_src(&p), None);
         assert_eq!(ipv4_dst(&p), None);
+    }
+
+    #[test]
+    fn keepalive_addr_parses_only_the_addressed_form() {
+        // New-format keepalive: 0x00 marker + tunnel IP.
+        assert_eq!(
+            keepalive_addr(&[0, 10, 7, 0, 2]),
+            Some(Ipv4Addr::new(10, 7, 0, 2))
+        );
+        // Legacy 1-byte keepalive carries no address.
+        assert_eq!(keepalive_addr(&[0]), None);
+        // Wrong marker or wrong length: not a keepalive address.
+        assert_eq!(keepalive_addr(&[1, 10, 7, 0, 2]), None);
+        assert_eq!(keepalive_addr(&[0, 10, 7, 0]), None);
+        assert_eq!(keepalive_addr(&[0, 10, 7, 0, 2, 9]), None);
+        assert_eq!(keepalive_addr(&[]), None);
     }
 
     #[test]
