@@ -162,6 +162,13 @@ fn addr_at(pkt: &[u8], off: usize) -> Option<Ipv4Addr> {
     if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
         return None;
     }
+    // A valid IHL is 5..=15 words (20..=60 bytes) and must fit in the buffer.
+    // Without this check, `rewrite_addr` would compute the transport-checksum
+    // offset from a bogus IHL and stomp on the IP header itself.
+    let ihl = (pkt[0] & 0x0f) as usize * 4;
+    if ihl < 20 || ihl > pkt.len() {
+        return None;
+    }
     Some(Ipv4Addr::new(
         pkt[off],
         pkt[off + 1],
@@ -172,7 +179,8 @@ fn addr_at(pkt: &[u8], off: usize) -> Option<Ipv4Addr> {
 
 /// Overwrite the address at `off` (src or dst) with `new`, fixing the IPv4 header
 /// checksum and the TCP/UDP transport checksum (which include the address)
-/// incrementally. Assumes `pkt` is a validated IPv4 packet of length ≥ 20.
+/// incrementally. Assumes `pkt` passed [`addr_at`] validation (length ≥ 20,
+/// version 4, and a sane in-bounds IHL).
 fn rewrite_addr(pkt: &mut [u8], off: usize, new: Ipv4Addr) {
     let old: [u8; 4] = [pkt[off], pkt[off + 1], pkt[off + 2], pkt[off + 3]];
     let new = new.octets();
@@ -310,6 +318,32 @@ mod tests {
         rewrite_addr(&mut p, DST_OFFSET, Ipv4Addr::new(10, 9, 0, 2));
         assert_eq!(parse_dst(&p), Some(Ipv4Addr::new(10, 9, 0, 2)));
         assert!(ip_checksum_ok(&p) && udp_checksum_ok(&p));
+    }
+
+    #[test]
+    fn rejects_malformed_ihl() {
+        let mut nat = Nat::new(
+            Ipv4Addr::new(10, 9, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            Duration::from_secs(120),
+        );
+        let now = Instant::now();
+        let peer: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+
+        // IHL=0: the transport-checksum offset would land inside the IP header.
+        let mut p = udp_packet(Ipv4Addr::new(10, 9, 0, 2), Ipv4Addr::new(8, 8, 8, 8));
+        p[0] = 0x40;
+        assert!(matches!(nat.ingress(peer, &mut p, now), Ingress::Invalid));
+
+        // IHL=15 (60 bytes) on a shorter packet: header claims more than exists.
+        let mut p = udp_packet(Ipv4Addr::new(10, 9, 0, 2), Ipv4Addr::new(8, 8, 8, 8));
+        p.truncate(32);
+        p[0] = 0x4f;
+        assert!(matches!(nat.ingress(peer, &mut p, now), Ingress::Invalid));
+
+        // Nothing was learned from the malformed packets.
+        let mut down = udp_packet(Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(10, 9, 0, 2));
+        assert_eq!(nat.egress(&mut down, now), None);
     }
 
     #[test]

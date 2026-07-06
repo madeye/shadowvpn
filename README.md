@@ -63,11 +63,16 @@ documented in `src/crypto.rs` and `src/protocol.rs`.
 
 ### Keepalive (ShadowVPN convention, not part of the ss spec)
 
-The client periodically sends a tiny encrypted datagram (a 1-byte `0x00`
-plaintext) so that stateful NAT/firewall mappings stay open and the server
-learns the client's current source address before any real traffic flows. The
-server drops any decrypted payload smaller than a 20-byte IPv4 header, so the
-keepalive never reaches the TUN write path.
+The client periodically sends a tiny encrypted datagram (a 5-byte plaintext: a
+`0x00` marker followed by the client's 4-byte tunnel IP) so that stateful
+NAT/firewall mappings stay open and the server learns the client's current
+source address before any real traffic flows. In the default learning mode the
+announced tunnel IP lets the server map (and re-map, after a NAT rebind) the
+client's UDP address from the keepalive alone; in `--nat` mode the keepalive
+refreshes an existing lease, and the mapping itself is allocated by the first
+real packet. The server drops any decrypted payload smaller than a 20-byte
+IPv4 header, so the keepalive never reaches the TUN write path (older 1-byte
+`0x00` keepalives are still accepted and treated as refresh-only).
 
 ---
 

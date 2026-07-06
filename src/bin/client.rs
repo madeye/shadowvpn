@@ -20,7 +20,8 @@
 //! sends a tiny dummy packet so that (a) a stateful NAT/firewall on the path
 //! keeps the UDP mapping open, and (b) the server learns the client's current
 //! source address even before the client sends any real traffic. We send a
-//! 1-byte plaintext (`0x00`); a real IP packet is always larger than this, and
+//! 5-byte plaintext (`0x00` marker + our 4-byte tunnel IP, see
+//! [`keepalive_payload`]); a real IP packet is always larger than this, and
 //! the server is expected to drop sub-IP-header datagrams, so the keepalive is
 //! harmless if it ever reaches the TUN-write path. (This is a ShadowVPN
 //! convention, not part of the shadowsocks wire spec.)
@@ -57,9 +58,16 @@ const CHANNEL_DEPTH: usize = 1024;
 /// a few seconds would spin the receive loop.
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Plaintext payload of a keepalive datagram: a single zero byte. Smaller than
-/// any real IP packet header, so the server can distinguish/drop it cheaply.
-const KEEPALIVE_PAYLOAD: &[u8] = &[0u8];
+/// Plaintext payload of a keepalive datagram: a `0x00` marker byte followed by
+/// the client's 4-byte tunnel IP. At 5 bytes it is smaller than any real IP
+/// packet header, so the server can distinguish/drop it cheaply; the announced
+/// tunnel IP lets the server learn/refresh this client's UDP source address
+/// from the keepalive alone, before any real traffic flows. (Servers predating
+/// the address suffix simply drop the datagram, same as the old bare `0x00`.)
+fn keepalive_payload(tun_ip: Ipv4Addr) -> [u8; 5] {
+    let [a, b, c, d] = tun_ip.octets();
+    [0u8, a, b, c, d]
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -229,6 +237,7 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         Arc::clone(&master_key),
         obfuscator.clone(),
         cfg.keepalive,
+        cfg.tun.ip,
     ));
 
     // The DNS-proxy task, when policy routing is active. When it is not (or on
@@ -553,14 +562,16 @@ async fn keepalive_loop(
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
     interval: Duration,
+    tun_ip: Ipv4Addr,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
     // Don't fire a burst if we ever fall behind schedule.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let payload = keepalive_payload(tun_ip);
     loop {
         ticker.tick().await;
-        let datagram = match encrypt_packet(cipher, &master_key, KEEPALIVE_PAYLOAD) {
+        let datagram = match encrypt_packet(cipher, &master_key, &payload) {
             Ok(d) => d,
             Err(e) => {
                 warn!("failed to encrypt keepalive, skipping: {e}");
