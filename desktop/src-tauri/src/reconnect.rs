@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use tauri::Manager;
 
-use crate::{helper, runner, AppState};
+use crate::{helper, helper_ipc::Cmd, runner, settings, AppState};
 
 /// How often the watcher re-derives the run status.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -23,6 +23,16 @@ const BACKOFF_START: Duration = Duration::from_secs(2);
 
 /// Retry delays double up to this cap, then stay there.
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// Journal the client writes next to its own binary before touching the
+/// resolver (`shadowvpn::policy::dnsconf::JOURNAL_FILE_NAME` — hard-coded
+/// here because the desktop crate does not depend on the client crate; keep
+/// the two in sync).
+const JOURNAL_FILE_NAME: &str = "dns-restore.json";
+
+/// Minimum spacing between `--restore-dns` attempts, so a restore that keeps
+/// failing doesn't respawn the client binary every poll tick.
+const DNS_RESTORE_RETRY: Duration = Duration::from_secs(60);
 
 /// Spawn the watcher thread for the lifetime of the app.
 pub fn spawn(app: tauri::AppHandle) {
@@ -35,6 +45,7 @@ pub fn spawn(app: tauri::AppHandle) {
 fn watch(app: tauri::AppHandle) {
     let mut backoff = BACKOFF_START;
     let mut next_attempt = Instant::now();
+    let mut next_dns_restore = Instant::now();
 
     loop {
         std::thread::sleep(POLL_INTERVAL);
@@ -61,6 +72,13 @@ fn watch(app: tauri::AppHandle) {
                 next_attempt = Instant::now();
             }
             "disconnected" => {
+                // No client running: if a crashed run left a DNS restore
+                // journal behind, heal the resolver now — promptless, through
+                // the elevated helper. Done before (and independently of) any
+                // reconnect, so DNS comes back even when the user isn't
+                // reconnecting or every reconnect attempt fails.
+                maybe_restore_dns(&app, &mut next_dns_restore);
+
                 let Some(profile) = active.clone() else {
                     continue;
                 };
@@ -97,6 +115,62 @@ fn watch(app: tauri::AppHandle) {
             }
             // "connecting": a run is already being brought up; leave it alone.
             _ => {}
+        }
+    }
+}
+
+/// If a run died without restoring the system resolver, its journal is still
+/// sitting next to the client binary — ask the elevated helper to run
+/// `shadowvpn-client --restore-dns` to heal DNS. No-ops (cheaply) when there
+/// is no journal; attempts are spaced by [`DNS_RESTORE_RETRY`].
+///
+/// Only ever goes through a live helper: with the helper gone, restoring
+/// would raise a credential prompt out of nowhere, and the next `apply` in
+/// the client self-heals from the journal anyway.
+fn maybe_restore_dns(app: &tauri::AppHandle, next_attempt: &mut Instant) {
+    if Instant::now() < *next_attempt {
+        return;
+    }
+    let Ok(settings_info) = settings::get_settings(app.clone()) else {
+        return;
+    };
+    let Some(bin) = settings_info.resolved_client_bin else {
+        return;
+    };
+    let journal_present = std::path::Path::new(&bin)
+        .parent()
+        .map(|dir| dir.join(JOURNAL_FILE_NAME).exists())
+        .unwrap_or(false);
+    if !journal_present {
+        return;
+    }
+    // The helper refuses RestoreDns while it supervises a client; skip the
+    // round-trip when a ping already says so (a client this GUI's status
+    // derivation doesn't know about, e.g. mid-connect from another session).
+    match helper::ping(app) {
+        None => return,
+        Some(resp) if resp.running == Some(true) => return,
+        Some(_) => {}
+    }
+
+    *next_attempt = Instant::now() + DNS_RESTORE_RETRY;
+    match helper::call(app, Cmd::RestoreDns) {
+        Ok(r) if r.ok => {
+            eprintln!("[reconnect] restored system DNS from the journal a crashed run left behind");
+        }
+        Ok(r) => {
+            eprintln!(
+                "[reconnect] DNS restore failed (retrying in {}s): {}",
+                DNS_RESTORE_RETRY.as_secs(),
+                r.error
+                    .unwrap_or_else(|| "unknown helper error".to_string())
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[reconnect] DNS restore failed (retrying in {}s): {e}",
+                DNS_RESTORE_RETRY.as_secs()
+            );
         }
     }
 }

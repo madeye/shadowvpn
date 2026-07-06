@@ -375,6 +375,45 @@ fn respond(line: &str, args: &Args, slot: &ChildSlot) -> (Response, bool) {
                 false,
             ),
         },
+        Cmd::RestoreDns => {
+            if guard.is_some() {
+                return (
+                    Response::err("client is running; it owns the resolver configuration"),
+                    false,
+                );
+            }
+            // Same posture as Connect: only ever the one fixed client binary,
+            // with a fixed argument — requests cannot influence what runs.
+            let mut cmd = Command::new(&args.client_bin);
+            cmd.arg("--restore-dns");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            match cmd.output() {
+                Ok(out) if out.status.success() => (
+                    Response {
+                        ok: true,
+                        ..Default::default()
+                    },
+                    false,
+                ),
+                Ok(out) => (
+                    Response::err(format!(
+                        "restore-dns failed ({}): {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )),
+                    false,
+                ),
+                Err(e) => (
+                    Response::err(format!("failed to run {}: {e}", args.client_bin)),
+                    false,
+                ),
+            }
+        }
         Cmd::Shutdown => {
             if let Some(mut child) = guard.take() {
                 let _ = stop_child(&mut child);

@@ -16,11 +16,37 @@
 //! The OS resolver can only point at an address, not a port, so this is only
 //! applied when the proxy listens on port 53; otherwise it is skipped with a
 //! warning and the operator must configure DNS themselves.
+//!
+//! # Crash recovery (the restore journal)
+//!
+//! The pre-`apply` configuration is persisted to a journal file
+//! ([`JOURNAL_FILE_NAME`], next to the running binary — same convention as the
+//! DNS cache) *before* the resolver is touched, and removed again after a
+//! successful restore. If the process dies without restoring (SIGKILL, a
+//! panic-abort, power loss), the journal survives and the original
+//! configuration is recovered by whichever of these happens first:
+//!
+//! * the next [`apply`] (e.g. the desktop app auto-reconnecting) restores the
+//!   journal *before* reading the "previous" configuration — without this, the
+//!   dead run's proxy address would be recorded as the value to restore,
+//!   wedging DNS permanently even across later clean exits;
+//! * [`restore_from_journal`] (the client's `--restore-dns` flag), which the
+//!   desktop app runs through its elevated helper when it sees a leftover
+//!   journal with no client running.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{info, warn};
+
+/// Journal file recording the resolver configuration to restore; lives next to
+/// the running binary (like the DNS cache) so it survives reboots and is found
+/// again by any later invocation of the same binary.
+///
+/// The desktop app hard-codes the same name to detect a leftover journal
+/// (`reconnect::maybe_restore_dns`); keep the two in sync.
+pub const JOURNAL_FILE_NAME: &str = "dns-restore.json";
 
 /// Restores the previous system DNS configuration when dropped.
 pub struct DnsGuard {
@@ -29,8 +55,16 @@ pub struct DnsGuard {
 
 impl Drop for DnsGuard {
     fn drop(&mut self) {
-        imp::restore(&self.restore);
-        info!("system resolver restored");
+        if imp::restore(&self.restore) {
+            remove_journal();
+            info!("system resolver restored");
+        } else {
+            warn!(
+                "failed to restore the system resolver; keeping {} so a later \
+                 `shadowvpn-client --restore-dns` can retry",
+                journal_path().display()
+            );
+        }
     }
 }
 
@@ -52,9 +86,96 @@ pub fn apply(proxy: IpAddr, port: u16, direct_src: IpAddr) -> Result<Option<DnsG
         );
         return Ok(None);
     }
-    let restore = imp::apply(proxy, direct_src)?;
+
+    // Self-heal: a journal here means a previous run died without restoring,
+    // so the resolver may still point at that run's (now dead) proxy. Put the
+    // original configuration back BEFORE snapshotting the current one below —
+    // otherwise our own proxy address would be recorded as the thing to
+    // "restore" on exit.
+    if let Some(stale) = read_journal() {
+        warn!(
+            "found a DNS restore journal from a run that did not exit cleanly; restoring the \
+             original resolver configuration before applying"
+        );
+        if !imp::restore(&stale) {
+            warn!("could not restore from the stale journal; continuing");
+        }
+        remove_journal();
+    }
+
+    let restore = imp::snapshot(proxy, direct_src)?;
+    // Persist the restore state before touching the resolver, so a crash at
+    // any later point can always be recovered from disk.
+    if let Err(e) = write_journal(&restore) {
+        warn!(
+            "could not write the DNS restore journal ({e}); if this run dies without cleaning \
+             up, the resolver will stay pointed at {proxy} until the next connect"
+        );
+    }
+    imp::engage(&restore, proxy)?;
     info!("system resolver pointed at {proxy} (restored automatically on exit)");
     Ok(Some(DnsGuard { restore }))
+}
+
+/// Restore the system resolver from a journal left behind by a run that died
+/// without cleaning up (the client's `--restore-dns` mode).
+///
+/// Returns `true` if a journal was found and applied, `false` if there was
+/// nothing to do.
+pub fn restore_from_journal() -> Result<bool> {
+    let Some(restore) = read_journal() else {
+        return Ok(false);
+    };
+    if !imp::restore(&restore) {
+        anyhow::bail!(
+            "failed to restore the resolver configuration recorded in {}",
+            journal_path().display()
+        );
+    }
+    remove_journal();
+    info!("system resolver restored from journal");
+    Ok(true)
+}
+
+fn journal_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(JOURNAL_FILE_NAME)
+}
+
+fn read_journal() -> Option<imp::Restore> {
+    let path = journal_path();
+    let data = std::fs::read(&path).ok()?;
+    match serde_json::from_slice(&data) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            // Unparseable (a future format, manual edits): there is nothing to
+            // recover from it, and leaving it would re-warn on every start.
+            warn!(
+                "ignoring unreadable DNS restore journal {}: {e}",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
+/// Write the journal atomically (tmp file + rename) so a crash mid-write can
+/// never leave a truncated file behind.
+fn write_journal(restore: &imp::Restore) -> Result<()> {
+    let path = journal_path();
+    let tmp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(restore).context("serializing the restore state")?;
+    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_journal() {
+    let _ = std::fs::remove_file(journal_path());
 }
 
 // ---------------------------------------------------------------------------
@@ -64,33 +185,61 @@ pub fn apply(proxy: IpAddr, port: u16, direct_src: IpAddr) -> Result<Option<DnsG
 mod imp {
     use super::*;
     use anyhow::{bail, Context};
+    use serde::{Deserialize, Serialize};
     use std::process::Command;
 
     /// What to put back: the service and its previous DNS servers (empty = none).
+    #[derive(Serialize, Deserialize)]
     pub struct Restore {
         service: String,
         prev: Vec<String>,
     }
 
-    pub fn apply(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
+    pub fn snapshot(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
         let _ = direct_src; // macOS finds the primary service via the route table
         let service = primary_service()
             .context("could not determine the primary network service to configure DNS on")?;
-        let prev = get_dns(&service);
-        set_dns(&service, &[proxy.to_string()])?;
-        flush();
+        let prev = sanitize_prev(get_dns(&service), proxy);
         Ok(Restore { service, prev })
     }
 
-    pub fn restore(r: &Restore) {
+    pub fn engage(r: &Restore, proxy: IpAddr) -> Result<()> {
+        set_dns(&r.service, &[proxy.to_string()])?;
+        flush();
+        Ok(())
+    }
+
+    pub fn restore(r: &Restore) -> bool {
         // `empty` clears all DNS servers for the service.
         let servers: Vec<String> = if r.prev.is_empty() {
             vec!["empty".to_string()]
         } else {
             r.prev.clone()
         };
-        let _ = set_dns(&r.service, &servers);
+        let ok = match set_dns(&r.service, &servers) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("restoring DNS on service '{}': {e}", r.service);
+                false
+            }
+        };
         flush();
+        ok
+    }
+
+    /// Belt-and-braces for a poisoned snapshot with no journal to explain it
+    /// (e.g. a pre-journal build crashed here): the proxy's own address can
+    /// never be the configuration to restore, so fall back to "no servers set"
+    /// (DHCP-provided DNS).
+    fn sanitize_prev(prev: Vec<String>, proxy: IpAddr) -> Vec<String> {
+        if prev == [proxy.to_string()] {
+            warn!(
+                "current DNS ({proxy}) is this proxy itself (left by an earlier run?); will \
+                 restore to automatic DNS instead"
+            );
+            return Vec::new();
+        }
+        prev
     }
 
     fn set_dns(service: &str, servers: &[String]) -> Result<()> {
@@ -178,6 +327,35 @@ mod imp {
             .args(["-HUP", "mDNSResponder"])
             .status();
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sanitize_drops_own_proxy_address() {
+            let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+            assert!(sanitize_prev(vec!["127.0.0.1".to_string()], proxy).is_empty());
+            // A real upstream list is kept, even one containing the proxy
+            // among others (someone's deliberate config).
+            let mixed = vec!["127.0.0.1".to_string(), "1.1.1.1".to_string()];
+            assert_eq!(sanitize_prev(mixed.clone(), proxy), mixed);
+            let real = vec!["192.168.0.1".to_string()];
+            assert_eq!(sanitize_prev(real.clone(), proxy), real);
+        }
+
+        #[test]
+        fn restore_journal_round_trips() {
+            let r = Restore {
+                service: "Wi-Fi".to_string(),
+                prev: vec!["192.168.0.1".to_string(), "8.8.8.8".to_string()],
+            };
+            let json = serde_json::to_string(&r).unwrap();
+            let back: Restore = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.service, r.service);
+            assert_eq!(back.prev, r.prev);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,13 +365,18 @@ mod imp {
 mod imp {
     use super::*;
     use anyhow::Context;
+    use serde::{Deserialize, Serialize};
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
     const PATH: &str = "/etc/resolv.conf";
 
+    /// First line of the resolv.conf we write; identifies our own leftovers.
+    const MARKER: &str = "# shadowvpn split-DNS";
+
     /// What `/etc/resolv.conf` was before we changed it.
+    #[derive(Serialize, Deserialize)]
     pub enum Restore {
         /// It was a symlink to this target.
         Symlink(PathBuf),
@@ -203,35 +386,54 @@ mod imp {
         Absent,
     }
 
-    pub fn apply(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
+    pub fn snapshot(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
+        let _ = proxy;
         let _ = direct_src; // Linux rewrites the global /etc/resolv.conf
-        let restore = match fs::symlink_metadata(PATH) {
+        Ok(match fs::symlink_metadata(PATH) {
             Ok(m) if m.file_type().is_symlink() => {
                 let target = fs::read_link(PATH).context("reading resolv.conf symlink")?;
-                // Replace the symlink with a regular file so a resolver daemon
-                // (systemd-resolved) doesn't keep overwriting the target.
-                fs::remove_file(PATH).context("removing resolv.conf symlink")?;
                 Restore::Symlink(target)
             }
-            Ok(_) => Restore::File(fs::read(PATH).unwrap_or_default()),
+            Ok(_) => {
+                let content = fs::read(PATH).unwrap_or_default();
+                if content.starts_with(MARKER.as_bytes()) {
+                    // Our own file, left by a pre-journal build's crash: never
+                    // the thing to restore. Removing it on restore lets the
+                    // network manager / resolver daemon regenerate the real one.
+                    warn!(
+                        "current /etc/resolv.conf was written by a previous shadowvpn run; it \
+                         will be removed on restore so the resolver daemon can regenerate it"
+                    );
+                    Restore::Absent
+                } else {
+                    Restore::File(content)
+                }
+            }
             Err(_) => Restore::Absent,
-        };
-        fs::write(PATH, format!("# shadowvpn split-DNS\nnameserver {proxy}\n"))
-            .context("writing /etc/resolv.conf")?;
-        Ok(restore)
+        })
     }
 
-    pub fn restore(r: &Restore) {
+    pub fn engage(r: &Restore, proxy: IpAddr) -> Result<()> {
+        let _ = r;
+        // Remove first: writing through a symlink would clobber its target
+        // (e.g. systemd-resolved's stub file), and replacing the symlink with
+        // a regular file also stops a resolver daemon from overwriting us.
+        let _ = fs::remove_file(PATH);
+        fs::write(PATH, format!("{MARKER}\nnameserver {proxy}\n"))
+            .context("writing /etc/resolv.conf")?;
+        Ok(())
+    }
+
+    pub fn restore(r: &Restore) -> bool {
         match r {
             Restore::Symlink(target) => {
                 let _ = fs::remove_file(PATH);
-                let _ = symlink(target, PATH);
+                symlink(target, PATH).is_ok()
             }
-            Restore::File(content) => {
-                let _ = fs::write(PATH, content);
-            }
+            Restore::File(content) => fs::write(PATH, content).is_ok(),
             Restore::Absent => {
                 let _ = fs::remove_file(PATH);
+                true
             }
         }
     }
@@ -244,42 +446,65 @@ mod imp {
 mod imp {
     use super::*;
     use anyhow::{bail, Context};
+    use serde::{Deserialize, Serialize};
     use std::io;
     use std::process::Command;
 
     /// What to put back when we exit: either the interface used DHCP-assigned
     /// DNS, or it had this explicit list of static servers.
+    #[derive(Serialize, Deserialize)]
     pub enum Restore {
         Dhcp { alias: String },
         Static { alias: String, servers: Vec<String> },
     }
 
-    pub fn apply(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
+    pub fn snapshot(proxy: IpAddr, direct_src: IpAddr) -> Result<Restore> {
         let alias = primary_alias(direct_src)
             .context("could not determine the primary network interface to configure DNS on")?;
-        let restore = read_current(&alias);
-        set_static(&alias, &[proxy.to_string()])?;
-        flush();
-        Ok(restore)
+        Ok(sanitize(read_current(&alias), proxy))
     }
 
-    pub fn restore(r: &Restore) {
-        match r {
-            Restore::Dhcp { alias } => {
-                let _ = netsh(&[
-                    "interface",
-                    "ipv4",
-                    "set",
-                    "dnsservers",
-                    &name_arg(alias),
-                    "dhcp",
-                ]);
-            }
-            Restore::Static { alias, servers } => {
-                let _ = set_static(alias, servers);
-            }
-        }
+    pub fn engage(r: &Restore, proxy: IpAddr) -> Result<()> {
+        let alias = match r {
+            Restore::Dhcp { alias } | Restore::Static { alias, .. } => alias,
+        };
+        set_static(alias, &[proxy.to_string()])?;
         flush();
+        Ok(())
+    }
+
+    pub fn restore(r: &Restore) -> bool {
+        let ok = match r {
+            Restore::Dhcp { alias } => netsh(&[
+                "interface",
+                "ipv4",
+                "set",
+                "dnsservers",
+                &name_arg(alias),
+                "dhcp",
+            ])
+            .map(|o| o.status.success())
+            .unwrap_or(false),
+            Restore::Static { alias, servers } => set_static(alias, servers).is_ok(),
+        };
+        flush();
+        ok
+    }
+
+    /// Belt-and-braces for a poisoned snapshot with no journal to explain it
+    /// (e.g. a pre-journal build crashed here): the proxy's own address can
+    /// never be the configuration to restore, so fall back to DHCP DNS.
+    fn sanitize(r: Restore, proxy: IpAddr) -> Restore {
+        match r {
+            Restore::Static { alias, servers } if servers == [proxy.to_string()] => {
+                warn!(
+                    "current DNS ({proxy}) is this proxy itself (left by an earlier run?); \
+                     will restore to DHCP DNS instead"
+                );
+                Restore::Dhcp { alias }
+            }
+            other => other,
+        }
     }
 
     /// The alias of the interface to reconfigure DNS on.
@@ -436,12 +661,20 @@ mod imp {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 mod imp {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
+    #[derive(Serialize, Deserialize)]
     pub struct Restore;
 
-    pub fn apply(_proxy: IpAddr, _direct_src: IpAddr) -> Result<Restore> {
+    pub fn snapshot(_proxy: IpAddr, _direct_src: IpAddr) -> Result<Restore> {
         anyhow::bail!("automatic DNS configuration is not supported on this platform")
     }
 
-    pub fn restore(_r: &Restore) {}
+    pub fn engage(_r: &Restore, _proxy: IpAddr) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn restore(_r: &Restore) -> bool {
+        true
+    }
 }

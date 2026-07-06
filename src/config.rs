@@ -465,6 +465,12 @@ pub struct ClientArgs {
     #[arg(long = "no-set-dns")]
     pub no_set_dns: bool,
 
+    /// Restore the system resolver from the journal left by a run that did
+    /// not exit cleanly, then exit (no tunnel is brought up). Used by the
+    /// desktop app to heal DNS after a crashed client.
+    #[arg(long = "restore-dns")]
+    pub restore_dns: bool,
+
     /// Do NOT pre-resolve common domains into the cache on startup.
     #[arg(long = "no-prewarm")]
     pub no_prewarm: bool,
@@ -834,6 +840,7 @@ mod tests {
                 geoip_country: None,
                 set_dns: false,
                 no_set_dns: false,
+                restore_dns: false,
                 no_prewarm: false,
                 cache_file: None,
                 no_cache_persist: false,
