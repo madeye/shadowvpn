@@ -33,6 +33,11 @@ pub struct TunRouter {
     ifindex: u32,
     /// The tun's local address, used as the route's preferred source.
     tun_ip: Ipv4Addr,
+    /// Addresses that must never be routed into the tun — above all the VPN
+    /// server itself: routing the server's address into the tun would feed the
+    /// client's own encrypted datagrams back into the tunnel, an amplification
+    /// loop that floods the UDP socket until sends fail with ENOBUFS.
+    excluded: HashSet<Ipv4Addr>,
     /// Every address we have installed a route for (for cleanup + dedup).
     added: Mutex<HashSet<Ipv4Addr>>,
 }
@@ -44,12 +49,23 @@ impl TunRouter {
         Ok(Self {
             ifindex,
             tun_ip,
+            excluded: HashSet::new(),
             added: Mutex::new(HashSet::new()),
         })
     }
 
+    /// Never install a route for `ip` (e.g. the VPN server's own address).
+    pub fn exclude(mut self, ip: Ipv4Addr) -> Self {
+        self.excluded.insert(ip);
+        self
+    }
+
     /// Install a route for `ip` if we have not already, recording it for cleanup.
     pub fn add_route(&self, ip: Ipv4Addr) -> io::Result<()> {
+        if self.excluded.contains(&ip) {
+            debug!("not routing excluded address {ip} into the tun");
+            return Ok(());
+        }
         {
             let mut set = self.added.lock().unwrap();
             if !set.insert(ip) {
@@ -100,6 +116,37 @@ impl RouteGuard {
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         self.router.delete_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A router that skips interface resolution; only valid for exercising the
+    /// pre-syscall bookkeeping (exclusion, dedup) — `add_route` on a
+    /// non-excluded address would hit the real routing stack.
+    fn test_router() -> TunRouter {
+        TunRouter {
+            ifindex: 0,
+            tun_ip: Ipv4Addr::new(10, 9, 0, 2),
+            excluded: HashSet::new(),
+            added: Mutex::new(HashSet::new()),
+        }
+    }
+
+    #[test]
+    fn excluded_address_is_never_installed() {
+        let server = Ipv4Addr::new(157, 245, 227, 200);
+        let router = test_router().exclude(server);
+        // Every route source (live lookups, prewarm, cache seeding, the clean
+        // upstream pin) funnels through add_route, so this one check is the
+        // whole guarantee: the server's address must be dropped before any
+        // platform syscall, and must not be recorded for cleanup.
+        router
+            .add_route(server)
+            .expect("exclusion is a silent no-op");
+        assert!(router.added.lock().unwrap().is_empty());
     }
 }
 

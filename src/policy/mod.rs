@@ -183,6 +183,7 @@ pub async fn spawn(
     cfg: &PolicyConfig,
     tun_name: &str,
     tun_ip: std::net::Ipv4Addr,
+    server_ip: std::net::IpAddr,
     direct_src: std::net::IpAddr,
 ) -> anyhow::Result<PolicyHandle> {
     use anyhow::Context;
@@ -248,11 +249,16 @@ pub async fn spawn(
         chnroute::ChnRoute::default()
     };
 
-    // Build the router that programs per-destination routes into the tun.
-    let router = Arc::new(
-        route::TunRouter::new(tun_name, tun_ip)
-            .with_context(|| format!("setting up routing for tun device {tun_name}"))?,
-    );
+    // Build the router that programs per-destination routes into the tun. The
+    // server's own address is pinned as never-tunneled: its name typically
+    // classifies as tunnel-worthy (a foreign IP), but routing it into the tun
+    // would loop the client's own encrypted traffic back through the tunnel.
+    let mut router = route::TunRouter::new(tun_name, tun_ip)
+        .with_context(|| format!("setting up routing for tun device {tun_name}"))?;
+    if let IpAddr::V4(v4) = server_ip {
+        router = router.exclude(v4);
+    }
+    let router = Arc::new(router);
 
     // The clean upstream must itself be reached through the tunnel, so route it
     // there up front (before any query is forwarded to it).
