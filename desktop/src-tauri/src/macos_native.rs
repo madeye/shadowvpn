@@ -43,7 +43,9 @@ fn plist_cstr() -> CString {
 }
 
 fn err_string(buf: &[u8], fallback: &str) -> String {
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+    // No NUL found means the C side filled the whole buffer without
+    // terminating — take it all rather than discarding the message.
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     let msg = String::from_utf8_lossy(&buf[..end]).trim().to_string();
     if msg.is_empty() {
         fallback.to_string()

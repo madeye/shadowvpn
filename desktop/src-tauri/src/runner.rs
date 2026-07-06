@@ -353,7 +353,7 @@ pub fn connect(
         .lock()
         .map_err(|_| "internal state lock poisoned".to_string())?;
 
-    let status = do_connect(&app, &name)?;
+    let status = do_connect(&app, &name, true)?;
     // Record the intent: this profile should stay up. The reconnect watcher
     // uses it to restart a client that dies without a user disconnect.
     if let Ok(mut active) = state.active_profile.lock() {
@@ -364,7 +364,16 @@ pub fn connect(
 
 /// The connect body shared by the `connect` command and the auto-reconnect
 /// watcher. The caller is responsible for holding `AppState.lock`.
-pub fn do_connect(app: &tauri::AppHandle, name: &str) -> Result<StatusInfo, String> {
+///
+/// `allow_prompt` distinguishes the two: a user-initiated connect may raise
+/// the elevation dialog (or Touch ID gate), while the watcher must only ever
+/// reuse an already-authorized helper — a credential prompt out of nowhere is
+/// never acceptable, even if the helper died a moment after being pinged.
+pub fn do_connect(
+    app: &tauri::AppHandle,
+    name: &str,
+    allow_prompt: bool,
+) -> Result<StatusInfo, String> {
     paths::validate_profile_name(name)?;
 
     let current = current_status(app);
@@ -400,8 +409,13 @@ pub fn do_connect(app: &tauri::AppHandle, name: &str) -> Result<StatusInfo, Stri
     check_path_safe("pid file", &pid_path_str)?;
 
     // One credential prompt per session lives here: reuses the live helper
-    // when there is one, spawns (and prompts for) it otherwise.
-    helper::ensure(app, &bin)?;
+    // when there is one, spawns (and prompts for) it otherwise. Auto-reconnect
+    // takes the promptless path, which only ever reuses a live helper.
+    if allow_prompt {
+        helper::ensure(app, &bin)?;
+    } else {
+        helper::ensure_existing(app, &bin)?;
+    }
 
     // Ensure runs/ exists, rotate the previous run's log aside (its tail —
     // the reason that run ended — is the only post-mortem there is; a plain
@@ -501,17 +515,27 @@ pub fn disconnect(
     if !stopped_by_helper {
         kill_elevated(pid)?;
     }
-    if !wait_for_exit(pid, 25) {
-        return Err(format!(
-            "process {pid} still alive 5s after being stopped; it may need to be stopped manually"
-        ));
-    }
+    let exited = wait_for_exit(pid, 25);
 
+    // Reconcile the on-disk state even when the pid refused to die (a process
+    // stuck in uninterruptible sleep survives SIGKILL until the I/O returns).
+    // Leaving the pid/state files in place wedged the UI permanently:
+    // `current_status` kept saying "connected", so `connect` refused to run
+    // and `disconnect` kept failing on the same kill-resistant pid. With the
+    // files gone the app recovers on its own once the user (or the kernel)
+    // finishes the job.
     if let Ok(pid_path) = paths::pid_file(&app) {
         let _ = std::fs::remove_file(&pid_path);
     }
     if let Ok(state_path) = paths::state_file(&app) {
         let _ = std::fs::remove_file(&state_path);
+    }
+    if !exited {
+        return Err(format!(
+            "client process {pid} is still alive 5s after being stopped (likely stuck in \
+             uninterruptible I/O); its run state was cleared so the app can recover, but the \
+             process itself must be stopped manually (e.g. kill -9 {pid})"
+        ));
     }
 
     Ok(current_status(&app))
