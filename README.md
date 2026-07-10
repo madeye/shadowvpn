@@ -279,6 +279,32 @@ negligible next to the AEAD.
 
 ---
 
+## Install (one-liner)
+
+On Linux and macOS, install the latest release binary — server or client —
+with a single command (see
+[`scripts/install.sh`](scripts/install.sh); it detects OS/CPU, installs to
+`/usr/local/bin`, and drops an example config at `/etc/shadowvpn/`):
+
+```sh
+# server
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server
+
+# client (also installs the bundled gfwlist.txt for policy routing)
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- client
+
+# uninstall (add --purge to also remove /etc/shadowvpn configs)
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- uninstall server   # or: client | all
+```
+
+`--service` (after the role) also installs the systemd unit / launchd plist
+(not enabled); `SHADOWVPN_VERSION=vX.Y.Z` pins a release; `PREFIX=~/.local`
+installs without sudo. Windows: use the self-contained release `.zip` instead
+(client + `wintun.dll` + policy data). Full details in the
+[installation guide](https://madeye.github.io/shadowvpn/guide/installation).
+
+---
+
 ## Building
 
 Requires a recent stable Rust toolchain (edition 2021).
@@ -721,6 +747,7 @@ dist/
   systemd/        Linux service units (server + client)
   launchd/        macOS client daemon
 scripts/
+  install.sh             one-line curl installer/uninstaller (Linux + macOS)
   shadowvpn-client.ps1   self-elevating Windows client launcher
   shadowvpn-client.cmd   execution-policy-bypass wrapper for the launcher
 ```

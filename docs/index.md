@@ -77,3 +77,24 @@ features:
     link: /reference/benchmarks
     linkText: Benchmarks
 ---
+
+## Install in one line
+
+Linux & macOS — detects your OS/CPU and installs the
+[latest release](https://github.com/madeye/shadowvpn/releases):
+
+::: code-group
+
+```sh [server]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server
+```
+
+```sh [client]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- client
+```
+
+:::
+
+Uninstall with `… | sudo bash -s -- uninstall server` (or `client`). All
+options — pinned versions, `--service`, `--purge`, Windows packages — are in
+the [installation guide](/guide/installation#one-line-install).

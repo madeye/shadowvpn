@@ -65,6 +65,7 @@ dist/
 desktop/          Tauri v2 desktop GUI (experimental)
 docker/           end-to-end tests + benchmark harness
 scripts/
+  install.sh             one-line curl installer/uninstaller (Linux + macOS)
   shadowvpn-client.ps1   self-elevating Windows client launcher
   shadowvpn-client.cmd   execution-policy-bypass wrapper for the launcher
   gen-gfwlist.sh         regenerate assets/gfwlist.txt from upstream

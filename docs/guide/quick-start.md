@@ -3,9 +3,25 @@
 Get a working tunnel between two hosts in a few minutes. You need a server
 host with a public (or otherwise reachable) UDP port, and a client host.
 
-## 1. Build the binaries
+## 1. Install the binaries
 
-Requires a recent stable Rust toolchain (edition 2021):
+The fastest path (Linux & macOS) — a one-liner per host that installs the
+latest release to `/usr/local/bin` and drops an example config at
+`/etc/shadowvpn/`:
+
+::: code-group
+
+```sh [server host]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server
+```
+
+```sh [client host]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- client
+```
+
+:::
+
+Or build from source with a recent stable Rust toolchain (edition 2021):
 
 ```sh
 cargo build --release
@@ -13,7 +29,9 @@ cargo build --release
 
 This produces `target/release/shadowvpn-server` and
 `target/release/shadowvpn-client`. See [Installation](./installation) for
-release packages, Windows, and cross-compiling.
+the installer's options, release packages, Windows, and cross-compiling.
+The examples below use the source-build paths — with the one-line install,
+the binaries are just `shadowvpn-server` / `shadowvpn-client` on your `PATH`.
 
 ## 2. Start the server
 
