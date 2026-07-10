@@ -290,6 +290,10 @@ with a single command (see
 # server
 curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server
 
+# server, full setup (Linux): generate config (random password, NAT on), install
+# + enable the systemd service, open the firewall port, print the client config
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup
+
 # client (also installs the bundled gfwlist.txt for policy routing)
 curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- client
 
@@ -298,9 +302,10 @@ curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/insta
 ```
 
 `--service` (after the role) also installs the systemd unit / launchd plist
-(not enabled); `SHADOWVPN_VERSION=vX.Y.Z` pins a release; `PREFIX=~/.local`
-installs without sudo. Windows: use the self-contained release `.zip` instead
-(client + `wintun.dll` + policy data). Full details in the
+(not enabled); `--setup` takes `--port N` / `--obfs quic`;
+`SHADOWVPN_VERSION=vX.Y.Z` pins a release; `PREFIX=~/.local` installs without
+sudo. Windows: use the self-contained release `.zip` instead (client +
+`wintun.dll` + policy data). Full details in the
 [installation guide](https://madeye.github.io/shadowvpn/guide/installation).
 
 ---

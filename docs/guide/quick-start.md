@@ -21,6 +21,13 @@ curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/insta
 
 :::
 
+::: tip One-shot server setup
+On a Linux server, `sudo bash -s -- server --setup` does the whole server
+side in one command — config with a random password, systemd service enabled
++ started, forwarding + NAT, host firewall — and prints the matching client
+config. See [Server: one-line full setup](./installation#server-setup).
+:::
+
 Or build from source with a recent stable Rust toolchain (edition 2021):
 
 ```sh

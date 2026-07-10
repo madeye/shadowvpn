@@ -21,6 +21,38 @@ curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/insta
 
 :::
 
+### Server: one-line full setup {#server-setup}
+
+On a Linux server, add `--setup` to go from zero to a **running service** in
+one command. Beyond installing the binary, it:
+
+- writes `/etc/shadowvpn/server.json` with a **random password** and
+  [`"nat": true`](./multi-client) (an existing config is never overwritten),
+- installs the systemd unit with the **detected WAN interface** and tunnel
+  subnet, then enables + starts it,
+- opens the UDP port in **ufw/firewalld** (if active),
+- prints the **matching client config**, ready to paste on your devices.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup
+```
+
+Pick a port or an
+[obfuscation mode](./configuration#carrier-obfuscation) (both ends must
+match; the printed client config includes them):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup --port 443 --obfs quic
+```
+
+::: warning Cloud firewalls
+`--setup` opens the host firewall only. On DigitalOcean/AWS/GCP etc., also
+allow the UDP port in the cloud firewall / security group — a blocked port
+looks exactly like a wrong password from the client side.
+:::
+
+### Uninstall
+
 Uninstall the same way (configs are kept unless you add `--purge`):
 
 ::: code-group
@@ -40,6 +72,9 @@ Options and overrides:
 - `--service` (after the role) also installs the systemd unit / launchd plist
   from the release package — installed but **not** enabled; see
   [Running as a service](./service).
+- `server --setup` (Linux) does the whole server setup in one shot — see
+  [above](#server-setup); `--port N` and `--obfs none|quic|base64` tune the
+  generated config.
 - `uninstall all` removes both binaries; `--purge` also removes
   `/etc/shadowvpn` configs.
 - `SHADOWVPN_VERSION=v0.4.0` pins a release tag (default: latest);
