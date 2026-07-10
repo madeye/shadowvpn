@@ -15,6 +15,13 @@ match your setup.
 
 Both binaries need root (TUN creation, and on the client routing/DNS changes).
 
+::: tip One-line install
+The [one-line installer](./installation#one-line-install) with `--service`
+installs the matching service definition for you (not enabled), e.g.
+`curl -fsSL … | sudo bash -s -- server --service` — then just
+`sudo systemctl enable --now shadowvpn-server`.
+:::
+
 ## Linux (systemd)
 
 ```sh

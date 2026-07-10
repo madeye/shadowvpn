@@ -1,4 +1,20 @@
-# Windows launcher scripts
+# Scripts
+
+## One-line installer (Linux + macOS)
+
+[`install.sh`](install.sh) installs or uninstalls the **server** or **client**
+from the latest GitHub release with a single command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server     # or: client
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- uninstall server
+```
+
+Run with `--help` (or see the
+[installation guide](https://madeye.github.io/shadowvpn/guide/installation))
+for `--service`, `--purge`, `SHADOWVPN_VERSION`, and `PREFIX`.
+
+## Windows launcher scripts
 
 Convenience launchers for the ShadowVPN **client** on Windows. The client needs
 Administrator (to create the Wintun adapter and change routes / DNS), so the

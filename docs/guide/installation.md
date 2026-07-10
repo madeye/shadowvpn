@@ -1,5 +1,60 @@
 # Installation
 
+## One-line install (Linux & macOS) {#one-line-install}
+
+The quickest way to install: a single `curl | bash` that detects your OS and
+CPU, downloads the matching binary from the
+[latest release](https://github.com/madeye/shadowvpn/releases), installs it to
+`/usr/local/bin`, and drops an example config at `/etc/shadowvpn/` (the client
+also gets the bundled `gfwlist.txt` for
+[policy routing](./policy-routing)):
+
+::: code-group
+
+```sh [server]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server
+```
+
+```sh [client]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- client
+```
+
+:::
+
+Uninstall the same way (configs are kept unless you add `--purge`):
+
+::: code-group
+
+```sh [server]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- uninstall server
+```
+
+```sh [client]
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- uninstall client
+```
+
+:::
+
+Options and overrides:
+
+- `--service` (after the role) also installs the systemd unit / launchd plist
+  from the release package — installed but **not** enabled; see
+  [Running as a service](./service).
+- `uninstall all` removes both binaries; `--purge` also removes
+  `/etc/shadowvpn` configs.
+- `SHADOWVPN_VERSION=v0.4.0` pins a release tag (default: latest);
+  `PREFIX=~/.local` installs to a user-writable prefix without sudo
+  (configs/services are then skipped).
+
+::: tip Prefer to read before you pipe?
+The script is
+[`scripts/install.sh`](https://github.com/madeye/shadowvpn/blob/main/scripts/install.sh)
+— short, commented, and reviewable.
+:::
+
+Windows has no `curl | bash` flow — use the self-contained release `.zip`
+(client + `wintun.dll` + policy data), described [below](#windows).
+
 ## Release packages
 
 Tagged releases on the
