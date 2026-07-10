@@ -1,0 +1,115 @@
+# Installation
+
+## Release packages
+
+Tagged releases on the
+[GitHub releases page](https://github.com/madeye/shadowvpn/releases) ship
+prebuilt packages per target:
+
+| Target | Package | Contents |
+|--------|---------|----------|
+| `x86_64-unknown-linux-gnu` | `.tar.gz` | server + client binaries, bundled `gfwlist.txt` |
+| `aarch64-unknown-linux-gnu` | `.tar.gz` | server + client binaries, bundled `gfwlist.txt` |
+| `x86_64-apple-darwin` | `.tar.gz` | server + client binaries, bundled `gfwlist.txt` |
+| `aarch64-apple-darwin` | `.tar.gz` | server + client binaries, bundled `gfwlist.txt` |
+| `x86_64-pc-windows-msvc` | `.zip` | client + matching-arch `wintun.dll` + policy data (self-contained) |
+| `aarch64-pc-windows-msvc` | `.zip` | client + matching-arch `wintun.dll` + policy data (self-contained) |
+
+The release also builds installable **desktop app** packages — a `.dmg` on
+macOS (arm64 + x86_64), `.deb`/`.AppImage` on Linux (x86_64), and an NSIS
+`-setup.exe` on Windows (x64 + ARM64) — see the [desktop app guide](./desktop).
+
+::: tip Bundled policy data
+The Unix tarballs and the Windows zip bundle `gfwlist.txt` next to the client
+(the Windows zip also downloads a `GeoLite2-Country.mmdb` at package time), so
+[policy routing](./policy-routing) modes work out of the box — no separate
+downloads.
+:::
+
+## Building from source
+
+Requires a recent stable Rust toolchain (edition 2021):
+
+```sh
+cargo build --release
+```
+
+This produces two binaries:
+
+- `target/release/shadowvpn-server`
+- `target/release/shadowvpn-client`
+
+Run the test suite (crypto + config unit tests):
+
+```sh
+cargo test --lib
+```
+
+### The `shadowvpn-uri` helper (optional)
+
+Config export/import as `shadowvpn://` URIs and QR codes lives in a separate
+binary behind the `uri` feature (off by default) so the server/client builds
+stay lean:
+
+```sh
+cargo build --release --features uri --bin shadowvpn-uri
+```
+
+See [Config URIs & QR codes](./uri-qr).
+
+## Windows
+
+ShadowVPN builds on Windows (`x86_64-pc-windows-msvc` /
+`aarch64-pc-windows-msvc`) with the MSVC toolchain; CI builds and tests the
+Windows target on every push.
+
+The client's TUN layer uses [Wintun](https://www.wintun.net/), whose
+`wintun.dll` is loaded at runtime and **must sit next to
+`shadowvpn-client.exe`** — download the build matching the CPU architecture
+and drop it alongside the binary (the release zip already includes the right
+one).
+
+A recommended folder layout, with the self-elevating launcher from
+[`scripts/`](https://github.com/madeye/shadowvpn/tree/main/scripts):
+
+```
+shadowvpn\
+  shadowvpn-client.exe
+  wintun.dll              <- required, matching CPU arch
+  client.json             <- your config
+  shadowvpn-client.ps1    <- self-elevating launcher
+  shadowvpn-client.cmd    <- wrapper that bypasses the execution policy
+```
+
+::: warning ARM64 needs the ARM64 DLL
+An `x86_64` `wintun.dll` next to an ARM64 `shadowvpn-client.exe` (or vice
+versa) fails to load — typically Windows **error 193** (`%1 is not a valid
+Win32 application`). Match the DLL to the binary's architecture, not the OS
+marketing name.
+:::
+
+## Cipher performance on ARM
+
+`chacha20-poly1305` (the default) uses runtime SIMD feature detection and is
+fast out of the box on every target. AES-GCM uses AES-NI automatically on
+x86-64, **but on aarch64 (Raspberry Pi, Apple Silicon, Windows-on-ARM) the
+ARMv8 AES backend is gated behind compile-time target features** — a plain
+`cargo build` for ARM runs AES-GCM in slow constant-time software.
+
+- On ARM hardware that lacks (or isn't built for) AES acceleration, prefer
+  `chacha20-poly1305` — it is both faster and simpler there.
+- To use AES-GCM at full speed on ARM, build with the crypto features enabled:
+
+  ```sh
+  RUSTFLAGS="-C target-feature=+aes,+neon" cargo build --release
+  # or, when building on the target device itself:
+  RUSTFLAGS="-C target-cpu=native" cargo build --release
+  ```
+
+See the [ciphers reference](/reference/ciphers) for details.
+
+## Next steps
+
+- [Quick start](./quick-start) — bring the tunnel up.
+- [Configuration](./configuration) — JSON config and CLI flags.
+- [Running as a service](./service) — systemd / launchd units.
