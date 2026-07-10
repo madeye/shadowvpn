@@ -10,9 +10,20 @@ curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/insta
 curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- uninstall server
 ```
 
+On a Linux server, `--setup` goes from zero to a running service in one
+command — it writes a real config (random password, NAT enabled), installs
+the systemd unit with the detected WAN interface, enables + starts the
+service, opens the UDP port in ufw/firewalld, and prints the matching client
+config:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup
+# optional: --port 443 --obfs quic
+```
+
 Run with `--help` (or see the
 [installation guide](https://madeye.github.io/shadowvpn/guide/installation))
-for `--service`, `--purge`, `SHADOWVPN_VERSION`, and `PREFIX`.
+for `--service`, `--setup`, `--purge`, `SHADOWVPN_VERSION`, and `PREFIX`.
 
 ## Windows launcher scripts
 

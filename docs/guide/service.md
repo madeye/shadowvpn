@@ -20,6 +20,10 @@ The [one-line installer](./installation#one-line-install) with `--service`
 installs the matching service definition for you (not enabled), e.g.
 `curl -fsSL … | sudo bash -s -- server --service` — then just
 `sudo systemctl enable --now shadowvpn-server`.
+
+On a Linux **server**, `--setup` goes further: it generates the config,
+patches the unit's WAN interface, and enables + starts the service in one
+command — see [Server: one-line full setup](./installation#server-setup).
 :::
 
 ## Linux (systemd)
