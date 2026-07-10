@@ -14,9 +14,10 @@ The on-wire crypto matches the **shadowsocks.org AEAD UDP scheme** exactly, so
 the construction is spec-correct and interoperable, with one deliberate,
 documented deviation (no SOCKS address header — see below).
 
-> **Landing page:** a visual overview lives at
+> **Documentation:** the full doc site lives at
 > [**madeye.github.io/shadowvpn**](https://madeye.github.io/shadowvpn/)
-> (source in [`docs/`](docs/)).
+> (VitePress source in [`docs/`](docs/)) — guides, configuration reference,
+> wire protocol, and benchmarks.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="ShadowVPN end-to-end data flow" width="100%">
@@ -269,7 +270,7 @@ How it works: the server keys a mapping by the client's UDP 4-tuple, allocates a
 free internal IP from the subnet (network/broadcast/server excluded), and rewrites
 the inner source on ingress (placeholder → internal) and destination on egress
 (internal → placeholder), fixing IPv4/TCP/UDP checksums incrementally. Mappings
-are refreshed by traffic (data or the 25-second keepalive) and reclaimed after
+are refreshed by traffic (data or the client keepalive) and reclaimed after
 `lease_ttl_secs` idle (default 120). Trade-offs: clients **cannot address each
 other** (they share one placeholder — it's hub-and-spoke to the server and beyond),
 and ICMP error payloads that embed the original header aren't rewritten (tunnelled
@@ -393,7 +394,8 @@ limit the data plane's own ceiling shows: the pipelined relay loops carry single
 flow TCP at ~1 Gbit/s (≈3× a strict per-packet `recv → crypt → send` loop). Full
 results across ciphers, carrier framing, a lossy/high-latency link, and that
 ceiling comparison — plus how to read them — are in
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+[`docs/reference/benchmarks.md`](docs/reference/benchmarks.md) (rendered at
+[madeye.github.io/shadowvpn/reference/benchmarks](https://madeye.github.io/shadowvpn/reference/benchmarks)).
 
 Needs `NET_ADMIN` and `/dev/net/tun` (requested by the compose file). It is a
 measurement tool, not a CI gate — the absolute numbers depend on the host.
@@ -712,7 +714,8 @@ src/
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
   bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
 docs/
-  index.html      landing page (GitHub Pages)
+  .vitepress/     doc-site config (VitePress, deployed to GitHub Pages)
+  guide/, reference/   documentation pages
   architecture.svg, wire.svg, policy-routing.svg   diagrams
 dist/
   systemd/        Linux service units (server + client)
