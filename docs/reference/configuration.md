@@ -16,6 +16,7 @@ anything not supplied. Both binaries accept `-c, --config <PATH>`.
 | `tun_netmask` | `--tun-netmask`   | IPv4 netmask for the TUN interface                              | no       | `255.255.255.0`      |
 | `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: client IP; client: server IP) | yes      | —                    |
 | `mtu`         | `--mtu`           | TUN interface MTU                                               | no       | `1400`               |
+| `tun_ip6`     | `--tun-ip6`       | optional IPv6 address + prefix on the TUN, CIDR form (e.g. `fd07:7::2/64`) — used by [mesh routing](/guide/mesh-routing) | no | none |
 | `obfs`        | *(config only)*   | carrier obfuscation: `none` \| `quic` \| `base64` — both ends must match | no | `none`        |
 
 The alias `chacha20-ietf-poly1305` is accepted for `cipher` and treated as
@@ -26,7 +27,12 @@ The alias `chacha20-ietf-poly1305` is accepted for `cipher` and treated as
 | JSON field       | CLI flag           | Meaning                                                             | Default |
 |------------------|--------------------|---------------------------------------------------------------------|---------|
 | `nat`            | `--nat`            | tell clients apart by UDP endpoint and NAT them onto internal IPs, so all clients can share one config ([NAT mode](/guide/multi-client)) | `false` |
-| `lease_ttl_secs` | `--lease-ttl-secs` | NAT mode: reclaim a client's internal-IP lease after this many idle seconds | `120` |
+| `lease_ttl_secs` | `--lease-ttl-secs` | NAT mode: reclaim a client's internal-IP lease after this many idle seconds; also the expiry for advertised [mesh routes](/guide/mesh-routing) whose owner went quiet | `120` |
+| `approve_routes` | `--approve-routes` | allowlist of CIDRs: an advertised route is approved when it equals, or is a subnet of, an entry ([mesh routing](/guide/mesh-routing)) | none |
+| `auto_approve_routes` | `--auto-approve-routes` | approve every advertised route                             | `false` |
+
+Mesh routing (`approve_routes` / `auto_approve_routes` / `tun_ip6`) requires
+the default learning mode and cannot be combined with `nat`.
 
 ## Client-only fields
 
@@ -35,6 +41,8 @@ The alias `chacha20-ietf-poly1305` is accepted for `cipher` and treated as
 | JSON field       | CLI flag            | Meaning                                                          | Default |
 |------------------|---------------------|-------------------------------------------------------------------|---------|
 | `keepalive_secs` | `--keepalive-secs`  | keepalive interval in seconds — keep it below the path's UDP NAT timeout | `15` |
+| `advertise_routes` | `--advertise-routes` | IPv4/IPv6 subnets behind this client to advertise to the server (comma-separated CIDRs on the CLI, array in JSON) | none |
+| `accept_routes`  | `--accept-routes`   | install subnet routes pushed by the server onto the TUN; removed on withdrawal and exit | `false` |
 
 ### Policy routing
 

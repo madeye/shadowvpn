@@ -45,6 +45,7 @@ use tokio::sync::mpsc;
 
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
+use shadowvpn::mesh::{self, RouteAdvert, RouteInstaller};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
 use shadowvpn::tun_device::TunDevice;
@@ -210,6 +211,47 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         None
     };
 
+    // --- Mesh subnet routing (Tailscale-like) ------------------------------
+    // Advertised routes ride the keepalive tick; accepted routes are pushed
+    // back by the server and installed onto the tun by the RouteInstaller.
+    let mesh_active = cfg.accept_routes || !cfg.advertise_routes.is_empty();
+    if !cfg.advertise_routes.is_empty() {
+        info!(
+            "advertising subnet routes to the server: {}",
+            cfg.advertise_routes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let route_installer = if cfg.accept_routes {
+        info!("accepting subnet routes pushed by the server");
+        Some(Arc::new(
+            RouteInstaller::new(&iface_name, cfg.tun.ip, server_addr.ip())
+                .context("setting up the mesh route installer")?,
+        ))
+    } else {
+        None
+    };
+    // Cleanup guard: removes installed routes when `run` returns, even though
+    // the net->tun task keeps its own reference to the installer.
+    let _route_guard = route_installer.clone().map(mesh::InstallerGuard::new);
+
+    // The periodic datagram: a plain keepalive, or a route advert (which the
+    // server also treats as a keepalive) once mesh routing is in play.
+    let periodic_payload: Vec<u8> = if mesh_active {
+        RouteAdvert {
+            tunnel_ip: cfg.tun.ip,
+            tunnel_ip6: cfg.tun.ip6.map(|net| net.ip()),
+            accept_routes: cfg.accept_routes,
+            routes: cfg.advertise_routes.clone(),
+        }
+        .encode()
+    } else {
+        keepalive_payload(cfg.tun.ip).to_vec()
+    };
+
     // --- Relay + keepalive tasks -------------------------------------------
     // Loop A: TUN -> net (read IP packet, encrypt, send UDP).
     let up = tokio::spawn(tun_to_net(
@@ -227,17 +269,18 @@ async fn run(cfg: ClientConfig) -> Result<()> {
         cipher,
         Arc::clone(&master_key),
         obfuscator.clone(),
+        route_installer,
     ));
 
     // Keepalive: periodic tiny encrypted datagram so the server learns/refreshes
-    // our address and NAT mappings stay open.
+    // our address and NAT mappings stay open (and mesh adverts stay fresh).
     let keepalive = tokio::spawn(keepalive_loop(
         Arc::clone(&socket),
         cipher,
         Arc::clone(&master_key),
         obfuscator.clone(),
         cfg.keepalive,
-        cfg.tun.ip,
+        periodic_payload,
     ));
 
     // The DNS-proxy task, when policy routing is active. When it is not (or on
@@ -451,6 +494,7 @@ async fn net_to_tun(
     cipher: Cipher,
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
+    route_installer: Option<Arc<RouteInstaller>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
@@ -523,6 +567,25 @@ async fn net_to_tun(
                 }
             };
 
+            // Control payloads (marker byte 0x00) never reach the TUN. The one
+            // the client acts on is the server's route push; anything else is
+            // dropped, matching the server's treatment of unknown controls.
+            if mesh::is_control(&plaintext) {
+                match mesh::parse_control(&plaintext) {
+                    Some(mesh::Control::RoutePush(push)) => match &route_installer {
+                        Some(installer) => installer.apply(&push.routes),
+                        None => {
+                            debug!("ignoring route push: accept_routes is not enabled")
+                        }
+                    },
+                    other => debug!(
+                        "dropping {}-byte control payload ({other:?})",
+                        plaintext.len()
+                    ),
+                }
+                continue;
+            }
+
             // Drop keepalive-sized payloads: anything too small to be an IP packet
             // (an IPv4 header alone is 20 bytes) must not be written to the TUN.
             if plaintext.len() < 20 {
@@ -550,25 +613,27 @@ async fn net_to_tun(
     }
 }
 
-/// Periodically send a tiny encrypted keepalive datagram to the server.
+/// Periodically send a tiny encrypted keepalive (or mesh route advert) to the
+/// server.
 ///
 /// This refreshes NAT mappings and lets the server learn our source address
-/// before we send real traffic. Encryption failures and transient send errors
-/// are logged and skipped (the next tick retries); any other send failure is
-/// fatal (the socket itself is broken).
+/// before we send real traffic; when mesh routing is active, the payload is a
+/// route advert, which the server treats as a keepalive too (and answers with
+/// a route push for accept-routes clients). Encryption failures and transient
+/// send errors are logged and skipped (the next tick retries); any other send
+/// failure is fatal (the socket itself is broken).
 async fn keepalive_loop(
     socket: Arc<UdpSocket>,
     cipher: Cipher,
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
     interval: Duration,
-    tun_ip: Ipv4Addr,
+    payload: Vec<u8>,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
     // Don't fire a burst if we ever fall behind schedule.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let payload = keepalive_payload(tun_ip);
     loop {
         ticker.tick().await;
         let datagram = match encrypt_packet(cipher, &master_key, &payload) {

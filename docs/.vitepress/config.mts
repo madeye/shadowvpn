@@ -44,6 +44,7 @@ export default defineConfig({
             { text: 'Running server & client', link: '/guide/running' },
             { text: 'Routing & IP forwarding', link: '/guide/routing' },
             { text: 'Policy routing (split tunnel)', link: '/guide/policy-routing' },
+            { text: 'Mesh subnet routing', link: '/guide/mesh-routing' },
             { text: 'Multiple clients (NAT mode)', link: '/guide/multi-client' },
             { text: 'Running as a service', link: '/guide/service' },
           ],
