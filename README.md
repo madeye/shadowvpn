@@ -159,7 +159,12 @@ supplied.
 | `tun_netmask` | `--tun-netmask`   | IPv4 netmask for the TUN interface                            | no       | `255.255.255.0`      |
 | `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: client IP; client: server IP)| yes     | —                    |
 | `mtu`         | `--mtu`           | TUN interface MTU                                              | no       | `1400`               |
+| `tun_ip6`     | `--tun-ip6`       | optional IPv6 address + prefix on the TUN (e.g. `fd07:7::2/64`) | no      | none                 |
 | `obfs`        | *(config only)*   | carrier obfuscation: `none` \| `quic` \| `base64` (both ends must match) | no | `none`               |
+| `advertise_routes` | `--advertise-routes` | client: subnets behind this client to advertise (comma-sep CIDRs) | no | none            |
+| `accept_routes` | `--accept-routes` | client: install subnet routes pushed by the server            | no       | `false`              |
+| `approve_routes` | `--approve-routes` | server: allowlist of CIDRs approving advertised routes       | no       | none                 |
+| `auto_approve_routes` | `--auto-approve-routes` | server: approve every advertised route              | no       | `false`              |
 
 On the **server** the `server` field is the UDP bind/listen address; on the
 **client** it is the remote server address to connect to. Both binaries accept
@@ -276,6 +281,33 @@ other** (they share one placeholder — it's hub-and-spoke to the server and bey
 and ICMP error payloads that embed the original header aren't rewritten (tunnelled
 PMTU discovery may suffer). The per-packet cost is a couple of checksum deltas,
 negligible next to the AEAD.
+
+### Mesh subnet routing (Tailscale-like)
+
+In the default learning mode, ShadowVPN can share subnet routes between
+clients the way a Tailscale subnet router does — no external control plane:
+
+* **Advertise** — a client announces the IPv4/IPv6 subnets behind it with
+  `--advertise-routes 192.168.200.0/24,fd42:cafe::/64`. Adverts ride the
+  keepalive tick, inside the same AEAD envelope.
+* **Approve** — the server gates advertised routes on an operator policy
+  (`--approve-routes <cidr,…>` allowlist or `--auto-approve-routes`), the
+  stand-in for Tailscale's admin-console route approval. Unapproved routes
+  are held, logged as *awaiting approval*, and never routed or pushed.
+* **Accept** — a client running with `--accept-routes` receives the approved
+  set (split horizon: never its own routes) and installs/removes kernel
+  routes on its TUN automatically — rtnetlink on Linux, `PF_ROUTE` on macOS,
+  IP Helper on Windows — with cleanup on exit.
+
+The server **hub-relays** spoke↔spoke traffic UDP→UDP by longest-prefix match,
+so client↔client and client↔subnet packets never touch the server's TUN and
+need no IP forwarding on the server. Give every node an IPv6 ULA with
+`--tun-ip6` (e.g. `fd07:7::1/64`) to route globally-unique IPv6 prefixes
+between sites whose private IPv4 ranges overlap. Control messages start with a
+`0x00` byte (an impossible IP version nibble), so old and new peers
+interoperate — unknown control payloads are simply dropped. See the
+[mesh routing guide](https://madeye.github.io/shadowvpn/guide/mesh-routing)
+for the full walkthrough and validation ladder.
 
 ---
 

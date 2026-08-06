@@ -27,9 +27,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
+use ipnetwork::{IpNetwork, Ipv6Network};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::Cipher;
+use crate::mesh::{RouteApproval, MAX_ROUTES};
 use crate::policy::{Mode, PolicyConfig};
 use crate::protocol::DEFAULT_TUN_MTU;
 
@@ -173,6 +175,12 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_ip: Option<Ipv4Addr>,
 
+    /// Optional IPv6 address + prefix for the TUN interface (CIDR form, e.g.
+    /// `"fd07:7::2/64"`). Give every node an address in one shared ULA prefix
+    /// so IPv6 subnet routes have an in-tunnel source/return address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tun_ip6: Option<Ipv6Network>,
+
     /// TUN interface MTU.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
@@ -200,6 +208,28 @@ pub struct FileConfig {
     /// it goes idle. Ignored by the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keepalive_secs: Option<u64>,
+
+    // --- Mesh subnet routing (Tailscale-like) -------------------------------
+    /// Client-only: subnets behind this client to advertise to the server
+    /// (IPv4/IPv6 CIDRs). The server relays matching traffic here once the
+    /// route is approved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertise_routes: Option<Vec<IpNetwork>>,
+
+    /// Client-only: accept subnet routes pushed by the server and install them
+    /// onto the TUN interface (removed again on exit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accept_routes: Option<bool>,
+
+    /// Server-only: allowlist of CIDRs whose sub-networks are approved when a
+    /// client advertises them. Advertised routes outside it are held as
+    /// "awaiting approval" and never routed or pushed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approve_routes: Option<Vec<IpNetwork>>,
+
+    /// Server-only: approve every advertised route (no allowlist needed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_approve_routes: Option<bool>,
 
     // --- Client-only policy routing (ignored by the server) ----------------
     /// Policy-routing mode: `full` (default), `gfwlist`, or `chinadns`.
@@ -281,6 +311,8 @@ pub struct TunConfig {
     pub netmask: Ipv4Addr,
     /// Peer / point-to-point destination address inside the tunnel.
     pub peer_ip: Ipv4Addr,
+    /// Optional IPv6 address + prefix on the interface (mesh IPv6 routing).
+    pub ip6: Option<Ipv6Network>,
     /// Interface MTU.
     pub mtu: u16,
 }
@@ -301,7 +333,10 @@ pub struct ServerConfig {
     /// NAT multiple clients onto distinct internal IPs (keyed by UDP endpoint).
     pub nat: bool,
     /// Idle time-to-live for a client's NAT mapping (reclamation threshold).
+    /// Also the expiry for advertised subnet routes whose owner went quiet.
     pub lease_ttl: Duration,
+    /// Approval policy for client-advertised subnet routes.
+    pub route_approval: RouteApproval,
 }
 
 /// Fully resolved, validated client configuration.
@@ -322,6 +357,10 @@ pub struct ClientConfig {
     pub obfs: Option<String>,
     /// Interval between keepalive datagrams.
     pub keepalive: Duration,
+    /// Subnets behind this client to advertise to the server.
+    pub advertise_routes: Vec<IpNetwork>,
+    /// Whether to accept and install subnet routes pushed by the server.
+    pub accept_routes: bool,
 }
 
 /// Command-line arguments for `shadowvpn-server`.
@@ -365,6 +404,10 @@ pub struct ServerArgs {
     #[arg(long = "peer-ip")]
     pub peer_ip: Option<Ipv4Addr>,
 
+    /// IPv6 address + prefix for the TUN interface (e.g. fd07:7::1/64).
+    #[arg(long = "tun-ip6")]
+    pub tun_ip6: Option<Ipv6Network>,
+
     /// TUN interface MTU.
     #[arg(long = "mtu")]
     pub mtu: Option<u16>,
@@ -377,6 +420,14 @@ pub struct ServerArgs {
     /// Idle time-to-live for a client's NAT mapping, in seconds.
     #[arg(long = "lease-ttl-secs")]
     pub lease_ttl_secs: Option<u64>,
+
+    /// Approve advertised routes covered by these CIDRs (comma-separated).
+    #[arg(long = "approve-routes", value_delimiter = ',')]
+    pub approve_routes: Option<Vec<IpNetwork>>,
+
+    /// Approve every route clients advertise (Tailscale "approve all").
+    #[arg(long = "auto-approve-routes")]
+    pub auto_approve_routes: bool,
 }
 
 /// Command-line arguments for `shadowvpn-client`.
@@ -420,9 +471,22 @@ pub struct ClientArgs {
     #[arg(long = "peer-ip")]
     pub peer_ip: Option<Ipv4Addr>,
 
+    /// IPv6 address + prefix for the TUN interface (e.g. fd07:7::2/64).
+    #[arg(long = "tun-ip6")]
+    pub tun_ip6: Option<Ipv6Network>,
+
     /// TUN interface MTU.
     #[arg(long = "mtu")]
     pub mtu: Option<u16>,
+
+    /// Subnets behind this client to advertise to the server (comma-separated
+    /// IPv4/IPv6 CIDRs), e.g. 192.168.200.0/24,fd42:cafe::/64.
+    #[arg(long = "advertise-routes", value_delimiter = ',')]
+    pub advertise_routes: Option<Vec<IpNetwork>>,
+
+    /// Accept subnet routes pushed by the server and install them on the TUN.
+    #[arg(long = "accept-routes")]
+    pub accept_routes: bool,
 
     /// Policy-routing mode: full | gfwlist | chinadns.
     #[arg(long = "mode")]
@@ -707,6 +771,7 @@ fn resolve_tun(
     ip: Option<Ipv4Addr>,
     netmask: Option<Ipv4Addr>,
     peer_ip: Option<Ipv4Addr>,
+    ip6: Option<Ipv6Network>,
     mtu: Option<u16>,
 ) -> Result<TunConfig, ConfigError> {
     Ok(TunConfig {
@@ -714,8 +779,28 @@ fn resolve_tun(
         ip: ip.ok_or(ConfigError::Missing("tun_ip"))?,
         netmask: netmask.unwrap_or(DEFAULT_NETMASK),
         peer_ip: peer_ip.ok_or(ConfigError::Missing("peer_ip"))?,
+        ip6,
         mtu: mtu.unwrap_or(DEFAULT_TUN_MTU),
     })
+}
+
+/// Validate a set of advertised routes: bounded and free of degenerate
+/// (default-route) entries, which must go through the normal full-tunnel
+/// routing setup rather than a subnet advertisement.
+fn validate_advertised(routes: &[IpNetwork]) -> Result<(), ConfigError> {
+    if routes.len() > MAX_ROUTES {
+        return Err(ConfigError::Invalid {
+            field: "advertise_routes",
+            message: format!("at most {MAX_ROUTES} routes may be advertised"),
+        });
+    }
+    if let Some(net) = routes.iter().find(|net| net.prefix() == 0) {
+        return Err(ConfigError::Invalid {
+            field: "advertise_routes",
+            message: format!("`{net}` is a default route; advertise specific subnets instead"),
+        });
+    }
+    Ok(())
 }
 
 impl ServerArgs {
@@ -737,6 +822,7 @@ impl ServerArgs {
             self.tun_ip.or(file.tun_ip),
             self.tun_netmask.or(file.tun_netmask),
             self.peer_ip.or(file.peer_ip),
+            self.tun_ip6.or(file.tun_ip6),
             self.mtu.or(file.mtu),
         )?;
 
@@ -749,6 +835,27 @@ impl ServerArgs {
                 .unwrap_or(DEFAULT_LEASE_TTL_SECS),
         );
 
+        let route_approval = RouteApproval {
+            auto: self.auto_approve_routes || file.auto_approve_routes.unwrap_or(false),
+            allowlist: self
+                .approve_routes
+                .or(file.approve_routes)
+                .unwrap_or_default(),
+        };
+
+        // Mesh routing identifies clients by their distinct tunnel IPs; NAT
+        // mode deliberately erases that distinction (one shared config), so
+        // the two cannot be combined.
+        if nat && (route_approval.auto || !route_approval.allowlist.is_empty() || tun.ip6.is_some())
+        {
+            return Err(ConfigError::Invalid {
+                field: "nat",
+                message: "mesh subnet routing (approve_routes / auto_approve_routes / tun_ip6) \
+                          requires learning mode; remove --nat"
+                    .to_string(),
+            });
+        }
+
         Ok(ServerConfig {
             listen,
             cipher,
@@ -757,6 +864,7 @@ impl ServerArgs {
             obfs,
             nat,
             lease_ttl,
+            route_approval,
         })
     }
 }
@@ -784,6 +892,7 @@ impl ClientArgs {
             self.tun_ip.or(file.tun_ip),
             self.tun_netmask.or(file.tun_netmask),
             self.peer_ip.or(file.peer_ip),
+            self.tun_ip6.or(file.tun_ip6),
             self.mtu.or(file.mtu),
         )?;
 
@@ -800,6 +909,13 @@ impl ClientArgs {
             });
         }
 
+        let advertise_routes = self
+            .advertise_routes
+            .or(file.advertise_routes)
+            .unwrap_or_default();
+        validate_advertised(&advertise_routes)?;
+        let accept_routes = self.accept_routes || file.accept_routes.unwrap_or(false);
+
         Ok(ClientConfig {
             server,
             cipher,
@@ -808,6 +924,8 @@ impl ClientArgs {
             policy,
             obfs,
             keepalive: Duration::from_secs(keepalive_secs),
+            advertise_routes,
+            accept_routes,
         })
     }
 }
@@ -829,7 +947,10 @@ mod tests {
                 tun_ip: None,
                 tun_netmask: None,
                 peer_ip: None,
+                tun_ip6: None,
                 mtu: None,
+                advertise_routes: None,
+                accept_routes: false,
                 mode: None,
                 dns_listen: None,
                 dns_local: None,
@@ -860,9 +981,12 @@ mod tests {
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
             peer_ip: Some(Ipv4Addr::new(10, 9, 0, 2)),
+            tun_ip6: None,
             mtu: None,
             nat: false,
             lease_ttl_secs: None,
+            approve_routes: None,
+            auto_approve_routes: false,
         };
         let cfg = args.resolve().expect("resolve");
         assert_eq!(cfg.listen, "0.0.0.0:9000");
@@ -1062,12 +1186,112 @@ mod tests {
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
             peer_ip: Some(Ipv4Addr::new(10, 9, 0, 2)),
+            tun_ip6: None,
             mtu: None,
             nat: true,
             lease_ttl_secs: None,
+            approve_routes: None,
+            auto_approve_routes: false,
         };
         let cfg = args.resolve().expect("resolve");
         assert!(cfg.nat);
         assert_eq!(cfg.lease_ttl, Duration::from_secs(DEFAULT_LEASE_TTL_SECS));
+    }
+
+    #[test]
+    fn mesh_config_resolves_and_validates() {
+        let base = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 77, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 77, 0, 1)),
+            ..ClientArgs::empty()
+        };
+
+        // Defaults: no mesh.
+        let cfg = base.clone().resolve().expect("resolve");
+        assert!(cfg.advertise_routes.is_empty());
+        assert!(!cfg.accept_routes);
+        assert!(cfg.tun.ip6.is_none());
+
+        // Advertise + accept + tun_ip6 resolve through.
+        let mut m = base.clone();
+        m.advertise_routes = Some(vec![
+            "192.168.200.0/24".parse().unwrap(),
+            "fd42:cafe::/64".parse().unwrap(),
+        ]);
+        m.accept_routes = true;
+        m.tun_ip6 = Some("fd07:7::2/64".parse().unwrap());
+        let cfg = m.resolve().expect("resolve mesh");
+        assert_eq!(cfg.advertise_routes.len(), 2);
+        assert!(cfg.accept_routes);
+        assert_eq!(cfg.tun.ip6.unwrap().to_string(), "fd07:7::2/64");
+
+        // A default route may not be advertised.
+        let mut d = base.clone();
+        d.advertise_routes = Some(vec!["0.0.0.0/0".parse().unwrap()]);
+        assert!(matches!(
+            d.resolve(),
+            Err(ConfigError::Invalid {
+                field: "advertise_routes",
+                ..
+            })
+        ));
+
+        // More than MAX_ROUTES is rejected.
+        let mut o = base;
+        o.advertise_routes = Some(
+            (0..=MAX_ROUTES)
+                .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256).parse().unwrap())
+                .collect(),
+        );
+        assert!(matches!(
+            o.resolve(),
+            Err(ConfigError::Invalid {
+                field: "advertise_routes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn server_mesh_approval_resolves_and_rejects_nat_combo() {
+        let base = ServerArgs {
+            config: None,
+            listen: Some("0.0.0.0:1".to_string()),
+            password: Some("pw".to_string()),
+            cipher: None,
+            tun_name: None,
+            tun_ip: Some(Ipv4Addr::new(10, 77, 0, 1)),
+            tun_netmask: None,
+            peer_ip: Some(Ipv4Addr::new(10, 77, 0, 2)),
+            tun_ip6: None,
+            mtu: None,
+            nat: false,
+            lease_ttl_secs: None,
+            approve_routes: None,
+            auto_approve_routes: false,
+        };
+
+        let cfg = base.clone().resolve().expect("resolve");
+        assert!(!cfg.route_approval.auto);
+        assert!(cfg.route_approval.allowlist.is_empty());
+
+        let mut a = base.clone();
+        a.approve_routes = Some(vec!["192.168.0.0/16".parse().unwrap()]);
+        a.tun_ip6 = Some("fd07:7::1/64".parse().unwrap());
+        let cfg = a.resolve().expect("resolve approval");
+        assert_eq!(cfg.route_approval.allowlist.len(), 1);
+        assert_eq!(cfg.tun.ip6.unwrap().prefix(), 64);
+
+        // Mesh settings + NAT mode are mutually exclusive.
+        let mut n = base;
+        n.nat = true;
+        n.auto_approve_routes = true;
+        assert!(matches!(
+            n.resolve(),
+            Err(ConfigError::Invalid { field: "nat", .. })
+        ));
     }
 }

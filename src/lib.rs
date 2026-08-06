@@ -50,6 +50,7 @@
 //! * [`obfs`] — optional carrier obfuscation (QUIC/HTTP3-shaped or base64).
 //! * [`tun_device`] — async TUN interface wrapper (macOS utun + Linux + Windows).
 //! * [`policy`] — client-side policy routing (gfwlist / chinadns split tunnel).
+//! * [`mesh`] — Tailscale-like subnet routing (advertise / approve / accept).
 //! * [`nat`] — server-side per-client NAT (multiple clients, one shared config).
 //! * [`pool`] — internal-IP allocation pool used by [`nat`].
 //! * `uri` — `shadowvpn://` config import/export + QR codes (feature `uri`).
@@ -58,6 +59,7 @@
 
 pub mod config;
 pub mod crypto;
+pub mod mesh;
 pub mod nat;
 pub mod net;
 pub mod obfs;

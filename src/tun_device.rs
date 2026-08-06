@@ -36,6 +36,12 @@ impl TunDevice {
             // Point-to-point: address + netmask, with the peer as destination.
             .ipv4(cfg.ip, cfg.netmask, Some(cfg.peer_ip));
 
+        // Optional IPv6 (mesh routing): one shared ULA prefix across the
+        // tunnel gives IPv6 subnet routes an in-tunnel source/return address.
+        if let Some(ip6) = cfg.ip6 {
+            builder = builder.ipv6(ip6.ip(), ip6.prefix());
+        }
+
         if let Some(name) = &cfg.name {
             builder = builder.name(name.clone());
         }

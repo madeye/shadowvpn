@@ -30,8 +30,12 @@ COPY --from=builder /src/target/release/shadowvpn-client /usr/local/bin/shadowvp
 
 COPY docker/server.json docker/client.json /etc/shadowvpn/
 COPY docker/run-server.sh docker/test-client.sh \
-     docker/run-server-multi.sh docker/run-client-multi.sh /usr/local/bin/
+     docker/run-server-multi.sh docker/run-client-multi.sh \
+     docker/run-server-mesh.sh docker/run-client-mesh-router.sh \
+     docker/run-client-mesh-accept.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/run-server.sh /usr/local/bin/test-client.sh \
-    /usr/local/bin/run-server-multi.sh /usr/local/bin/run-client-multi.sh
+    /usr/local/bin/run-server-multi.sh /usr/local/bin/run-client-multi.sh \
+    /usr/local/bin/run-server-mesh.sh /usr/local/bin/run-client-mesh-router.sh \
+    /usr/local/bin/run-client-mesh-accept.sh
 
 ENV RUST_LOG=info
