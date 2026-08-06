@@ -485,7 +485,9 @@ impl RouteInstaller {
                 false,
             ) {
                 Ok(()) => info!("removed withdrawn subnet route {net}"),
-                Err(e) => debug!("failed to remove subnet route {net}: {e}"),
+                // warn, not debug: a failed removal leaves a stale kernel
+                // route silently steering traffic into the tunnel.
+                Err(e) => warn!("failed to remove subnet route {net}: {e}"),
             }
             installed.remove(&net);
         }

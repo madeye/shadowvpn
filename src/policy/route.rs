@@ -288,6 +288,11 @@ mod imp {
         const RTPROT_STATIC: u8 = 4;
         const RT_SCOPE_LINK: u8 = 253;
         const RT_SCOPE_UNIVERSE: u8 = 0;
+        // Deletes must use NOWHERE (the match-any wildcard, what iproute2
+        // sends): the kernel only deletes an IPv4 route whose scope equals
+        // the request's, and 0 (UNIVERSE) never matches the LINK-scoped
+        // routes installed here.
+        const RT_SCOPE_NOWHERE: u8 = 255;
         const RTN_UNICAST: u8 = 1;
         const RTA_DST: u16 = 1;
         const RTA_OIF: u16 = 4;
@@ -340,7 +345,7 @@ mod imp {
         buf.push(0); // rtm_tos
         buf.push(RT_TABLE_MAIN); // rtm_table
         buf.push(if add { RTPROT_STATIC } else { 0 }); // rtm_protocol
-        buf.push(if add { scope } else { 0 }); // rtm_scope
+        buf.push(if add { scope } else { RT_SCOPE_NOWHERE }); // rtm_scope
         buf.push(if add { RTN_UNICAST } else { 0 }); // rtm_type
         buf.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
 
@@ -395,6 +400,9 @@ mod imp {
             assert_eq!(u16::from_ne_bytes([m[4], m[5]]), 25); // RTM_DELROUTE
                                                               // DST + OIF only: header(16) + rtmsg(12) + 2*(4+4) = 44.
             assert_eq!(m.len(), 44);
+            // rtm_scope must be NOWHERE (match-any): a 0 (UNIVERSE) scope
+            // never matches the LINK-scoped IPv4 routes installed by add.
+            assert_eq!(m[22], 255);
         }
 
         #[test]
