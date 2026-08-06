@@ -125,11 +125,13 @@ On the accepting client, `ip route` / `ip -6 route` show the pushed routes as
 `proto static` entries on the tun device; the server logs every
 approval, hold, move, withdrawal, and expiry.
 
-This flow is exercised end to end in CI-style runs on Linux VMs: a hub, a
-subnet router advertising a dummy `192.168.200.0/24` + `fd42:cafe::/64`
-interface, and an accepting client — covering advert/approve/accept, hub
-relay for IPv4 + IPv6, allowlist gating (the unapproved route is withheld and
-withdrawn), and route cleanup on exit.
+This flow is exercised end to end in CI on every PR
+(`docker/run-e2e-mesh.sh`, run in both `auto` and `allowlist` approval
+modes): a hub, a subnet router advertising a local `192.168.200.0/24` +
+`fd42:cafe::/64`, and an accepting client — covering advert/approve/accept,
+hub relay for IPv4 + IPv6, allowlist gating (an unlisted route is held as
+awaiting approval and never pushed), and route withdrawal after the
+advertiser goes away.
 
 ## Wire format
 

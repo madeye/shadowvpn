@@ -176,6 +176,33 @@ jobs:
       - name: Verify policy routing
         run: ./docker/run-e2e-policy.sh "${{ matrix.mode }}"
 
+  # Mesh subnet-routing test (Tailscale-like advertise/approve/accept): a hub
+  # server, a subnet-router client advertising IPv4 + IPv6 prefixes, and an
+  # accept-routes client. Verifies the routes are pushed and installed, the
+  # hub relay carries spoke<->spoke and subnet traffic (v4 + v6), approval
+  # gating works (allowlist holds an unlisted route; auto approves it), and
+  # routes are withdrawn after the advertiser goes away. Self-contained (no
+  # external network); runs on every PR.
+  e2e-mesh:
+    name: docker e2e mesh (${{ matrix.approval }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        approval:
+          - auto
+          - allowlist
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the TUN device is available on the runner
+        run: |
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+
+      - name: Verify mesh subnet routing
+        run: ./docker/run-e2e-mesh.sh "${{ matrix.approval }}"
+
   # Multi-client auto-IP test: one --auto-assign server and three auto_ip
   # clients. Verifies each client is leased a distinct tunnel IP, every client
   # reaches the server through the tunnel, and clients reach each other via the

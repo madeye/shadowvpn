@@ -1,0 +1,48 @@
+# Docker-based end-to-end test for ShadowVPN mesh subnet routing.
+#
+# Brings up a hub server (learning mode + approval policy), a subnet-router
+# client that advertises IPv4/IPv6 prefixes it hosts locally, and an
+# accept-routes client that receives the approved set and installs kernel
+# routes on its TUN. The driver (run-e2e-mesh.sh) then verifies advertise/
+# approve/accept, the hub relay (spoke<->spoke, v4 + v6), routed subnet
+# reachability, allowlist gating, and route withdrawal when the advertiser
+# goes away.
+#
+#   docker/run-e2e-mesh.sh auto        # or: allowlist
+
+x-shadowvpn: &shadowvpn
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: shadowvpn-e2e:latest
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun
+  # The tunnel carries an IPv6 ULA (fd07:7::/64) and an advertised IPv6 route;
+  # make sure IPv6 is not disabled inside the containers.
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: "0"
+    net.ipv6.conf.default.disable_ipv6: "0"
+  environment:
+    CIPHER: ${CIPHER:-chacha20-poly1305}
+    RUST_LOG: ${RUST_LOG:-info}
+    MESH_APPROVAL: ${MESH_APPROVAL:-auto}
+
+services:
+  server:
+    <<: *shadowvpn
+    container_name: svpn-mesh-server
+    command: ["run-server-mesh.sh"]
+
+  router:
+    <<: *shadowvpn
+    container_name: svpn-mesh-router
+    depends_on: [server]
+    command: ["run-client-mesh-router.sh"]
+
+  accept:
+    <<: *shadowvpn
+    container_name: svpn-mesh-accept
+    depends_on: [server]
+    command: ["run-client-mesh-accept.sh"]
