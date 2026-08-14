@@ -77,7 +77,7 @@ Options and overrides:
   generated config.
 - `uninstall all` removes both binaries; `--purge` also removes
   `/etc/shadowvpn` configs.
-- `SHADOWVPN_VERSION=v0.4.0` pins a release tag (default: latest);
+- `SHADOWVPN_VERSION=v0.5.0` pins a release tag (default: latest);
   `PREFIX=~/.local` installs to a user-writable prefix without sudo
   (configs/services are then skipped).
 
