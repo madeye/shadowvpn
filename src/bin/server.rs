@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -33,48 +33,108 @@ use log::{debug, error, info, warn};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use shadowvpn::assign::{Assigner, Lease};
 use shadowvpn::config::{ServerArgs, ServerConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet};
-use shadowvpn::mesh::{self, Control, RouteApproval, RoutePush, SubnetTable};
+use shadowvpn::mesh::{self, Assign, AssignStatus, Control, RouteApproval, RoutePush, SubnetTable};
 use shadowvpn::nat::{Ingress, Nat};
 use shadowvpn::obfs::{self, Obfuscator};
+use shadowvpn::pool::host_range;
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
 use shadowvpn::tun_device::TunDevice;
+
+/// One learned inner-IP → UDP mapping, live only within `lease_ttl`.
+struct ClientEntry {
+    peer: SocketAddr,
+    last_seen: Instant,
+}
 
 /// Learning-mode routing state: the classic per-address client map plus the
 /// mesh subnet-route table (Tailscale-like advertised routes).
 #[derive(Default)]
 struct Learned {
     /// Inner tunnel IP (v4 or v6) → the UDP endpoint it was last seen from.
-    clients: HashMap<IpAddr, SocketAddr>,
+    clients: HashMap<IpAddr, ClientEntry>,
     /// Advertised subnet routes, matched by longest prefix after `clients`.
     subnets: SubnetTable,
 }
 
 impl Learned {
     /// Record that `src` is reachable via `peer`, logging on change.
+    /// Refreshes `last_seen` so a quiet-but-still-sending client stays live.
     fn learn(&mut self, src: IpAddr, peer: SocketAddr, via: &str) {
-        if self.clients.insert(src, peer) != Some(peer) {
-            info!("client {src} reachable via {peer}{via}");
+        let now = Instant::now();
+        match self.clients.get_mut(&src) {
+            Some(entry) if entry.peer == peer => {
+                entry.last_seen = now;
+            }
+            _ => {
+                if self
+                    .clients
+                    .insert(
+                        src,
+                        ClientEntry {
+                            peer,
+                            last_seen: now,
+                        },
+                    )
+                    .map(|e| e.peer)
+                    != Some(peer)
+                {
+                    info!("client {src} reachable via {peer}{via}");
+                }
+            }
         }
     }
 
-    /// Resolve an inner destination: exact client first, then the
+    /// Resolve an inner destination: exact *live* client first, then the
     /// longest-prefix subnet route.
-    fn lookup(&self, dst: IpAddr) -> Option<SocketAddr> {
-        self.clients
-            .get(&dst)
-            .copied()
-            .or_else(|| self.subnets.lookup(dst))
+    fn lookup(&self, dst: IpAddr, now: Instant, ttl: Duration) -> Option<SocketAddr> {
+        if let Some(entry) = self.clients.get(&dst) {
+            if now.saturating_duration_since(entry.last_seen) <= ttl {
+                return Some(entry.peer);
+            }
+        }
+        self.subnets.lookup(dst)
     }
+
+    /// Drop mappings whose `last_seen` is older than `ttl`.
+    fn expire_clients(&mut self, ttl: Duration, now: Instant) {
+        self.clients.retain(|ip, entry| {
+            let live = now.saturating_duration_since(entry.last_seen) <= ttl;
+            if !live {
+                info!("client {ip} expired (idle > {}s)", ttl.as_secs());
+            }
+            live
+        });
+    }
+
+    /// Forget `ip` if it still points at `last_peer`, or the mapping is dead.
+    fn unlearn(&mut self, ip: IpAddr, last_peer: Option<SocketAddr>, now: Instant, ttl: Duration) {
+        let Some(entry) = self.clients.get(&ip) else {
+            return;
+        };
+        let live = now.saturating_duration_since(entry.last_seen) <= ttl;
+        if last_peer == Some(entry.peer) || !live {
+            self.clients.remove(&ip);
+        }
+    }
+}
+
+/// Learning-mode maps plus the node-id assigner.
+struct LearnState {
+    learned: Learned,
+    assigner: Assigner,
+    /// Learned-mapping / subnet-route TTL (not the 7-day assignment TTL).
+    lease_ttl: Duration,
 }
 
 /// How the server maps inner IP packets to clients. Held behind a [`Mutex`] and
 /// only touched synchronously (never across an `.await`).
 enum Routing {
     /// Learn inner source IP → UDP peer; route by inner destination IP. Clients
-    /// must use distinct tunnel IPs.
-    Learn(Learned),
+    /// must use distinct tunnel IPs. Serves `AssignRequest`.
+    Learn(Box<LearnState>),
     /// NAT clients onto distinct internal IPs keyed by their UDP endpoint, so
     /// they can all share one static config.
     Nat(Nat),
@@ -140,7 +200,13 @@ async fn run(cfg: ServerConfig) -> Result<()> {
         );
         Routing::Nat(nat)
     } else {
-        Routing::Learn(Learned::default())
+        let assigner = build_assigner(&cfg);
+        print_assignment_banner(&cfg, &assigner);
+        Routing::Learn(Box::new(LearnState {
+            learned: Learned::default(),
+            assigner,
+            lease_ttl: cfg.lease_ttl,
+        }))
     }));
 
     // Carrier obfuscation, matching the client. When enabled, datagrams on the
@@ -195,10 +261,14 @@ async fn run(cfg: ServerConfig) -> Result<()> {
                     Routing::Nat(nat) => {
                         nat.reap(Instant::now());
                     }
-                    Routing::Learn(learned) => {
-                        for net in learned.subnets.expire(lease_ttl, Instant::now()) {
+                    Routing::Learn(state) => {
+                        let tick = Instant::now();
+                        for net in state.learned.subnets.expire(lease_ttl, tick) {
                             info!("subnet route {net} expired (advertiser went quiet)");
                         }
+                        state.learned.expire_clients(lease_ttl, tick);
+                        let dropped = state.assigner.reap(SystemTime::now());
+                        unlearn_dropped(&mut state.learned, &dropped, tick, lease_ttl);
                     }
                 }
             }
@@ -286,14 +356,15 @@ async fn udp_to_tun(
             // the TUN, but keep the sender's routing state fresh and may earn
             // a route push in reply.
             if mesh::is_control(&plaintext) {
-                let reply = handle_control(&routing, &cfg.route_approval, peer, &plaintext, now);
-                if let Some(push) = reply {
+                if let Some(reply) =
+                    handle_control(&routing, &cfg.route_approval, peer, &plaintext, now)
+                {
                     send_ciphered(
                         &socket_out,
                         cipher,
                         &cfg.master_key,
                         &obfuscator,
-                        &push.encode(),
+                        &encode_control(&reply),
                         peer,
                     )
                     .await;
@@ -324,13 +395,15 @@ async fn udp_to_tun(
             let action = {
                 let mut guard = routing.lock().unwrap();
                 match &mut *guard {
-                    Routing::Learn(learned) => {
+                    Routing::Learn(state) => {
                         if let Some(src) = ip_src(&plaintext) {
-                            learned.learn(src, peer, "");
+                            maybe_learn(&mut state.learned, &state.assigner, src, peer, "");
                         } else {
                             debug!("datagram from {peer} is not a parseable IP packet; forwarding");
                         }
-                        match ip_dst(&plaintext).and_then(|dst| learned.lookup(dst)) {
+                        match ip_dst(&plaintext)
+                            .and_then(|dst| state.learned.lookup(dst, now, cfg.lease_ttl))
+                        {
                             // Spoke↔spoke: relay UDP→UDP without touching TUN.
                             Some(next) if next != peer => Action::Relay(next),
                             // The destination maps back to the sender itself;
@@ -426,7 +499,9 @@ async fn tun_to_udp(
             let peer = {
                 let mut guard = routing.lock().unwrap();
                 match &mut *guard {
-                    Routing::Learn(learned) => ip_dst(&pkt).and_then(|dst| learned.lookup(dst)),
+                    Routing::Learn(state) => {
+                        ip_dst(&pkt).and_then(|dst| state.learned.lookup(dst, now, cfg.lease_ttl))
+                    }
                     Routing::Nat(nat) => nat.egress(&mut pkt, now),
                 }
             };
@@ -469,18 +544,18 @@ async fn tun_to_udp(
     }
 }
 
-/// Handle an authenticated control message (keepalive or mesh route message)
-/// from `peer`, updating routing state. Returns a route push to send back when
-/// the message was an advert from an accept-routes client. The payload has
-/// already been AEAD-authenticated, so its contents are exactly as trustworthy
-/// as the header fields of a data packet.
+/// Handle an authenticated control message (keepalive, mesh, or assign)
+/// from `peer`, updating routing state. Returns a reply to send back when
+/// the message was an advert from an accept-routes client or an `AssignReq`.
+/// The payload has already been AEAD-authenticated, so its contents are
+/// exactly as trustworthy as the header fields of a data packet.
 fn handle_control(
     routing: &Shared,
     approval: &RouteApproval,
     peer: SocketAddr,
     payload: &[u8],
     now: Instant,
-) -> Option<RoutePush> {
+) -> Option<Control> {
     let control = match mesh::parse_control(payload) {
         Some(control) => control,
         None => {
@@ -493,30 +568,37 @@ fn handle_control(
     };
     let mut guard = routing.lock().unwrap();
     match (&mut *guard, control) {
-        // NAT mode identifies clients by endpoint alone: any control message
-        // refreshes the lease, and mesh routing is unsupported (rejected at
-        // config time on this server; other clients may still ask).
-        (Routing::Nat(nat), control) => {
-            nat.touch(peer, now);
-            if !matches!(control, Control::Keepalive(_)) {
-                debug!("ignoring mesh control from {peer}: NAT mode has no subnet routing");
-            }
-            None
-        }
-        (Routing::Learn(learned), Control::Keepalive(src)) => {
+        (Routing::Learn(state), Control::Keepalive(src)) => {
             if let Some(src) = src {
-                learned.learn(IpAddr::V4(src), peer, " (keepalive)");
+                maybe_learn(
+                    &mut state.learned,
+                    &state.assigner,
+                    IpAddr::V4(src),
+                    peer,
+                    " (keepalive)",
+                );
             }
             None
         }
-        (Routing::Learn(learned), Control::RouteAdvert(advert)) => {
-            // An advert doubles as a keepalive: learn/refresh the client's
-            // tunnel addresses.
-            learned.learn(IpAddr::V4(advert.tunnel_ip), peer, " (advert)");
+        (Routing::Learn(state), Control::RouteAdvert(advert)) => {
+            maybe_learn(
+                &mut state.learned,
+                &state.assigner,
+                IpAddr::V4(advert.tunnel_ip),
+                peer,
+                " (advert)",
+            );
             if let Some(ip6) = advert.tunnel_ip6 {
-                learned.learn(IpAddr::V6(ip6), peer, " (advert)");
+                maybe_learn(
+                    &mut state.learned,
+                    &state.assigner,
+                    IpAddr::V6(ip6),
+                    peer,
+                    " (advert)",
+                );
             }
-            let outcome = learned
+            let outcome = state
+                .learned
                 .subnets
                 .advertise(peer, &advert.routes, approval, now);
             let who = advert.tunnel_ip;
@@ -537,14 +619,160 @@ fn handle_control(
             }
             // Reply with the (split-horizon) approved set — even when empty,
             // so a client whose routes were all withdrawn removes them.
-            advert.accept_routes.then(|| RoutePush {
-                routes: learned.subnets.routes_for(peer),
+            advert.accept_routes.then(|| {
+                Control::RoutePush(RoutePush {
+                    routes: state.learned.subnets.routes_for(peer),
+                })
             })
         }
         (Routing::Learn(_), Control::RoutePush(_)) => {
             debug!("ignoring route push from {peer}: pushes only flow server→client");
             None
         }
+        (Routing::Learn(state), Control::AssignReq(req)) => {
+            let (reply, dropped) = state.assigner.allocate(&req, peer, SystemTime::now());
+            unlearn_dropped(&mut state.learned, &dropped, now, state.lease_ttl);
+            if reply.status == AssignStatus::Ok {
+                state
+                    .learned
+                    .learn(IpAddr::V4(reply.tun_ip), peer, " (assign)");
+                if let Some(ip6) = reply.tun_ip6 {
+                    state.learned.learn(IpAddr::V6(ip6), peer, " (assign)");
+                }
+            }
+            Some(Control::Assign(reply))
+        }
+        (Routing::Learn(_), Control::Assign(_)) => {
+            debug!("ignoring assign reply from {peer}: assigns only flow server→client");
+            None
+        }
+        (Routing::Nat(nat), Control::Keepalive(_)) => {
+            nat.touch(peer, now);
+            None
+        }
+        (Routing::Nat(nat), Control::AssignReq(_)) => {
+            nat.touch(peer, now);
+            Some(Control::Assign(nat_mode_assign()))
+        }
+        (
+            Routing::Nat(nat),
+            Control::RouteAdvert(_) | Control::RoutePush(_) | Control::Assign(_),
+        ) => {
+            nat.touch(peer, now);
+            debug!("ignoring mesh/assign control from {peer}: NAT mode has no subnet routing");
+            None
+        }
+    }
+}
+
+/// Learn `src` via `peer` unless that address is leased to a different node.
+/// A missing `by_peer` binding is treated as not-owner.
+fn maybe_learn(
+    learned: &mut Learned,
+    assigner: &Assigner,
+    src: IpAddr,
+    peer: SocketAddr,
+    via: &str,
+) {
+    let owner = match src {
+        IpAddr::V4(v) => assigner.node_for_ip4(v),
+        IpAddr::V6(v) => assigner.node_for_ip6(v),
+    };
+    if let Some(owner) = owner {
+        if assigner.node_for_peer(peer) != Some(owner) {
+            warn!("learn denied: {src} is leased to another node (from {peer})");
+            return;
+        }
+    }
+    learned.learn(src, peer, via);
+}
+
+fn unlearn_dropped(learned: &mut Learned, dropped: &[Lease], now: Instant, ttl: Duration) {
+    for lease in dropped {
+        learned.unlearn(IpAddr::V4(lease.ip4), lease.last_peer, now, ttl);
+        if let Some(ip6) = lease.ip6 {
+            learned.unlearn(IpAddr::V6(ip6), lease.last_peer, now, ttl);
+        }
+    }
+}
+
+fn encode_control(msg: &Control) -> Vec<u8> {
+    match msg {
+        Control::RoutePush(push) => push.encode(),
+        Control::Assign(assign) => assign.encode(),
+        Control::Keepalive(_) | Control::RouteAdvert(_) | Control::AssignReq(_) => {
+            debug!("refusing to encode client-originated control {msg:?}");
+            Vec::new()
+        }
+    }
+}
+
+fn nat_mode_assign() -> Assign {
+    Assign {
+        status: AssignStatus::NatMode,
+        tun_ip: Ipv4Addr::UNSPECIFIED,
+        netmask: Ipv4Addr::UNSPECIFIED,
+        peer_ip: Ipv4Addr::UNSPECIFIED,
+        tun_ip6: None,
+        plen6: 0,
+        flags: 0,
+        ttl_secs: 0,
+    }
+}
+
+fn build_assigner(cfg: &ServerConfig) -> Assigner {
+    let mut assigner = Assigner::new(
+        cfg.tun.ip,
+        cfg.tun.netmask,
+        cfg.tun.ip6,
+        cfg.tun.peer_ip,
+        cfg.reserved_ips.iter().copied(),
+        cfg.assign_ttl,
+        cfg.lease_file.clone(),
+    );
+    if let Some(pool) = cfg.assign_pool {
+        let (start, end) = host_range(pool.network(), pool.mask());
+        assigner.set_host_range(start, end);
+    }
+    assigner
+}
+
+fn print_assignment_banner(cfg: &ServerConfig, assigner: &Assigner) {
+    let pool = cfg
+        .assign_pool
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| tun_cidr(cfg.tun.ip, cfg.tun.netmask));
+    let reserved = cfg
+        .reserved_ips
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let file = cfg
+        .lease_file
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "-".into());
+    info!(
+        "assignment: ON ({}/{} leased, pool {pool}, reserved {reserved}, ttl {}, file {file})",
+        assigner.leased(),
+        assigner.capacity(),
+        fmt_ttl(cfg.assign_ttl),
+    );
+}
+
+fn tun_cidr(ip: Ipv4Addr, mask: Ipv4Addr) -> String {
+    let m = u32::from(mask);
+    let network = Ipv4Addr::from(u32::from(ip) & m);
+    format!("{network}/{}", m.leading_ones())
+}
+
+fn fmt_ttl(d: Duration) -> String {
+    let s = d.as_secs();
+    if s > 0 && s.is_multiple_of(86_400) {
+        format!("{}d", s / 86_400)
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -715,6 +943,42 @@ mod tests {
         assert_eq!(ip_dst(&p), None);
     }
 
+    fn learn_state() -> LearnState {
+        LearnState {
+            learned: Learned::default(),
+            assigner: Assigner::new(
+                Ipv4Addr::new(10, 77, 0, 1),
+                Ipv4Addr::new(255, 255, 255, 0),
+                None,
+                Ipv4Addr::new(10, 77, 0, 2),
+                [],
+                Duration::from_secs(shadowvpn::assign::DEFAULT_ASSIGN_TTL_SECS),
+                None,
+            ),
+            lease_ttl: Duration::from_secs(120),
+        }
+    }
+
+    fn learn_routing() -> Shared {
+        Arc::new(Mutex::new(Routing::Learn(Box::new(learn_state()))))
+    }
+
+    fn keepalive(ip: Option<Ipv4Addr>) -> Vec<u8> {
+        match ip {
+            None => vec![0x00],
+            Some(ip) => {
+                let mut v = vec![0x00];
+                v.extend_from_slice(&ip.octets());
+                v
+            }
+        }
+    }
+
+    const NODE_A: [u8; 16] = [
+        0xc0, 0xff, 0xee, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    ];
+
     #[test]
     fn learned_lookup_prefers_exact_client_over_subnet() {
         use shadowvpn::mesh::RouteApproval;
@@ -722,6 +986,8 @@ mod tests {
         let mut learned = Learned::default();
         let peer_a: SocketAddr = "198.51.100.1:1000".parse().unwrap();
         let peer_b: SocketAddr = "198.51.100.2:2000".parse().unwrap();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(120);
         learned.learn("10.77.0.2".parse().unwrap(), peer_a, "");
         learned.subnets.advertise(
             peer_b,
@@ -730,21 +996,43 @@ mod tests {
                 auto: true,
                 allowlist: vec![],
             },
-            Instant::now(),
+            now,
         );
 
         // Exact client match beats the covering subnet route…
-        assert_eq!(learned.lookup("10.77.0.2".parse().unwrap()), Some(peer_a));
+        assert_eq!(
+            learned.lookup("10.77.0.2".parse().unwrap(), now, ttl),
+            Some(peer_a)
+        );
         // …and everything else in the subnet goes to its advertiser.
-        assert_eq!(learned.lookup("10.77.9.9".parse().unwrap()), Some(peer_b));
-        assert_eq!(learned.lookup("192.0.2.1".parse().unwrap()), None);
+        assert_eq!(
+            learned.lookup("10.77.9.9".parse().unwrap(), now, ttl),
+            Some(peer_b)
+        );
+        assert_eq!(learned.lookup("192.0.2.1".parse().unwrap(), now, ttl), None);
+    }
+
+    #[test]
+    fn learned_lookup_ignores_expired_and_sweeper_drops() {
+        let mut learned = Learned::default();
+        let peer: SocketAddr = "198.51.100.1:1000".parse().unwrap();
+        let ip: IpAddr = "10.77.0.2".parse().unwrap();
+        learned.learn(ip, peer, "");
+        let ttl = Duration::from_secs(120);
+        assert_eq!(learned.lookup(ip, Instant::now(), ttl), Some(peer));
+
+        learned.clients.get_mut(&ip).unwrap().last_seen = Instant::now() - Duration::from_secs(121);
+        let now = Instant::now();
+        assert_eq!(learned.lookup(ip, now, ttl), None);
+        learned.expire_clients(ttl, now);
+        assert!(learned.clients.is_empty());
     }
 
     #[test]
     fn control_handling_learns_and_replies_to_accepting_clients() {
         use shadowvpn::mesh::{RouteAdvert, RouteApproval};
 
-        let routing: Shared = Arc::new(Mutex::new(Routing::Learn(Learned::default())));
+        let routing = learn_routing();
         let approval = RouteApproval {
             auto: false,
             allowlist: vec!["192.168.200.0/24".parse().unwrap()],
@@ -776,29 +1064,302 @@ mod tests {
             accept_routes: true,
             routes: vec![],
         };
-        let push = handle_control(&routing, &approval, client_peer, &advert.encode(), now)
-            .expect("accepting client gets a push");
+        let Control::RoutePush(push) =
+            handle_control(&routing, &approval, client_peer, &advert.encode(), now)
+                .expect("accepting client gets a push")
+        else {
+            panic!("expected RoutePush");
+        };
         assert_eq!(push.routes, vec!["192.168.200.0/24".parse().unwrap()]);
 
         // Learning happened for v4 and v6 tunnel addresses, and the approved
         // subnet routes through the advertiser.
         let guard = routing.lock().unwrap();
-        let Routing::Learn(learned) = &*guard else {
+        let Routing::Learn(state) = &*guard else {
             panic!("learning mode")
         };
+        let ttl = state.lease_ttl;
         assert_eq!(
-            learned.lookup("10.77.0.2".parse().unwrap()),
+            state.learned.lookup("10.77.0.2".parse().unwrap(), now, ttl),
             Some(router_peer)
         );
         assert_eq!(
-            learned.lookup("fd07:7::2".parse().unwrap()),
+            state.learned.lookup("fd07:7::2".parse().unwrap(), now, ttl),
             Some(router_peer)
         );
         assert_eq!(
-            learned.lookup("192.168.200.7".parse().unwrap()),
+            state
+                .learned
+                .lookup("192.168.200.7".parse().unwrap(), now, ttl),
             Some(router_peer)
         );
         // The unapproved route is not routable.
-        assert_eq!(learned.lookup("10.99.1.1".parse().unwrap()), None);
+        assert_eq!(
+            state.learned.lookup("10.99.1.1".parse().unwrap(), now, ttl),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_control_learn_table() {
+        use shadowvpn::mesh::{AssignReq, RouteAdvert, RouteApproval};
+
+        let routing = learn_routing();
+        let approval = RouteApproval {
+            auto: false,
+            allowlist: vec![],
+        };
+        let now = Instant::now();
+        let peer: SocketAddr = "198.51.100.1:1000".parse().unwrap();
+        let other: SocketAddr = "198.51.100.2:2000".parse().unwrap();
+        let none = RouteApproval {
+            auto: false,
+            allowlist: vec![],
+        };
+
+        assert_eq!(
+            handle_control(&routing, &approval, peer, &keepalive(None), now),
+            None
+        );
+        {
+            let guard = routing.lock().unwrap();
+            let Routing::Learn(state) = &*guard else {
+                panic!("learn")
+            };
+            assert!(state.learned.clients.is_empty());
+        }
+
+        let ip = Ipv4Addr::new(10, 77, 0, 9);
+        assert_eq!(
+            handle_control(&routing, &approval, peer, &keepalive(Some(ip)), now),
+            None
+        );
+        {
+            let guard = routing.lock().unwrap();
+            let Routing::Learn(state) = &*guard else {
+                panic!("learn")
+            };
+            assert_eq!(
+                state.learned.lookup(IpAddr::V4(ip), now, state.lease_ttl),
+                Some(peer)
+            );
+        }
+
+        let advert = RouteAdvert {
+            tunnel_ip: Ipv4Addr::new(10, 77, 0, 10),
+            tunnel_ip6: Some("fd07:7::a".parse().unwrap()),
+            accept_routes: false,
+            routes: vec![],
+        };
+        assert_eq!(
+            handle_control(&routing, &approval, peer, &advert.encode(), now),
+            None
+        );
+
+        let push = RoutePush { routes: vec![] };
+        assert_eq!(
+            handle_control(&routing, &approval, peer, &push.encode(), now),
+            None
+        );
+
+        let client_assign = Assign {
+            status: AssignStatus::Ok,
+            tun_ip: Ipv4Addr::UNSPECIFIED,
+            netmask: Ipv4Addr::UNSPECIFIED,
+            peer_ip: Ipv4Addr::UNSPECIFIED,
+            tun_ip6: None,
+            plen6: 0,
+            flags: 0,
+            ttl_secs: 0,
+        };
+        assert_eq!(
+            handle_control(&routing, &approval, peer, &client_assign.encode(), now),
+            None
+        );
+
+        let req = AssignReq {
+            flags: 0,
+            node_id: NODE_A,
+            hint_ip4: Ipv4Addr::new(10, 77, 0, 37),
+            hint_ip6: None,
+        };
+        let Control::Assign(reply) =
+            handle_control(&routing, &approval, peer, &req.encode(), now).expect("Assign")
+        else {
+            panic!("expected Assign");
+        };
+        assert_eq!(reply.status, AssignStatus::Ok);
+        assert_eq!(reply.tun_ip, Ipv4Addr::new(10, 77, 0, 37));
+        assert_eq!(reply.peer_ip, Ipv4Addr::new(10, 77, 0, 1));
+
+        // Non-owner keepalive of the leased IP is not learned.
+        assert_eq!(
+            handle_control(
+                &routing,
+                &approval,
+                other,
+                &keepalive(Some(reply.tun_ip)),
+                now
+            ),
+            None
+        );
+        {
+            let guard = routing.lock().unwrap();
+            let Routing::Learn(state) = &*guard else {
+                panic!("learn")
+            };
+            assert_eq!(
+                state
+                    .learned
+                    .lookup(IpAddr::V4(reply.tun_ip), now, state.lease_ttl),
+                Some(peer)
+            );
+            assert_eq!(state.assigner.node_for_peer(peer), Some(NODE_A));
+            assert_eq!(state.assigner.node_for_peer(other), None);
+        }
+
+        assert_eq!(
+            handle_control(&routing, &none, peer, &[0x00, 0x05, 0x00], now),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_control_nat_table() {
+        use shadowvpn::mesh::AssignReq;
+
+        let routing: Shared = Arc::new(Mutex::new(Routing::Nat(Nat::new(
+            Ipv4Addr::new(10, 9, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            Duration::from_secs(120),
+        ))));
+        let approval = RouteApproval {
+            auto: false,
+            allowlist: vec![],
+        };
+        let now = Instant::now();
+        let peer: SocketAddr = "198.51.100.1:1000".parse().unwrap();
+
+        assert_eq!(
+            handle_control(
+                &routing,
+                &approval,
+                peer,
+                &keepalive(Some(Ipv4Addr::new(10, 9, 0, 2))),
+                now
+            ),
+            None
+        );
+
+        let req = AssignReq {
+            flags: 0,
+            node_id: NODE_A,
+            hint_ip4: Ipv4Addr::UNSPECIFIED,
+            hint_ip6: None,
+        };
+        let Control::Assign(reply) =
+            handle_control(&routing, &approval, peer, &req.encode(), now).expect("NatMode")
+        else {
+            panic!("expected Assign");
+        };
+        assert_eq!(reply.status, AssignStatus::NatMode);
+        assert!(reply.tun_ip.is_unspecified());
+
+        let advert = shadowvpn::mesh::RouteAdvert {
+            tunnel_ip: Ipv4Addr::new(10, 9, 0, 2),
+            tunnel_ip6: None,
+            accept_routes: true,
+            routes: vec![],
+        };
+        assert_eq!(
+            handle_control(&routing, &approval, peer, &advert.encode(), now),
+            None
+        );
+    }
+
+    #[test]
+    fn maybe_learn_v4_and_v6_require_by_peer_owner() {
+        let mut state = LearnState {
+            learned: Learned::default(),
+            assigner: Assigner::new(
+                Ipv4Addr::new(10, 77, 0, 1),
+                Ipv4Addr::new(255, 255, 255, 0),
+                Some("fd07:7::1/64".parse().unwrap()),
+                Ipv4Addr::new(10, 77, 0, 2),
+                [],
+                Duration::from_secs(shadowvpn::assign::DEFAULT_ASSIGN_TTL_SECS),
+                None,
+            ),
+            lease_ttl: Duration::from_secs(120),
+        };
+        let peer: SocketAddr = "198.51.100.1:1000".parse().unwrap();
+        let other: SocketAddr = "198.51.100.2:2000".parse().unwrap();
+        let req = shadowvpn::mesh::AssignReq {
+            flags: shadowvpn::mesh::FLAG_WANT_IP6,
+            node_id: NODE_A,
+            hint_ip4: Ipv4Addr::new(10, 77, 0, 37),
+            hint_ip6: None,
+        };
+        let (reply, _) = state.assigner.allocate(&req, peer, SystemTime::now());
+        assert_eq!(reply.tun_ip, Ipv4Addr::new(10, 77, 0, 37));
+        let ip6 = reply.tun_ip6.expect("embedded v6");
+
+        maybe_learn(
+            &mut state.learned,
+            &state.assigner,
+            IpAddr::V4(reply.tun_ip),
+            other,
+            "",
+        );
+        maybe_learn(
+            &mut state.learned,
+            &state.assigner,
+            IpAddr::V6(ip6),
+            other,
+            "",
+        );
+        assert!(state.learned.clients.is_empty());
+
+        maybe_learn(
+            &mut state.learned,
+            &state.assigner,
+            IpAddr::V4(reply.tun_ip),
+            peer,
+            "",
+        );
+        maybe_learn(
+            &mut state.learned,
+            &state.assigner,
+            IpAddr::V6(ip6),
+            peer,
+            "",
+        );
+        let now = Instant::now();
+        assert_eq!(
+            state
+                .learned
+                .lookup(IpAddr::V4(reply.tun_ip), now, state.lease_ttl),
+            Some(peer)
+        );
+        assert_eq!(
+            state.learned.lookup(IpAddr::V6(ip6), now, state.lease_ttl),
+            Some(peer)
+        );
+    }
+
+    #[test]
+    fn encode_control_dispatches_push_and_assign() {
+        let push = RoutePush {
+            routes: vec!["192.168.1.0/24".parse().unwrap()],
+        };
+        assert_eq!(
+            encode_control(&Control::RoutePush(push.clone())),
+            push.encode()
+        );
+        let assign = nat_mode_assign();
+        assert_eq!(
+            encode_control(&Control::Assign(assign.clone())),
+            assign.encode()
+        );
     }
 }

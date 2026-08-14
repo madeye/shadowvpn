@@ -75,12 +75,15 @@
 //! * [`tun_device`] — async TUN interface wrapper (macOS utun + Linux + Windows).
 //! * [`policy`] — client-side policy routing (gfwlist / chinadns split tunnel).
 //! * [`mesh`] — Tailscale-like subnet routing (advertise / approve / accept).
+//! * [`assign`] — node-id keyed tunnel-IP assignment (learning mode).
+//! * [`state`] — private state-file helpers (client identity, server leases).
 //! * [`nat`] — server-side per-client NAT (multiple clients, one shared config).
 //! * [`pool`] — internal-IP allocation pool used by [`nat`].
 //! * `uri` — `shadowvpn://` config import/export + QR codes (feature `uri`).
 
 #![warn(missing_docs)]
 
+pub mod assign;
 pub mod config;
 pub mod crypto;
 pub mod mesh;
@@ -90,6 +93,7 @@ pub mod obfs;
 pub mod policy;
 pub mod pool;
 pub mod protocol;
+pub mod state;
 pub mod tun_device;
 #[cfg(feature = "uri")]
 pub mod uri;

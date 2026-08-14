@@ -55,6 +55,8 @@
   const fObfs = document.getElementById("f-obfs");
 
   const fTunName = document.getElementById("f-tun_name");
+  const fAutoTun = document.getElementById("f-auto_tun");
+  const hintAutoTun = document.getElementById("hint-auto_tun");
   const fTunIp = document.getElementById("f-tun_ip");
   const fTunNetmask = document.getElementById("f-tun_netmask");
   const fPeerIp = document.getElementById("f-peer_ip");
@@ -272,10 +274,22 @@
   // Profile editor
   // ---------------------------------------------------------------------
 
+  function updateAutoTunFields() {
+    const auto = fAutoTun.checked;
+    const tunLabel = fTunIp.closest("label");
+    const peerLabel = fPeerIp.closest("label");
+    if (tunLabel) tunLabel.hidden = auto;
+    if (peerLabel) peerLabel.hidden = auto;
+    fTunIp.required = !auto;
+    fPeerIp.required = !auto;
+    if (hintAutoTun) hintAutoTun.hidden = !auto;
+  }
+
   function clearForm() {
     profileForm.reset();
     fName.readOnly = false;
     updatePolicyFieldsState();
+    updateAutoTunFields();
   }
 
   function populateForm(name, config) {
@@ -293,6 +307,7 @@
     fTunIp.value = config.tun_ip || "";
     fTunNetmask.value = config.tun_netmask || "";
     fPeerIp.value = config.peer_ip || "";
+    fAutoTun.checked = !config.tun_ip && !config.peer_ip;
     fMtu.value = config.mtu != null ? String(config.mtu) : "";
 
     fMode.value = config.mode || "";
@@ -319,6 +334,7 @@
     fCacheFile.value = config.cache_file || "";
 
     updatePolicyFieldsState();
+    updateAutoTunFields();
   }
 
   async function selectProfile(name) {
@@ -524,6 +540,7 @@
   }
 
   fMode.addEventListener("change", updatePolicyFieldsState);
+  fAutoTun.addEventListener("change", updateAutoTunFields);
   [fGfwlist, fChnroute, fGeoip].forEach((input) => {
     input.addEventListener("input", updatePathHints);
   });
@@ -557,14 +574,15 @@
         config[key] = editorBase[key];
       }
     }
+    const autoTun = fAutoTun.checked;
     Object.assign(config, {
       server: strOrUndef(fServer),
       password: strOrUndef(fPassword),
       cipher: strOrUndef(fCipher),
       tun_name: strOrUndef(fTunName),
-      tun_ip: strOrUndef(fTunIp),
+      tun_ip: autoTun ? undefined : strOrUndef(fTunIp),
       tun_netmask: strOrUndef(fTunNetmask),
-      peer_ip: strOrUndef(fPeerIp),
+      peer_ip: autoTun ? undefined : strOrUndef(fPeerIp),
       mtu: intOrUndef(fMtu),
       obfs: strOrUndef(fObfs),
       mode: strOrUndef(fMode),
@@ -914,6 +932,7 @@
     initPrivileges();
     refreshBundledPaths();
     updatePolicyFieldsState();
+    updateAutoTunFields();
     loadProfiles();
     pollStatus();
     setInterval(pollStatus, STATUS_POLL_MS);

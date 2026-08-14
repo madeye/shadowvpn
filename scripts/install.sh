@@ -11,10 +11,10 @@
 #   --service    also install the service definition (systemd unit / launchd
 #                plist) from the release package — installed, not enabled
 #   --setup      server on Linux only: full working setup — write a real config
-#                (random password, NAT enabled), install the systemd unit with
-#                the detected WAN interface, enable + start the service, open
-#                the UDP port in ufw/firewalld, and print the matching client
-#                config
+#                (random password, learning mode + auto-assign), install the
+#                systemd unit with the detected WAN interface, enable + start
+#                the service, open the UDP port in ufw/firewalld, and print
+#                the matching client config (no tun_ip/peer_ip)
 #   --port N     with --setup: UDP port to listen on (default 8388)
 #   --obfs MODE  with --setup: obfs mode none|quic|base64 (default none;
 #                both ends must match)
@@ -47,10 +47,10 @@ usage: install.sh <server|client> [--service]
   --service    also install the service definition (systemd unit / launchd
                plist) from the release package — installed, not enabled
   --setup      server on Linux only: full working setup — write a real config
-               (random password, NAT enabled), install the systemd unit with
-               the detected WAN interface, enable + start the service, open
-               the UDP port in ufw/firewalld, and print the matching client
-               config
+               (random password, learning mode + auto-assign), install the
+               systemd unit with the detected WAN interface, enable + start
+               the service, open the UDP port in ufw/firewalld, and print
+               the matching client config (no tun_ip/peer_ip)
   --port N     with --setup: UDP port to listen on (default 8388)
   --obfs MODE  with --setup: obfs mode none|quic|base64 (default none;
                both ends must match)
@@ -220,14 +220,13 @@ if [ "$SETUP" = 0 ] && [ "$IS_ROOT" = 1 ] && [ ! -f "$ETC_DIR/$ROLE.json" ]; the
 }
 EOF
   else
+    # learning-mode example: omit tun_ip/peer_ip so the server auto-assigns.
     cat > "$ETC_DIR/client.json" <<'EOF'
 {
   "server": "vpn.example.com:8388",
   "password": "CHANGE-ME",
   "cipher": "chacha20-poly1305",
-  "tun_ip": "10.9.0.2",
   "tun_netmask": "255.255.255.0",
-  "peer_ip": "10.9.0.1",
   "mtu": 1400
 }
 EOF
@@ -256,7 +255,7 @@ if [ "$SETUP" = 1 ]; then
     else
       PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '\n')
     fi
-    say "writing $CFG (port $PORT/udp, obfs $OBFS, NAT on, random password)"
+    say "writing $CFG (port $PORT/udp, obfs $OBFS, learning mode, random password)"
     mkdir -p "$ETC_DIR"
     {
       echo '{'
@@ -265,10 +264,15 @@ if [ "$SETUP" = 1 ]; then
       echo '  "cipher": "chacha20-poly1305",'
       echo '  "tun_ip": "10.9.0.1",'
       echo '  "tun_netmask": "255.255.255.0",'
+      # peer_ip .2 is reserved (legacy static slot) so the assigner never
+      # hands it to an auto client.
       echo '  "peer_ip": "10.9.0.2",'
-      echo '  "mtu": 1400,'
-      if [ "$OBFS" != none ]; then echo "  \"obfs\": \"$OBFS\","; fi
-      echo '  "nat": true'
+      if [ "$OBFS" != none ]; then
+        echo '  "mtu": 1400,'
+        echo "  \"obfs\": \"$OBFS\""
+      else
+        echo '  "mtu": 1400'
+      fi
       echo '}'
     } > "$CFG"
     chmod 600 "$CFG"
@@ -281,10 +285,18 @@ if [ "$SETUP" = 1 ]; then
   CIPHER=$(json_str "$CFG" cipher);   CIPHER="${CIPHER:-chacha20-poly1305}"
   OBFS=$(json_str "$CFG" obfs);       OBFS="${OBFS:-none}"
   TUN_IP=$(json_str "$CFG" tun_ip);   TUN_IP="${TUN_IP:-10.9.0.1}"
-  PEER_IP=$(json_str "$CFG" peer_ip); PEER_IP="${PEER_IP:-10.9.0.2}"
   MTU=$(json_num "$CFG" mtu);         MTU="${MTU:-1400}"
   SUBNET="${TUN_IP%.*}.0/24"
   [ "$PASSWORD" = CHANGE-ME ] && warn "$CFG still has the CHANGE-ME password — edit it before real use"
+
+  # Previous --setup wrote "nat": true and we never overwrite. json_str only
+  # reads quoted strings, so grep the boolean.
+  NAT_ON=0
+  if grep -Eq '"nat"[[:space:]]*:[[:space:]]*true' "$CFG"; then
+    NAT_ON=1
+    PEER_IP=$(json_str "$CFG" peer_ip); PEER_IP="${PEER_IP:-10.9.0.2}"
+    warn "$CFG has \"nat\": true — auto-assign clients get NatMode (fatal); drop \"nat\" for learning + auto-assign, or use the static snippet below"
+  fi
 
   # systemd unit: patch the WAN interface / tunnel subnet / binary path, enable.
   UNIT_SRC="$PKG/systemd/shadowvpn-server.service"
@@ -333,14 +345,22 @@ if [ "$SETUP" = 1 ]; then
   echo "IMPORTANT: also open UDP $PORT in your cloud firewall / security group"
   echo "(DigitalOcean, AWS, GCP, ...) — the host firewall alone is not enough."
   echo
-  echo "matching client config (NAT is on: any number of clients can share it):"
+  if [ "$NAT_ON" = 1 ]; then
+    echo "matching client config (NAT is on: static tun_ip/peer_ip; drop \"nat\" from $CFG for auto-assign):"
+  else
+    echo "matching client config (no tun_ip/peer_ip: the server auto-assigns):"
+  fi
   echo '  {'
   echo "    \"server\": \"$PUB_IP:$PORT\","
   echo "    \"password\": \"$PASSWORD\","
   echo "    \"cipher\": \"$CIPHER\","
-  echo "    \"tun_ip\": \"$PEER_IP\","
+  if [ "$NAT_ON" = 1 ]; then
+    echo "    \"tun_ip\": \"$PEER_IP\","
+  fi
   echo '    "tun_netmask": "255.255.255.0",'
-  echo "    \"peer_ip\": \"$TUN_IP\","
+  if [ "$NAT_ON" = 1 ]; then
+    echo "    \"peer_ip\": \"$TUN_IP\","
+  fi
   if [ "$OBFS" != none ]; then
     echo "    \"mtu\": $MTU,"
     echo "    \"obfs\": \"$OBFS\""

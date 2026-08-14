@@ -91,6 +91,14 @@
                 <input id="f-tun_name" type="text" placeholder="auto" />
               </label>
 
+              <label class="checkbox-label">
+                <input id="f-auto_tun" type="checkbox" />
+                Automatic tunnel IP (server assigns)
+              </label>
+              <small class="field-hint" id="hint-auto_tun" hidden>
+                tun_ip and peer_ip are omitted. Identity lives in a sibling .state file, not in this profile.
+              </small>
+
               <label>
                 TUN IP
                 <input id="f-tun_ip" type="text" placeholder="10.7.0.2" required />

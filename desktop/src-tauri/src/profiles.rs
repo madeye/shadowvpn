@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 use crate::settings;
 
-/// EXACT mirror of `shadowvpn::config::FileConfig` (all 21 client+server
-/// fields), same `deny_unknown_fields` + per-field `skip_serializing_if`.
+/// EXACT mirror of `shadowvpn::config::FileConfig` keys, same
+/// `deny_unknown_fields` + per-field `skip_serializing_if`.
+/// `node_id` is not a FileConfig key and must never appear here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
@@ -39,6 +40,16 @@ pub struct ProfileConfig {
     pub nat: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign_pool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_ips: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign_ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,7 +162,10 @@ pub fn delete_profile(app: tauri::AppHandle, name: String) -> Result<(), String>
     }
 
     let path = paths::profile_path(&app, &name)?;
-    std::fs::remove_file(&path).map_err(|e| format!("profile '{name}' not found: {e}"))
+    std::fs::remove_file(&path).map_err(|e| format!("profile '{name}' not found: {e}"))?;
+    // Sibling `.state` holds `node_id`; leaving it would hand a later
+    // same-named profile this node's assigned IP.
+    unlink_profile_state(&path)
 }
 
 /// Data files the client can auto-discover next to its own binary; these mirror
@@ -197,20 +211,23 @@ fn validate_config(config: &ProfileConfig, bundled: BundledData) -> Result<(), S
     }
 
     let tun_ip = config.tun_ip.as_deref().unwrap_or("");
-    if tun_ip.is_empty() {
-        return Err("tun_ip is required".to_string());
+    let peer_ip = config.peer_ip.as_deref().unwrap_or("");
+    match (tun_ip.is_empty(), peer_ip.is_empty()) {
+        (true, true) => {}
+        (false, false) => {
+            parse_ipv4("tun_ip", tun_ip)?;
+            parse_ipv4("peer_ip", peer_ip)?;
+        }
+        _ => {
+            return Err(
+                "tun_ip and peer_ip must both be set, or both omitted for auto-assign".to_string(),
+            );
+        }
     }
-    parse_ipv4("tun_ip", tun_ip)?;
 
     if let Some(mask) = config.tun_netmask.as_deref().filter(|s| !s.is_empty()) {
         parse_ipv4("tun_netmask", mask)?;
     }
-
-    let peer_ip = config.peer_ip.as_deref().unwrap_or("");
-    if peer_ip.is_empty() {
-        return Err("peer_ip is required".to_string());
-    }
-    parse_ipv4("peer_ip", peer_ip)?;
 
     if let Some(cipher) = config.cipher.as_deref() {
         if !["aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"].contains(&cipher) {
@@ -257,4 +274,128 @@ fn parse_ipv4(field: &str, s: &str) -> Result<(), String> {
     s.parse::<std::net::Ipv4Addr>()
         .map(|_| ())
         .map_err(|_| format!("invalid ipv4 address for {field}: '{s}'"))
+}
+
+/// `<profile>.json` → `<profile>.json.state` (CLI default for `-c <profile>`).
+fn profile_state_path(profile_json: &std::path::Path) -> std::path::PathBuf {
+    let mut s = profile_json.as_os_str().to_os_string();
+    s.push(".state");
+    std::path::PathBuf::from(s)
+}
+
+fn unlink_profile_state(profile_json: &std::path::Path) -> Result<(), String> {
+    let state = profile_state_path(profile_json);
+    match std::fs::remove_file(&state) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "cannot remove assignment state {}: {e}",
+            state.display()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_base() -> ProfileConfig {
+        ProfileConfig {
+            server: Some("vpn.example.com:8388".into()),
+            password: Some("pw".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn both_omitted_is_auto_assign() {
+        validate_config(&ok_base(), BundledData::default()).unwrap();
+    }
+
+    #[test]
+    fn both_set_is_static() {
+        let mut c = ok_base();
+        c.tun_ip = Some("10.9.0.2".into());
+        c.peer_ip = Some("10.9.0.1".into());
+        validate_config(&c, BundledData::default()).unwrap();
+    }
+
+    #[test]
+    fn only_tun_ip_is_invalid() {
+        let mut c = ok_base();
+        c.tun_ip = Some("10.9.0.2".into());
+        let err = validate_config(&c, BundledData::default()).unwrap_err();
+        assert!(err.contains("both be set, or both omitted"));
+    }
+
+    #[test]
+    fn only_peer_ip_is_invalid() {
+        let mut c = ok_base();
+        c.peer_ip = Some("10.9.0.1".into());
+        let err = validate_config(&c, BundledData::default()).unwrap_err();
+        assert!(err.contains("both be set, or both omitted"));
+    }
+
+    #[test]
+    fn profile_state_path_is_json_dot_state() {
+        let p = std::path::Path::new("/tmp/profiles/home.json");
+        assert_eq!(
+            profile_state_path(p),
+            std::path::PathBuf::from("/tmp/profiles/home.json.state")
+        );
+    }
+
+    #[test]
+    fn unlink_profile_state_ignores_missing() {
+        let p = std::env::temp_dir().join("shadowvpn-desktop-missing-profile.json");
+        unlink_profile_state(&p).unwrap();
+    }
+
+    #[test]
+    fn unlink_profile_state_removes_sibling() {
+        let json = std::env::temp_dir().join(format!(
+            "shadowvpn-desktop-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = profile_state_path(&json);
+        std::fs::write(&state, b"{}").unwrap();
+        unlink_profile_state(&json).unwrap();
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn new_fileconfig_keys_round_trip() {
+        let json = r#"{
+            "server": "vpn.example.com:8388",
+            "password": "pw",
+            "assign_pool": "10.9.0.0/24",
+            "reserved_ips": ["10.9.0.2"],
+            "assign_ttl_secs": 604800,
+            "lease_file": "-",
+            "state_file": "/tmp/custom.state"
+        }"#;
+        let cfg: ProfileConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.assign_pool.as_deref(), Some("10.9.0.0/24"));
+        assert_eq!(
+            cfg.reserved_ips.as_deref(),
+            Some(["10.9.0.2".to_string()].as_slice())
+        );
+        assert_eq!(cfg.assign_ttl_secs, Some(604800));
+        assert_eq!(cfg.lease_file.as_deref(), Some("-"));
+        assert_eq!(cfg.state_file.as_deref(), Some("/tmp/custom.state"));
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert!(back.get("node_id").is_none());
+    }
+
+    #[test]
+    fn node_id_is_rejected() {
+        let json =
+            r#"{"server":"h:1","password":"pw","node_id":"c0ffee00-0000-4000-8000-000000000001"}"#;
+        let err = serde_json::from_str::<ProfileConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field `node_id`"));
+    }
 }

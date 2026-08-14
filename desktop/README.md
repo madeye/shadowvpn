@@ -102,7 +102,8 @@ Linux/Windows they can differ):
 
 | Path | Contents |
 |---|---|
-| `<app-config-dir>/profiles/<name>.json` | One file per profile. **The file is itself a valid `shadowvpn-client --config` file** — only `FileConfig` keys, `deny_unknown_fields`, present-only keys. The profile name lives only in the filename. |
+| `<app-config-dir>/profiles/<name>.json` | One file per profile. **The file is itself a valid `shadowvpn-client --config` file** — only `FileConfig` keys, `deny_unknown_fields`, present-only keys. The profile name lives only in the filename. Omitting both `tun_ip` and `peer_ip` is valid (server auto-assigns). `node_id` is never stored here. |
+| `<app-config-dir>/profiles/<name>.json.state` | Client assignment cache (`node_id` + last IP). Written by `shadowvpn-client` when the helper runs `-c <profile>` (the CLI default path). **Not** copied by Duplicate / save-as-new-name. `delete_profile` unlinks this sibling along with the JSON. |
 | `<app-config-dir>/settings.json` | `{"client_bin": "/path/to/shadowvpn-client"}` — see [Client binary resolution](#client-binary-resolution). |
 | `<app-data-dir>/runs/shadowvpn.log` | stderr+stdout of the current/last client run (this is what the Log pane tails). |
 | `<app-data-dir>/runs/shadowvpn.log.out` | Windows only: `Start-Process` can't redirect stdout and stderr to the same file, so stdout lands here (normally empty — the client logs to stderr). |
@@ -114,6 +115,17 @@ On macOS these resolve under
 `~/.config/io.github.madeye.shadowvpn.desktop/` (config) and
 `~/.local/share/io.github.madeye.shadowvpn.desktop/` (data); on Windows, both
 under `%APPDATA%\io.github.madeye.shadowvpn.desktop\`.
+
+The profile editor has an **Automatic tunnel IP** checkbox that hides `tun_ip`
+and `peer_ip` and saves both omitted, so one shared profile (or URI) can be
+used on many machines. Identity is **not** cloned by Duplicate or by saving
+under a new name — only the JSON is written; the next connect creates a new
+`.state` / `node_id`. Deleting a profile also deletes its sibling `.state`.
+There is no rename command. The helper still launches `shadowvpn-client -c
+<profile>` with no `--state-file`; the client then uses that default sibling
+path. New optional `FileConfig` keys (`assign_pool`, `reserved_ips`,
+`assign_ttl_secs`, `lease_file`, `state_file`) are accepted so a URI or
+hand-edited profile is not rejected by `deny_unknown_fields`.
 
 ### Import / export via `shadowvpn://` URI
 

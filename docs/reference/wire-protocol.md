@@ -62,6 +62,82 @@ keepalives are still accepted and treated as refresh-only).
 The interval is 15 seconds by default (`keepalive_secs` /
 `--keepalive-secs`) — keep it below the path's UDP NAT timeout.
 
+[Auto-assign](/guide/auto-assign) clients replace this 5-byte keepalive with
+an `AssignRequest` (type `0x03`) on the same interval. Static clients are
+unchanged.
+
+## Control channel
+
+Control messages share the tunnel's plaintext channel with IP packets. Every
+control payload starts with a `0x00` byte — an IP packet's first nibble is
+its version (4 or 6), so the two can never collide. Typed messages are
+**not** 1 or 5 bytes (those lengths stay keepalives). Unknown types and
+wrong lengths return `None` and are dropped, so old and new peers
+interoperate.
+
+```text
+keepalive   : 00                      (legacy, 1 byte)
+keepalive   : 00 ip4[4]               (legacy, 5 bytes)
+route advert: 00 01 flags ip4[4] ip6[16] count { family plen addr[4|16] }*
+route push  : 00 02 00    count { family plen addr[4|16] }*
+assign req  : 00 03 flags node[16] hint4[4] hint6[16]     (39 bytes)
+assign      : 00 04 status ip4[4] mask[4] peer[4] ip6[16] plen6 flags ttl[4]
+                                                              (37 bytes)
+```
+
+### `AssignRequest` — 39 bytes, type `0x03`
+
+| Offset | Len | Field |
+|--------|-----|-------|
+| 0 | 1 | `0x00` marker |
+| 1 | 1 | type `0x03` |
+| 2 | 1 | `flags` (bit 0 = want IPv6; other bits 0) |
+| 3 | 16 | `node_id` (persisted locally; not in the URI/QR) |
+| 19 | 4 | `hint_ip4` (`0.0.0.0` = no hint) |
+| 23 | 16 | `hint_ip6` (`::` = none) |
+
+### `Assign` — 37 bytes, type `0x04`
+
+| Offset | Len | Field |
+|--------|-----|-------|
+| 0 | 1 | `0x00` marker |
+| 1 | 1 | type `0x04` |
+| 2 | 1 | `status` (`0` Ok, `1` Exhausted, `2` NatMode) |
+| 3 | 4 | assigned `tun_ip` |
+| 7 | 4 | netmask (server TUN netmask, not the pool mask) |
+| 11 | 4 | `peer_ip` (server TUN IPv4) |
+| 15 | 16 | `tun_ip6` (`::` if none) |
+| 31 | 1 | `plen6` (`0` means no IPv6) |
+| 32 | 1 | `flags` (v1: must be 0) |
+| 33 | 4 | `ttl_secs` (u32be; client logs only) |
+
+Parse requires **exact** length — 36- or 38-byte replies are dropped. A
+5-byte payload whose second byte happens to be `0x03` or `0x04` is still a
+keepalive.
+
+Hex example of an Ok reply: assigned `10.9.0.37/24`, peer `10.9.0.1`, IPv6
+`fd07:7::a09:25`/64 (the IPv4 embedded in octets `[12..16]` of
+`fd07:7::/64`), flags 0, ttl 604800:
+
+```
+00 04 00
+0a 09 00 25
+ff ff ff 00
+0a 09 00 01
+fd 07 00 07 00 00 00 00 00 00 00 00 0a 09 00 25
+40
+00
+00 09 3a 80
+```
+
+Status ≠ Ok uses the same 37-byte layout with zeroed addresses; the client
+must not program them. There is no `Conflict` status — a taken hint is
+skipped and the server still returns Ok with a different address (or
+Exhausted).
+
+Route advert / push are documented in the
+[mesh routing guide](/guide/mesh-routing#wire-format).
+
 ## Optional carrier obfuscation
 
 The `salt ++ AEAD` envelope can optionally be wrapped in a cosmetic carrier —

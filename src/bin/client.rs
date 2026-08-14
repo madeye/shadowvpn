@@ -16,15 +16,9 @@
 //!
 //! # Keepalive
 //!
-//! The client also runs a lightweight keepalive: it periodically encrypts and
-//! sends a tiny dummy packet so that (a) a stateful NAT/firewall on the path
-//! keeps the UDP mapping open, and (b) the server learns the client's current
-//! source address even before the client sends any real traffic. We send a
-//! 5-byte plaintext (`0x00` marker + our 4-byte tunnel IP, see
-//! [`keepalive_payload`]); a real IP packet is always larger than this, and
-//! the server is expected to drop sub-IP-header datagrams, so the keepalive is
-//! harmless if it ever reaches the TUN-write path. (This is a ShadowVPN
-//! convention, not part of the shadowsocks wire spec.)
+//! Static clients send a 5-byte plaintext (`0x00` + tunnel IPv4) or a mesh
+//! `RouteAdvert`. Auto-assign clients send `AssignRequest` instead (it carries
+//! `node_id`); mesh adds a `RouteAdvert` as a second datagram on the same tick.
 //!
 //! # Routing (NOT done automatically)
 //!
@@ -34,21 +28,26 @@
 //! traffic through the tunnel. See [`print_routing_hint`].
 
 use std::net::Ipv4Addr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
+use ipnetwork::Ipv6Network;
 use log::{debug, info, warn};
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
-use shadowvpn::mesh::{self, RouteAdvert, RouteInstaller};
+use shadowvpn::mesh::{self, Assign, AssignStatus, RouteInstaller};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
-use shadowvpn::tun_device::TunDevice;
+use shadowvpn::state::{default_client_state_path, write_private};
+use shadowvpn::tun_device::{SubnetRouteGuard, TunDevice};
 
 /// Depth of the hand-off channel between each relay loop's I/O reader and its
 /// processor (see the server for the rationale). Bounded for backpressure.
@@ -58,6 +57,15 @@ const CHANNEL_DEPTH: usize = 1024;
 /// surface back-to-back, and without a breather a condition that persists for
 /// a few seconds would spin the receive loop.
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// How often to resend `AssignRequest` until the first Ok.
+const ASSIGN_RETRY: Duration = Duration::from_secs(1);
+
+/// Fatal if the server never answers (old server or lost replies).
+const ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shared slot so `run` can drop/recreate the installer when the assigned IPv4 changes.
+type InstallerSlot = Arc<Mutex<Option<Arc<RouteInstaller>>>>;
 
 /// Plaintext payload of a keepalive datagram: a `0x00` marker byte followed by
 /// the client's 4-byte tunnel IP. At 5 bytes it is smaller than any real IP
@@ -96,10 +104,10 @@ async fn main() -> Result<()> {
 
 /// Bring up the TUN device + UDP socket and drive the two relay loops until one
 /// of them fails (or the process is signalled).
-async fn run(cfg: ClientConfig) -> Result<()> {
+async fn run(mut cfg: ClientConfig) -> Result<()> {
     // The master key length is guaranteed to match the cipher by `resolve()`.
     let cipher = cfg.cipher;
-    let master_key: Arc<[u8]> = Arc::from(cfg.master_key.into_boxed_slice());
+    let master_key: Arc<[u8]> = Arc::from(cfg.master_key.as_slice());
 
     // Carrier obfuscation, matching the server. When enabled, every datagram is
     // wrapped on send and unwrapped on recv; `None` is the plain envelope. Both
@@ -161,14 +169,47 @@ async fn run(cfg: ClientConfig) -> Result<()> {
     info!("UDP socket {local_addr} connected to server {}", cfg.server);
     let socket = Arc::new(socket);
 
+    // --- Identity / cache (auto only; want_ip6 is already frozen) -----------
+    let state_path = cfg
+        .state_file
+        .clone()
+        .unwrap_or_else(|| default_client_state_path(None, &cfg.server));
+    let node_id = if cfg.auto_tun {
+        let (id, last) = load_or_create_state(&state_path, &cfg.server);
+        if let Some(last) = last {
+            cfg.overlay_cached_assignment(
+                last.tun_ip,
+                last.tun_netmask,
+                last.peer_ip,
+                last.tun_ip6,
+            );
+        }
+        id
+    } else {
+        [0u8; 16]
+    };
+
     // --- TUN device ---------------------------------------------------------
-    let tun = TunDevice::create(&cfg.tun).with_context(|| {
-        format!(
+    // Auto always uses unaddressed+apply so Windows never gets a default route.
+    let tun = if cfg.auto_tun {
+        let tun = TunDevice::create_unaddressed(cfg.tun.name.as_deref(), cfg.tun.mtu).context(
             "failed to create TUN device (need root/elevated privileges); \
-             requested ip={} peer={} mtu={}",
-            cfg.tun.ip, cfg.tun.peer_ip, cfg.tun.mtu
-        )
-    })?;
+                 auto-assign (no IPv4 yet)",
+        )?;
+        if !cfg.tun.ip.is_unspecified() {
+            tun.apply_assignment(cfg.tun.ip, cfg.tun.netmask, cfg.tun.peer_ip, cfg.tun.ip6)
+                .context("failed to apply cached tunnel assignment")?;
+        }
+        tun
+    } else {
+        TunDevice::create(&cfg.tun).with_context(|| {
+            format!(
+                "failed to create TUN device (need root/elevated privileges); \
+                 requested ip={} peer={} mtu={}",
+                cfg.tun.ip, cfg.tun.peer_ip, cfg.tun.mtu
+            )
+        })?
+    };
     let tun = Arc::new(tun);
 
     let iface_name = tun.name().unwrap_or_else(|_| {
@@ -177,44 +218,18 @@ async fn run(cfg: ClientConfig) -> Result<()> {
             .clone()
             .unwrap_or_else(|| "<unknown>".to_string())
     });
-    info!(
-        "TUN up: iface={iface_name} ip={} peer={} netmask={} mtu={}",
-        cfg.tun.ip, cfg.tun.peer_ip, cfg.tun.netmask, cfg.tun.mtu
-    );
-
-    // --- Policy routing (optional) -----------------------------------------
-    // In `gfwlist`/`chinadns` mode the client runs a split-DNS proxy and
-    // programs per-destination routes into the tun (user-mode, via the OS
-    // routing socket) so that only selected destinations go through the tunnel.
-    // In `full` mode (the default) we touch nothing and just print the manual
-    // routing hint, preserving the historical behavior.
-    let mut policy_handle = if cfg.policy.mode.is_enabled() {
+    if cfg.auto_tun && cfg.tun.ip.is_unspecified() {
         info!(
-            "policy routing mode = {}; only matched destinations are tunneled",
-            cfg.policy.mode.name()
+            "TUN up: iface={iface_name} mtu={} (waiting for assignment)",
+            cfg.tun.mtu
         );
-        Some(
-            shadowvpn::policy::spawn(
-                &cfg.policy,
-                &iface_name,
-                cfg.tun.ip,
-                server_addr.ip(),
-                direct_src,
-            )
-            .await
-            .context("failed to start policy routing")?,
-        )
     } else {
-        // Tell the user how to actually route traffic through the tunnel; in
-        // full mode we never mutate the routing table ourselves.
-        print_routing_hint(&cfg.tun, &cfg.server);
-        None
-    };
+        info!(
+            "TUN up: iface={iface_name} ip={} peer={} netmask={} mtu={}",
+            cfg.tun.ip, cfg.tun.peer_ip, cfg.tun.netmask, cfg.tun.mtu
+        );
+    }
 
-    // --- Mesh subnet routing (Tailscale-like) ------------------------------
-    // Advertised routes ride the keepalive tick; accepted routes are pushed
-    // back by the server and installed onto the tun by the RouteInstaller.
-    let mesh_active = cfg.accept_routes || !cfg.advertise_routes.is_empty();
     if !cfg.advertise_routes.is_empty() {
         info!(
             "advertising subnet routes to the server: {}",
@@ -225,90 +240,167 @@ async fn run(cfg: ClientConfig) -> Result<()> {
                 .join(", ")
         );
     }
-    let route_installer = if cfg.accept_routes {
+    if cfg.accept_routes {
         info!("accepting subnet routes pushed by the server");
-        Some(Arc::new(
-            RouteInstaller::new(&iface_name, cfg.tun.ip, server_addr.ip())
-                .context("setting up the mesh route installer")?,
-        ))
+    }
+
+    // Policy / RouteInstaller store an immutable tun_ip: only build once IPv4
+    // is known (a cache counts). Recreated below if the server hands out a new IP.
+    let mut policy_handle = None;
+    let installer_slot: InstallerSlot = Arc::new(Mutex::new(None));
+    let mut _route_guard = None;
+    let mut subnet_guard = None;
+    let mut hinted_routing = false;
+
+    if !cfg.tun.ip.is_unspecified() {
+        start_policy_and_installer(
+            &cfg,
+            &iface_name,
+            server_addr.ip(),
+            direct_src,
+            &mut policy_handle,
+            &installer_slot,
+            &mut _route_guard,
+        )
+        .await?;
+        if cfg.auto_tun {
+            let mut guard =
+                SubnetRouteGuard::new(&iface_name).context("setting up the TUN subnet route")?;
+            guard
+                .apply(cfg.tun.ip, cfg.tun.netmask, cfg.tun.ip6)
+                .context("installing cached TUN subnet route")?;
+            subnet_guard = Some(guard);
+        }
+        if !cfg.policy.mode.is_enabled() {
+            print_routing_hint(&cfg.tun, &cfg.server);
+            hinted_routing = true;
+        }
+    }
+
+    // Auto: drop every TUN read (including IPv6 NS) until Assign Ok.
+    let assigned_ok = Arc::new(AtomicBool::new(!cfg.auto_tun));
+    let (assign_tx, mut assign_rx) = mpsc::channel::<Assign>(8);
+
+    // --- Relay + keepalive tasks -------------------------------------------
+    let mut up = tokio::spawn(tun_to_net(
+        Arc::clone(&tun),
+        Arc::clone(&socket),
+        cipher,
+        Arc::clone(&master_key),
+        obfuscator.clone(),
+        Arc::clone(&assigned_ok),
+    ));
+
+    let mut down = tokio::spawn(net_to_tun(
+        Arc::clone(&tun),
+        Arc::clone(&socket),
+        cipher,
+        Arc::clone(&master_key),
+        obfuscator.clone(),
+        Arc::clone(&installer_slot),
+        cfg.auto_tun.then_some(assign_tx),
+    ));
+
+    // Static clients keep the 5-byte keepalive / RouteAdvert tick.
+    let mut keepalive = if cfg.auto_tun {
+        None
+    } else {
+        let periodic_payload: Vec<u8> = if cfg.mesh_active() {
+            cfg.route_advert().encode()
+        } else {
+            keepalive_payload(cfg.tun.ip).to_vec()
+        };
+        Some(tokio::spawn(keepalive_loop(
+            Arc::clone(&socket),
+            cipher,
+            Arc::clone(&master_key),
+            obfuscator.clone(),
+            cfg.keepalive,
+            periodic_payload,
+        )))
+    };
+
+    let mut assign_retry = if cfg.auto_tun {
+        let mut ticker = tokio::time::interval(ASSIGN_RETRY);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(ticker)
     } else {
         None
     };
-    // Cleanup guard: removes installed routes when `run` returns, even though
-    // the net->tun task keeps its own reference to the installer.
-    let _route_guard = route_installer.clone().map(mesh::InstallerGuard::new);
+    let assign_deadline = Instant::now() + ASSIGN_TIMEOUT;
+    let mut keep_tick: Option<tokio::time::Interval> = None;
+    let mut got_ok = !cfg.auto_tun;
 
-    // The periodic datagram: a plain keepalive, or a route advert (which the
-    // server also treats as a keepalive) once mesh routing is in play.
-    let periodic_payload: Vec<u8> = if mesh_active {
-        RouteAdvert {
-            tunnel_ip: cfg.tun.ip,
-            tunnel_ip6: cfg.tun.ip6.map(|net| net.ip()),
-            accept_routes: cfg.accept_routes,
-            routes: cfg.advertise_routes.clone(),
+    loop {
+        // Process Assign outside `select` so we can drop/respawn `policy_handle`.
+        let mut pending_assign: Option<Assign> = None;
+        tokio::select! {
+            r = &mut up => return propagate("tun->net", r),
+            r = &mut down => return propagate("net->tun", r),
+            r = join_opt(&mut keepalive) => return propagate("keepalive", r),
+            r = policy_task_result(&mut policy_handle) => return r,
+            _ = shutdown_signal() => {
+                info!("received shutdown signal; shutting down");
+                return Ok(());
+            }
+            reply = assign_rx.recv(), if cfg.auto_tun => {
+                pending_assign = Some(reply.context("assignment channel closed")?);
+            }
+            _ = tick_opt(&mut assign_retry), if !got_ok => {
+                if Instant::now() >= assign_deadline {
+                    bail!(
+                        "server did not assign an IP; set a static tun_ip or upgrade the server"
+                    );
+                }
+                send_control(
+                    socket.as_ref(),
+                    cipher,
+                    master_key.as_ref(),
+                    obfuscator.as_deref(),
+                    &cfg.assign_request(node_id),
+                )
+                .await?;
+            }
+            _ = tick_opt(&mut keep_tick) => {
+                // After Ok, AssignRequest *is* the keepalive (carries node_id).
+                for payload in cfg.auto_tick_payloads(node_id) {
+                    send_control(
+                        socket.as_ref(),
+                        cipher,
+                        master_key.as_ref(),
+                        obfuscator.as_deref(),
+                        &payload,
+                    )
+                    .await?;
+                }
+            }
         }
-        .encode()
-    } else {
-        keepalive_payload(cfg.tun.ip).to_vec()
-    };
-
-    // --- Relay + keepalive tasks -------------------------------------------
-    // Loop A: TUN -> net (read IP packet, encrypt, send UDP).
-    let up = tokio::spawn(tun_to_net(
-        Arc::clone(&tun),
-        Arc::clone(&socket),
-        cipher,
-        Arc::clone(&master_key),
-        obfuscator.clone(),
-    ));
-
-    // Loop B: net -> TUN (recv UDP, decrypt, write IP packet).
-    let down = tokio::spawn(net_to_tun(
-        Arc::clone(&tun),
-        Arc::clone(&socket),
-        cipher,
-        Arc::clone(&master_key),
-        obfuscator.clone(),
-        route_installer,
-    ));
-
-    // Keepalive: periodic tiny encrypted datagram so the server learns/refreshes
-    // our address and NAT mappings stay open (and mesh adverts stay fresh).
-    let keepalive = tokio::spawn(keepalive_loop(
-        Arc::clone(&socket),
-        cipher,
-        Arc::clone(&master_key),
-        obfuscator.clone(),
-        cfg.keepalive,
-        periodic_payload,
-    ));
-
-    // The DNS-proxy task, when policy routing is active. When it is not (or on
-    // non-Linux), this future stays pending forever so it never wins the select.
-    // Keeping `policy_handle` owned here also keeps the teardown guard alive for
-    // the lifetime of the client.
-    let policy_fut = async {
-        if let Some(handle) = policy_handle.as_mut() {
-            return match (&mut handle.task).await {
-                Ok(inner) => inner.context("DNS proxy loop failed"),
-                Err(join) => Err(anyhow::Error::new(join).context("DNS proxy task panicked")),
-            };
+        if let Some(reply) = pending_assign {
+            handle_assign_reply(
+                reply,
+                &mut cfg,
+                &tun,
+                &iface_name,
+                server_addr.ip(),
+                direct_src,
+                &state_path,
+                node_id,
+                &assigned_ok,
+                &mut got_ok,
+                &mut assign_retry,
+                &mut keep_tick,
+                &mut policy_handle,
+                &installer_slot,
+                &mut _route_guard,
+                &mut subnet_guard,
+                &mut hinted_routing,
+                socket.as_ref(),
+                cipher,
+                master_key.as_ref(),
+                obfuscator.as_deref(),
+            )
+            .await?;
         }
-        std::future::pending::<Result<()>>().await
-    };
-    tokio::pin!(policy_fut);
-
-    // Whichever arm fires first ends the client (a returning relay loop means a
-    // fatal IO error; the keepalive loop only returns on a fatal send error; the
-    // policy loop only returns on a fatal DNS-proxy error; a signal is a clean
-    // shutdown request). Exiting gracefully drops the policy handle, whose guards
-    // restore the system DNS, remove the tunnel routes, and save the cache.
-    tokio::select! {
-        r = up => propagate("tun->net", r),
-        r = down => propagate("net->tun", r),
-        r = keepalive => propagate("keepalive", r),
-        r = &mut policy_fut => r,
-        _ = shutdown_signal() => { info!("received shutdown signal; shutting down"); Ok(()) }
     }
 }
 
@@ -401,6 +493,7 @@ async fn tun_to_net(
     cipher: Cipher,
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
+    assigned_ok: Arc<AtomicBool>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
@@ -414,6 +507,11 @@ async fn tun_to_net(
                 .await
                 .context("failed to read from TUN device")?;
             if n == 0 {
+                continue;
+            }
+            // Unaddressed / cached-but-unconfirmed TUN still emits IPv6 NS.
+            if !assigned_ok.load(Ordering::Acquire) {
+                debug!("dropping {n}-byte TUN packet until Assign Ok");
                 continue;
             }
             if tx.send(buf[..n].to_vec()).await.is_err() {
@@ -494,7 +592,8 @@ async fn net_to_tun(
     cipher: Cipher,
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
-    route_installer: Option<Arc<RouteInstaller>>,
+    installer_slot: InstallerSlot,
+    assign_tx: Option<mpsc::Sender<Assign>>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
@@ -567,16 +666,23 @@ async fn net_to_tun(
                 }
             };
 
-            // Control payloads (marker byte 0x00) never reach the TUN. The one
-            // the client acts on is the server's route push; anything else is
-            // dropped, matching the server's treatment of unknown controls.
+            // Control payloads never reach the TUN. Assign is forwarded to
+            // `run` so this processor does not reconfigure the device.
             if mesh::is_control(&plaintext) {
                 match mesh::parse_control(&plaintext) {
-                    Some(mesh::Control::RoutePush(push)) => match &route_installer {
-                        Some(installer) => installer.apply(&push.routes),
-                        None => {
-                            debug!("ignoring route push: accept_routes is not enabled")
+                    Some(mesh::Control::RoutePush(push)) => {
+                        match installer_slot.lock().unwrap().clone() {
+                            Some(installer) => installer.apply(&push.routes),
+                            None => debug!("ignoring route push: no installer yet"),
                         }
+                    }
+                    Some(mesh::Control::Assign(reply)) => match &assign_tx {
+                        Some(tx) => {
+                            if tx.try_send(reply).is_err() {
+                                debug!("dropping Assign: run is not accepting");
+                            }
+                        }
+                        None => debug!("dropping Assign: not in auto mode"),
                     },
                     other => debug!(
                         "dropping {}-byte control payload ({other:?})",
@@ -656,6 +762,394 @@ async fn keepalive_loop(
             return Err(e).context("failed to send keepalive to server");
         }
         debug!("sent {}-byte keepalive", wire.len());
+    }
+}
+
+async fn send_control(
+    socket: &UdpSocket,
+    cipher: Cipher,
+    master_key: &[u8],
+    obfuscator: Option<&Obfuscator>,
+    payload: &[u8],
+) -> Result<()> {
+    let datagram = match encrypt_packet(cipher, master_key, payload) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("failed to encrypt control payload, skipping: {e}");
+            return Ok(());
+        }
+    };
+    let wire = match obfuscator {
+        Some(o) => o.wrap(&datagram),
+        None => datagram,
+    };
+    if let Err(e) = socket.send(&wire).await {
+        if is_transient_udp_error(&e) {
+            warn!("transient control send error: {e}");
+            return Ok(());
+        }
+        return Err(e).context("failed to send control payload to server");
+    }
+    debug!("sent {}-byte control payload", payload.len());
+    Ok(())
+}
+
+async fn tick_opt(interval: &mut Option<tokio::time::Interval>) {
+    match interval.as_mut() {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn join_opt(
+    handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Result<Result<()>, tokio::task::JoinError> {
+    match handle.as_mut() {
+        Some(h) => h.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn policy_task_result(handle: &mut Option<shadowvpn::policy::PolicyHandle>) -> Result<()> {
+    match handle.as_mut() {
+        Some(h) => match (&mut h.task).await {
+            Ok(inner) => inner.context("DNS proxy loop failed"),
+            Err(join) => Err(anyhow::Error::new(join).context("DNS proxy task panicked")),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_policy_and_installer(
+    cfg: &ClientConfig,
+    iface_name: &str,
+    server_ip: std::net::IpAddr,
+    direct_src: std::net::IpAddr,
+    policy_handle: &mut Option<shadowvpn::policy::PolicyHandle>,
+    installer_slot: &InstallerSlot,
+    route_guard: &mut Option<mesh::InstallerGuard>,
+) -> Result<()> {
+    if cfg.policy.mode.is_enabled() && policy_handle.is_none() {
+        info!(
+            "policy routing mode = {}; only matched destinations are tunneled",
+            cfg.policy.mode.name()
+        );
+        *policy_handle = Some(
+            shadowvpn::policy::spawn(&cfg.policy, iface_name, cfg.tun.ip, server_ip, direct_src)
+                .await
+                .context("failed to start policy routing")?,
+        );
+    }
+    if cfg.accept_routes && installer_slot.lock().unwrap().is_none() {
+        let installer = Arc::new(
+            RouteInstaller::new(iface_name, cfg.tun.ip, server_ip)
+                .context("setting up the mesh route installer")?,
+        );
+        *installer_slot.lock().unwrap() = Some(Arc::clone(&installer));
+        *route_guard = Some(mesh::InstallerGuard::new(installer));
+    }
+    Ok(())
+}
+
+/// Abort the DNS-proxy task and wait for it to exit so `dns_listen` is released
+/// before a replacement `spawn` (dropping the JoinHandle would detach it).
+async fn shutdown_policy(handle: &mut Option<shadowvpn::policy::PolicyHandle>) {
+    if let Some(mut old) = handle.take() {
+        old.task.abort();
+        let _ = (&mut old.task).await;
+        drop(old);
+    }
+}
+
+fn reply_ip6(
+    want_ip6: bool,
+    reply: &Assign,
+    static_ip6: Option<Ipv6Network>,
+) -> Option<Ipv6Network> {
+    if want_ip6 {
+        let ip = reply.tun_ip6?;
+        (reply.plen6 != 0)
+            .then(|| Ipv6Network::new(ip, reply.plen6).ok())
+            .flatten()
+    } else {
+        static_ip6
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_assign_reply(
+    reply: Assign,
+    cfg: &mut ClientConfig,
+    tun: &TunDevice,
+    iface_name: &str,
+    server_ip: std::net::IpAddr,
+    direct_src: std::net::IpAddr,
+    state_path: &Path,
+    node_id: [u8; 16],
+    assigned_ok: &AtomicBool,
+    got_ok: &mut bool,
+    assign_retry: &mut Option<tokio::time::Interval>,
+    keep_tick: &mut Option<tokio::time::Interval>,
+    policy_handle: &mut Option<shadowvpn::policy::PolicyHandle>,
+    installer_slot: &InstallerSlot,
+    route_guard: &mut Option<mesh::InstallerGuard>,
+    subnet_guard: &mut Option<SubnetRouteGuard>,
+    hinted_routing: &mut bool,
+    socket: &UdpSocket,
+    cipher: Cipher,
+    master_key: &[u8],
+    obfuscator: Option<&Obfuscator>,
+) -> Result<()> {
+    match reply.status {
+        AssignStatus::Ok => {}
+        AssignStatus::Exhausted if *got_ok => {
+            warn!("server address pool exhausted; keeping current assignment");
+            return Ok(());
+        }
+        AssignStatus::NatMode if *got_ok => {
+            warn!("server entered NAT mode; keeping current assignment");
+            return Ok(());
+        }
+        AssignStatus::Exhausted => bail!("server address pool exhausted"),
+        AssignStatus::NatMode => {
+            bail!("server is in NAT mode; assignment is disabled")
+        }
+    }
+
+    let first_ok = !*got_ok;
+    let static_ip6 = if cfg.want_ip6 { None } else { cfg.tun.ip6 };
+    let ip6 = reply_ip6(cfg.want_ip6, &reply, static_ip6);
+    let old_ip = cfg.tun.ip;
+    let old_ip6 = cfg.tun.ip6;
+    let ipv4_changed = !old_ip.is_unspecified() && old_ip != reply.tun_ip;
+    // Periodic refresh: do not re-program the TUN / persist / log every 15s.
+    if !first_ok
+        && reply.tun_ip == cfg.tun.ip
+        && reply.netmask == cfg.tun.netmask
+        && reply.peer_ip == cfg.tun.peer_ip
+        && ip6 == cfg.tun.ip6
+    {
+        return Ok(());
+    }
+
+    tun.apply_assignment(reply.tun_ip, reply.netmask, reply.peer_ip, ip6)
+        .context("failed to apply tunnel assignment")?;
+
+    cfg.tun.ip = reply.tun_ip;
+    cfg.tun.netmask = reply.netmask;
+    cfg.tun.peer_ip = reply.peer_ip;
+    if cfg.want_ip6 {
+        cfg.tun.ip6 = ip6;
+    }
+
+    match subnet_guard {
+        Some(g) => g
+            .apply(reply.tun_ip, reply.netmask, ip6)
+            .context("refreshing TUN subnet route")?,
+        None => {
+            let mut g =
+                SubnetRouteGuard::new(iface_name).context("setting up the TUN subnet route")?;
+            g.apply(reply.tun_ip, reply.netmask, ip6)
+                .context("installing TUN subnet route")?;
+            *subnet_guard = Some(g);
+        }
+    }
+
+    if ipv4_changed {
+        warn!(
+            "TUN IPv4 changed from {old_ip} to {}; in-flight sockets bound to the old address will break",
+            reply.tun_ip
+        );
+        // JoinHandle drop would detach the proxy and leave 127.0.0.1:53 bound.
+        shutdown_policy(policy_handle).await;
+        if cfg.accept_routes {
+            *installer_slot.lock().unwrap() = None;
+            *route_guard = None;
+        }
+    }
+
+    start_policy_and_installer(
+        cfg,
+        iface_name,
+        server_ip,
+        direct_src,
+        policy_handle,
+        installer_slot,
+        route_guard,
+    )
+    .await?;
+
+    persist_assignment(state_path, &cfg.server, node_id, &reply, ip6);
+
+    if first_ok {
+        assigned_ok.store(true, Ordering::Release);
+        *got_ok = true;
+        *assign_retry = None;
+        let mut ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + cfg.keepalive, cfg.keepalive);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        *keep_tick = Some(ticker);
+    }
+
+    if !*hinted_routing && !cfg.policy.mode.is_enabled() {
+        print_routing_hint(&cfg.tun, &cfg.server);
+        *hinted_routing = true;
+    }
+
+    let v6 = ip6
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    if first_ok && !old_ip.is_unspecified() && !ipv4_changed && ip6 == old_ip6 {
+        info!("assignment confirmed (cached): {} / {v6}", reply.tun_ip);
+    } else {
+        info!(
+            "TUN assigned: {} / {v6} (peer {} ttl {}s)",
+            reply.tun_ip, reply.peer_ip, reply.ttl_secs
+        );
+    }
+
+    // Immediate advert on first Ok (and if the IPv4 moved); later ticks send it.
+    if cfg.mesh_active() && (first_ok || ipv4_changed) {
+        send_control(
+            socket,
+            cipher,
+            master_key,
+            obfuscator,
+            &cfg.route_advert().encode(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Persisted client identity. `last_assign` is absent until the first Ok.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClientStateFile {
+    node_id: String,
+    server: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_assign: Option<LastAssign>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LastAssign {
+    tun_ip: Ipv4Addr,
+    tun_netmask: Ipv4Addr,
+    peer_ip: Ipv4Addr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tun_ip6: Option<Ipv6Network>,
+    assigned_at_unix: u64,
+}
+
+fn generate_node_id() -> [u8; 16] {
+    use rand::rngs::SysRng;
+    use rand::TryRng;
+    let mut id = [0u8; 16];
+    SysRng
+        .try_fill_bytes(&mut id)
+        .expect("OS entropy for node_id");
+    // UUID v4 (RFC 4122): version 4, variant 10.
+    id[6] = (id[6] & 0x0f) | 0x40;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    id
+}
+
+fn fmt_node(id: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
+        id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15]
+    )
+}
+
+fn parse_node_id(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn load_or_create_state(path: &Path, server: &str) -> ([u8; 16], Option<LastAssign>) {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<ClientStateFile>(&bytes) {
+            Ok(st) => {
+                if let Some(id) = parse_node_id(&st.node_id) {
+                    return (id, st.last_assign);
+                }
+                warn!(
+                    "corrupt node_id in {}; generating a new identity",
+                    path.display()
+                );
+            }
+            Err(e) => warn!(
+                "corrupt client state {}: {e}; generating a new identity",
+                path.display()
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            "failed to read client state {}: {e}; generating a new identity",
+            path.display()
+        ),
+    }
+    let id = generate_node_id();
+    persist_state(
+        path,
+        &ClientStateFile {
+            node_id: fmt_node(&id),
+            server: server.to_string(),
+            last_assign: None,
+        },
+    );
+    (id, None)
+}
+
+fn persist_assignment(
+    path: &Path,
+    server: &str,
+    node_id: [u8; 16],
+    reply: &Assign,
+    ip6: Option<Ipv6Network>,
+) {
+    persist_state(
+        path,
+        &ClientStateFile {
+            node_id: fmt_node(&node_id),
+            server: server.to_string(),
+            last_assign: Some(LastAssign {
+                tun_ip: reply.tun_ip,
+                tun_netmask: reply.netmask,
+                peer_ip: reply.peer_ip,
+                tun_ip6: ip6,
+                assigned_at_unix: unix_now(),
+            }),
+        },
+    );
+}
+
+fn persist_state(path: &Path, state: &ClientStateFile) {
+    match serde_json::to_vec_pretty(state) {
+        Ok(bytes) => {
+            if let Err(e) = write_private(path, &bytes) {
+                warn!("failed to persist client state {}: {e}", path.display());
+            }
+        }
+        Err(e) => warn!("failed to serialize client state: {e}"),
     }
 }
 

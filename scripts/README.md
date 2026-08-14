@@ -11,10 +11,10 @@ curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/insta
 ```
 
 On a Linux server, `--setup` goes from zero to a running service in one
-command — it writes a real config (random password, NAT enabled), installs
-the systemd unit with the detected WAN interface, enables + starts the
-service, opens the UDP port in ufw/firewalld, and prints the matching client
-config:
+command — it writes a real config (random password, learning mode +
+auto-assign), installs the systemd unit with the detected WAN interface,
+enables + starts the service, opens the UDP port in ufw/firewalld, and
+prints the matching client config (no `tun_ip` / `peer_ip`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup

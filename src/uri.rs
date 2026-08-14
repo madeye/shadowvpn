@@ -12,9 +12,11 @@
 //! Because [`FileConfig`] carries local filesystem paths (`gfwlist`, `chnroute`,
 //! `geoip`, `cache_file`), a URI exported on one host may reference paths that do
 //! not exist on the importing host; those fields should be re-pointed after
-//! import. When sharing one server among several clients, give each client a
-//! distinct `tun_ip` before (or after) exporting — the server routes return
-//! traffic by inner tunnel IP, so duplicates collide.
+//! import. When sharing one server among several clients, omit `tun_ip` and
+//! `peer_ip` and let the server assign a unique tunnel IP (learning mode). The
+//! persisted `node_id` lives in `<config>.state`, **not** in the URI — cloning
+//! the QR must not clone the identity. Alternatively give each client a distinct
+//! static `tun_ip`, or run the server with `--nat` (no client↔client).
 //!
 //! [`encode`] / [`decode`] handle the URI text; [`render_qr`] turns the URI into
 //! a terminal-scannable QR code, and [`decode_qr_image`] reads one back from a

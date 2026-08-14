@@ -14,9 +14,9 @@ Both binaries accept `-c, --config <PATH>` to point at a JSON file.
 | `password`    | `-k, --password`  | pre-shared password; master key derived from it                 | yes      | —                    |
 | `cipher`      | `-m, --cipher`    | AEAD cipher name                                                | no       | `chacha20-poly1305`  |
 | `tun_name`    | `--tun-name`      | explicit TUN interface name (e.g. `utun7`, `tun0`)              | no       | OS picks             |
-| `tun_ip`      | `--tun-ip`        | local IPv4 address on the TUN interface                         | yes      | —                    |
+| `tun_ip`      | `--tun-ip`        | local IPv4 address on the TUN interface                         | server: yes; client: omit with `peer_ip` for [auto-assign](./auto-assign) | — |
 | `tun_netmask` | `--tun-netmask`   | IPv4 netmask for the TUN interface                              | no       | `255.255.255.0`      |
-| `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: client IP; client: server IP) | yes      | —                    |
+| `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: reserved static client; client: server IP) | server: yes; client: omit with `tun_ip` for [auto-assign](./auto-assign) | — |
 | `mtu`         | `--mtu`           | TUN interface MTU                                               | no       | `1400`               |
 | `obfs`        | *(config only)*   | carrier obfuscation: `none` \| `quic` \| `base64` (both ends must match) | no | `none`         |
 
@@ -59,7 +59,8 @@ There are more client-only fields for policy routing — see
 
 ::: tip Mirror images
 `tun_ip` and `peer_ip` swap between the two ends: the server's local tunnel IP
-is the client's peer, and vice versa.
+is the client's peer, and vice versa. On the client you can [omit both](./auto-assign)
+and let the server assign a unique address.
 :::
 
 ## Choosing a cipher
@@ -98,7 +99,10 @@ wire formats: [carrier obfuscation](/reference/obfuscation).
 
 ## Sharing configs between devices
 
+- [Omit `tun_ip` and `peer_ip`](./auto-assign) so every device can share one
+  client config and still get a unique, pingable tunnel IP.
 - Export/import a client config as a single `shadowvpn://` URI or QR code —
-  see [Config URIs & QR codes](./uri-qr).
-- Run many clients off one identical config with the server's
-  [NAT mode](./multi-client).
+  see [Config URIs & QR codes](./uri-qr). The `node_id` is **not** in the
+  URI; it lives in `<config>.state`.
+- Run many clients off one identical *placeholder* config with the server's
+  [NAT mode](./multi-client) when you do not need client↔client.
