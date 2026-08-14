@@ -30,6 +30,8 @@ pub fn write_private_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
+            // Windows already unlinked dest; keep the fsynced tmp as the only copy.
+            #[cfg(not(windows))]
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }

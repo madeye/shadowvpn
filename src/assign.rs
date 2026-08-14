@@ -169,15 +169,23 @@ impl Assigner {
     }
 
     /// Allocate or refresh a lease for `req.node_id`.
-    pub fn allocate(&mut self, req: &AssignReq, peer: SocketAddr, now: SystemTime) -> Assign {
-        let reaped = self.reap_inner(now);
-        let mut dirty = !reaped.is_empty();
+    ///
+    /// The `Vec` is every lease dropped during this call (TTL expiry or
+    /// pressure reclaim) so the caller can unlearn those addresses.
+    pub fn allocate(
+        &mut self,
+        req: &AssignReq,
+        peer: SocketAddr,
+        now: SystemTime,
+    ) -> (Assign, Vec<Lease>) {
+        let mut dropped = self.reap_inner(now);
+        let mut dirty = !dropped.is_empty();
 
         if let Some(reply) = self.refresh_existing(req, peer, now, &mut dirty) {
             if dirty || self.should_persist(now) {
                 self.persist(now);
             }
-            return reply;
+            return (reply, dropped);
         }
 
         if let Some(other) = self.by_peer.get(&peer).copied() {
@@ -192,18 +200,19 @@ impl Assigner {
 
         let want_ip6 = req.flags & FLAG_WANT_IP6 != 0;
         let Some((ip4, ip6)) = self.pick_addrs(req.node_id, req.hint_ip4, want_ip6) else {
-            if self.reclaim_oldest() {
+            if let Some(reclaimed) = self.reclaim_oldest() {
                 dirty = true;
+                dropped.push(reclaimed);
                 if let Some((ip4, ip6)) = self.pick_addrs(req.node_id, req.hint_ip4, want_ip6) {
-                    return self.bind_new(req.node_id, peer, ip4, ip6, now);
+                    return (self.bind_new(req.node_id, peer, ip4, ip6, now), dropped);
                 }
             }
             if dirty {
                 self.persist(now);
             }
-            return exhausted();
+            return (exhausted(), dropped);
         };
-        self.bind_new(req.node_id, peer, ip4, ip6, now)
+        (self.bind_new(req.node_id, peer, ip4, ip6, now), dropped)
     }
 
     /// Reclaim expired leases. Returns the dropped rows so the caller can unlearn.
@@ -231,19 +240,18 @@ impl Assigner {
             (lease.ip4, lease.ip6, lease.last_peer)
         };
         if old_peer != Some(peer) {
-            let had_live = old_peer
-                .map(|p| self.by_peer.get(&p) == Some(&req.node_id))
-                .unwrap_or(false);
+            // Only unbind if we still own that socket. Restored last_peer (or
+            // a step-2 unbind) may now belong to a different node.
             if let Some(old) = old_peer {
-                self.by_peer.remove(&old);
+                if self.by_peer.get(&old) == Some(&req.node_id) {
+                    self.by_peer.remove(&old);
+                    warn!("duplicate node_id {}", fmt_node(&req.node_id));
+                }
                 info!(
                     "assigned {ip4} / {} to node {} via {peer} (moved endpoint {old})",
                     ip6_disp(ip6),
                     fmt_node(&req.node_id)
                 );
-                if had_live {
-                    warn!("duplicate node_id {}", fmt_node(&req.node_id));
-                }
             }
             if let Some(lease) = self.by_node.get_mut(&req.node_id) {
                 lease.last_peer = Some(peer);
@@ -367,20 +375,17 @@ impl Assigner {
         }
     }
 
-    fn reclaim_oldest(&mut self) -> bool {
+    fn reclaim_oldest(&mut self) -> Option<Lease> {
         let oldest = self
             .by_node
             .iter()
             .min_by_key(|(_, l)| l.last_seen)
-            .map(|(id, _)| *id);
-        let Some(id) = oldest else {
-            return false;
-        };
+            .map(|(id, _)| *id)?;
         warn!(
             "reclaiming oldest idle lease for node {} under pool pressure",
-            fmt_node(&id)
+            fmt_node(&oldest)
         );
-        self.drop_lease(id).is_some()
+        self.drop_lease(oldest)
     }
 
     fn reap_inner(&mut self, now: SystemTime) -> Vec<Lease> {
@@ -504,7 +509,14 @@ impl Assigner {
                 dropped = true;
                 continue;
             };
-            let last_seen = from_unix(row.last_seen_unix);
+            let Some(last_seen) = from_unix(row.last_seen_unix) else {
+                warn!(
+                    "skipping lease with unrepresentable last_seen_unix {}",
+                    row.last_seen_unix
+                );
+                dropped = true;
+                continue;
+            };
             if is_expired(last_seen, now, self.ttl) {
                 dropped = true;
                 continue;
@@ -578,8 +590,8 @@ fn to_unix(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn from_unix(secs: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(secs)
+fn from_unix(secs: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
 fn exhausted() -> Assign {
@@ -710,6 +722,16 @@ mod tests {
         }
     }
 
+    fn alloc(
+        a: &mut Assigner,
+        node: NodeId,
+        hint: Ipv4Addr,
+        p: SocketAddr,
+        now: SystemTime,
+    ) -> Assign {
+        a.allocate(&req(node, hint, false), p, now).0
+    }
+
     fn assigner(persist: Option<PathBuf>) -> Assigner {
         assigner_full(
             None,
@@ -779,8 +801,8 @@ mod tests {
         let mut a = assigner(None);
         let mut b = assigner(None);
         let now = t0();
-        let ra = a.allocate(&req(NODE_A, Ipv4Addr::UNSPECIFIED, false), peer(1), now);
-        let rb = b.allocate(&req(NODE_A, Ipv4Addr::UNSPECIFIED, false), peer(1), now);
+        let ra = alloc(&mut a, NODE_A, Ipv4Addr::UNSPECIFIED, peer(1), now);
+        let rb = alloc(&mut b, NODE_A, Ipv4Addr::UNSPECIFIED, peer(1), now);
         assert_eq!(ra.status, AssignStatus::Ok);
         assert_eq!(ra.tun_ip, rb.tun_ip);
         assert_eq!(ra.tun_ip, expected_probe(NODE_A));
@@ -793,11 +815,11 @@ mod tests {
         let mut a = assigner(None);
         let now = t0();
         let hint = Ipv4Addr::new(10, 9, 0, 37);
-        let first = a.allocate(&req(NODE_A, hint, false), peer(1), now);
+        let first = alloc(&mut a, NODE_A, hint, peer(1), now);
         assert_eq!(first.tun_ip, hint);
-        let again = a.allocate(&req(NODE_A, hint, false), peer(1), now);
+        let again = alloc(&mut a, NODE_A, hint, peer(1), now);
         assert_eq!(again.tun_ip, hint);
-        let other = a.allocate(&req(NODE_B, hint, false), peer(2), now);
+        let other = alloc(&mut a, NODE_B, hint, peer(2), now);
         assert_ne!(other.tun_ip, hint);
         assert_eq!(other.status, AssignStatus::Ok);
     }
@@ -812,7 +834,7 @@ mod tests {
             (NODE_B, Ipv4Addr::new(10, 9, 0, 2), 2),
             (NODE_C, reserved, 3),
         ] {
-            let r = a.allocate(&req(node, hint, false), peer(port), now);
+            let r = alloc(&mut a, node, hint, peer(port), now);
             assert_eq!(r.status, AssignStatus::Ok);
             assert_ne!(r.tun_ip, Ipv4Addr::new(10, 9, 0, 1));
             assert_ne!(r.tun_ip, Ipv4Addr::new(10, 9, 0, 2));
@@ -826,8 +848,8 @@ mod tests {
         let mut a = assigner(None);
         let now = t0();
         let p = peer(9);
-        let ra = a.allocate(&req(NODE_A, Ipv4Addr::UNSPECIFIED, false), p, now);
-        let rb = a.allocate(&req(NODE_B, Ipv4Addr::UNSPECIFIED, false), p, now);
+        let ra = alloc(&mut a, NODE_A, Ipv4Addr::UNSPECIFIED, p, now);
+        let rb = alloc(&mut a, NODE_B, Ipv4Addr::UNSPECIFIED, p, now);
         assert_eq!(a.node_for_peer(p), Some(NODE_B));
         assert!(a.lease(NODE_A).is_some());
         assert_ne!(ra.tun_ip, rb.tun_ip);
@@ -840,11 +862,13 @@ mod tests {
         let embedded: Ipv6Addr = "fd07:7::a09:25".parse().unwrap();
         assert_eq!(embed_ip4(prefix, Ipv4Addr::new(10, 9, 0, 37)), embedded);
         let mut a = assigner_full(Some(prefix), [], Duration::from_secs(60), None);
-        let r = a.allocate(
-            &req(NODE_A, Ipv4Addr::new(10, 9, 0, 37), true),
-            peer(1),
-            t0(),
-        );
+        let r = a
+            .allocate(
+                &req(NODE_A, Ipv4Addr::new(10, 9, 0, 37), true),
+                peer(1),
+                t0(),
+            )
+            .0;
         assert_eq!(r.status, AssignStatus::Ok);
         assert_eq!(r.tun_ip, Ipv4Addr::new(10, 9, 0, 37));
         assert_eq!(r.tun_ip6, Some(embedded));
@@ -856,7 +880,9 @@ mod tests {
     fn prefix_128_skips_v6() {
         let prefix: Ipv6Network = "fd07:7::1/128".parse().unwrap();
         let mut a = assigner_full(Some(prefix), [], Duration::from_secs(60), None);
-        let r = a.allocate(&req(NODE_A, Ipv4Addr::UNSPECIFIED, true), peer(1), t0());
+        let r = a
+            .allocate(&req(NODE_A, Ipv4Addr::UNSPECIFIED, true), peer(1), t0())
+            .0;
         assert_eq!(r.status, AssignStatus::Ok);
         assert!(r.tun_ip6.is_none());
         assert_eq!(r.plen6, 0);
@@ -873,11 +899,13 @@ mod tests {
             Duration::from_secs(DEFAULT_ASSIGN_TTL_SECS),
             Some(file.0.clone()),
         );
-        let r = a.allocate(
-            &req(NODE_A, Ipv4Addr::new(10, 9, 0, 37), true),
-            peer(54321),
-            SystemTime::now(),
-        );
+        let r = a
+            .allocate(
+                &req(NODE_A, Ipv4Addr::new(10, 9, 0, 37), true),
+                peer(54321),
+                SystemTime::now(),
+            )
+            .0;
         assert_eq!(a.node_for_peer(peer(54321)), Some(NODE_A));
         drop(a);
 
@@ -919,8 +947,8 @@ mod tests {
         let ttl = Duration::from_secs(8);
         let mut a = assigner_full(None, [], ttl, Some(file.0.clone()));
         // Truncate to whole seconds: persist stores last_seen_unix.
-        let start = from_unix(to_unix(SystemTime::now()));
-        a.allocate(&req(NODE_A, Ipv4Addr::UNSPECIFIED, false), peer(1), start);
+        let start = from_unix(to_unix(SystemTime::now())).expect("now fits in SystemTime");
+        alloc(&mut a, NODE_A, Ipv4Addr::UNSPECIFIED, peer(1), start);
         let loaded = |path: &Path| {
             assigner_full(None, [], ttl, Some(path.to_path_buf()))
                 .lease(NODE_A)
@@ -929,15 +957,19 @@ mod tests {
         };
         assert_eq!(loaded(&file.0), start);
 
-        a.allocate(
-            &req(NODE_A, Ipv4Addr::UNSPECIFIED, false),
+        alloc(
+            &mut a,
+            NODE_A,
+            Ipv4Addr::UNSPECIFIED,
             peer(1),
             start + Duration::from_secs(1),
         );
         assert_eq!(loaded(&file.0), start);
 
-        a.allocate(
-            &req(NODE_A, Ipv4Addr::UNSPECIFIED, false),
+        alloc(
+            &mut a,
+            NODE_A,
+            Ipv4Addr::UNSPECIFIED,
             peer(1),
             start + Duration::from_secs(2),
         );
@@ -959,10 +991,78 @@ mod tests {
     #[test]
     fn reply_uses_server_netmask_and_server_ip_as_peer() {
         let mut a = assigner(None);
-        let r = a.allocate(&req(NODE_A, Ipv4Addr::UNSPECIFIED, false), peer(1), t0());
+        let r = alloc(&mut a, NODE_A, Ipv4Addr::UNSPECIFIED, peer(1), t0());
         assert_eq!(r.netmask, Ipv4Addr::new(255, 255, 255, 0));
         assert_eq!(r.peer_ip, Ipv4Addr::new(10, 9, 0, 1));
         assert_eq!(r.flags, 0);
         assert_eq!(r.ttl_secs, DEFAULT_ASSIGN_TTL_SECS as u32);
+    }
+
+    #[test]
+    fn refresh_does_not_unbind_foreign_peer() {
+        let file = TempFile::new();
+        let now_unix = to_unix(SystemTime::now());
+        let body = serde_json::json!({
+            "version": 1,
+            "leases": [{
+                "node_id": "c0ffee00-0000-4000-8000-000000000001",
+                "ip4": "10.9.0.37",
+                "last_seen_unix": now_unix,
+                "last_peer": "203.0.113.9:1234"
+            }]
+        });
+        std::fs::write(&file.0, body.to_string()).unwrap();
+        let mut a = assigner(Some(file.0.clone()));
+        assert_eq!(a.node_for_peer(peer(1234)), None);
+
+        let now = SystemTime::now();
+        alloc(&mut a, NODE_B, Ipv4Addr::UNSPECIFIED, peer(1234), now);
+        assert_eq!(a.node_for_peer(peer(1234)), Some(NODE_B));
+
+        alloc(&mut a, NODE_A, Ipv4Addr::UNSPECIFIED, peer(5678), now);
+        assert_eq!(a.node_for_peer(peer(1234)), Some(NODE_B));
+        assert_eq!(a.node_for_peer(peer(5678)), Some(NODE_A));
+    }
+
+    #[test]
+    fn allocate_surfaces_reaped_and_reclaimed() {
+        let ttl = Duration::from_secs(10);
+        let mut a = assigner_full(None, [], ttl, None);
+        alloc(&mut a, NODE_A, Ipv4Addr::UNSPECIFIED, peer(1), t0());
+        let (_reply, expired) = a.allocate(
+            &req(NODE_B, Ipv4Addr::UNSPECIFIED, false),
+            peer(2),
+            t0() + Duration::from_secs(11),
+        );
+        assert!(expired.iter().any(|l| l.node_id == NODE_A));
+
+        let mut b = assigner(None);
+        let only = Ipv4Addr::new(10, 9, 0, 10);
+        b.set_host_range(u32::from(only), u32::from(only));
+        alloc(&mut b, NODE_A, only, peer(1), t0());
+        let (reply, reclaimed) = b.allocate(&req(NODE_B, only, false), peer(2), t0());
+        assert_eq!(reply.status, AssignStatus::Ok);
+        assert_eq!(reply.tun_ip, only);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].node_id, NODE_A);
+    }
+
+    #[test]
+    fn huge_last_seen_unix_does_not_panic() {
+        let file = TempFile::new();
+        let body = serde_json::json!({
+            "version": 1,
+            "leases": [{
+                "node_id": "c0ffee00-0000-4000-8000-000000000001",
+                "ip4": "10.9.0.37",
+                "last_seen_unix": u64::MAX,
+                "last_peer": "203.0.113.9:54321"
+            }]
+        });
+        std::fs::write(&file.0, body.to_string()).unwrap();
+        let a = assigner(Some(file.0.clone()));
+        if from_unix(u64::MAX).is_none() {
+            assert!(a.lease(NODE_A).is_none());
+        }
     }
 }
