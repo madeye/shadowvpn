@@ -86,6 +86,18 @@ parse_assigned_v4() {
         | sed -n 's/.*assigned \([0-9][0-9.]*\) \/ .*/\1/p' | sort -u
 }
 
+# Read/write the server lease *volume*. `docker cp` into a stopped container
+# writes the overlay; the named volume hides that copy on start.
+volume_cat() {
+    docker run --rm --volumes-from svpn-assign-server shadowvpn-e2e:latest \
+        cat /var/lib/shadowvpn/leases.json
+}
+
+volume_put() {
+    docker run --rm -i --volumes-from svpn-assign-server shadowvpn-e2e:latest \
+        sh -c 'cat > /var/lib/shadowvpn/leases.json'
+}
+
 echo "==> ShadowVPN auto-assign spoke-to-spoke test (cipher=${CIPHER}, clients=${#CLIENTS[@]})"
 $COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
 $COMPOSE up -d --build
@@ -194,20 +206,22 @@ fi
 
 # 6: inject a lease whose last_seen_unix is older than the 7-day TTL.
 # On load the assigner drops it, so that IPv4 is not held for a dead node.
-# (Skipped when python3 or compose cp is unavailable.)
+# Fail (do not skip) if the inject cannot land on the named volume.
 STALE_IP=10.9.0.200
 case " $before1 $before2 $before3 " in
 *" $STALE_IP "*) STALE_IP=10.9.0.201 ;;
 esac
+work=$(mktemp -d "${TMPDIR:-/tmp}/svpn-assign.XXXXXX")
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "  skip: stale-lease inject (python3 not available to edit leases.json)"
-else
-    work=$(mktemp -d "${TMPDIR:-/tmp}/svpn-assign.XXXXXX")
-    echo "  injecting expired lease for $STALE_IP and restarting the server..."
-    $COMPOSE stop -t 2 server >/dev/null 2>&1
-    if $COMPOSE cp server:/var/lib/shadowvpn/leases.json "$work/leases.json" 2>/dev/null \
-        || docker cp svpn-assign-server:/var/lib/shadowvpn/leases.json "$work/leases.json" 2>/dev/null; then
-        python3 - "$work/leases.json" "$STALE_IP" <<'PY'
+    echo "FAIL: stale-lease inject needs python3 to edit leases.json" >&2
+    fail=1
+elif ! $COMPOSE stop -t 2 server >/dev/null 2>&1; then
+    echo "FAIL: could not stop the server to inject a stale lease" >&2
+    fail=1
+elif ! volume_cat >"$work/leases.json" || [ ! -s "$work/leases.json" ]; then
+    echo "FAIL: could not read leases.json from the server volume" >&2
+    fail=1
+elif ! python3 - "$work/leases.json" "$STALE_IP" <<'PY'
 import json, sys
 path, ip = sys.argv[1], sys.argv[2]
 with open(path) as f:
@@ -224,47 +238,50 @@ with open(path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PY
-        if $COMPOSE cp "$work/leases.json" server:/var/lib/shadowvpn/leases.json 2>/dev/null \
-            || docker cp "$work/leases.json" svpn-assign-server:/var/lib/shadowvpn/leases.json 2>/dev/null; then
-            $COMPOSE start server >/dev/null 2>&1
-            # Load+persist of the dropped row happens in Assigner::new.
-            # Poll the rewritten file (old "assignment: ON" banners stay in logs).
-            dropped=0
-            for _ in $(seq 1 20); do
-                if $COMPOSE exec -T server cat /var/lib/shadowvpn/leases.json \
-                    >"$work/after.json" 2>/dev/null \
-                    && [ -s "$work/after.json" ] \
-                    && ! grep -q "$STALE_IP" "$work/after.json"; then
-                    dropped=1
-                    break
-                fi
-                sleep 1
-            done
-            banner=$($COMPOSE logs --no-color server 2>/dev/null | grep 'assignment: ON' | tail -1 || true)
-            echo "  latest banner: $banner"
-            if [ "$dropped" -eq 1 ]; then
-                echo "  OK: expired lease $STALE_IP was dropped on load (not held for a new node)"
-            else
-                echo "FAIL: expired lease $STALE_IP was restored after server start" >&2
+then
+    echo "FAIL: could not append expired lease to leases.json" >&2
+    fail=1
+elif ! volume_put <"$work/leases.json"; then
+    echo "FAIL: could not write leases.json back to the server volume" >&2
+    fail=1
+elif ! volume_cat >"$work/verify.json" || ! grep -q "$STALE_IP" "$work/verify.json"; then
+    echo "FAIL: stale lease $STALE_IP not present on the volume before server start" >&2
+    fail=1
+else
+    echo "  OK: volume contains expired lease $STALE_IP before server start"
+    if ! $COMPOSE start server >/dev/null 2>&1; then
+        echo "FAIL: could not start the server after stale-lease inject" >&2
+        fail=1
+    else
+        # Load+persist of the dropped row happens in Assigner::new.
+        dropped=0
+        for _ in $(seq 1 20); do
+            if $COMPOSE exec -T server cat /var/lib/shadowvpn/leases.json \
+                >"$work/after.json" 2>/dev/null \
+                && [ -s "$work/after.json" ] \
+                && ! grep -q "$STALE_IP" "$work/after.json"; then
+                dropped=1
+                break
+            fi
+            sleep 1
+        done
+        banner=$($COMPOSE logs --no-color server 2>/dev/null | grep 'assignment: ON' | tail -1 || true)
+        echo "  latest banner: $banner"
+        if [ "$dropped" -eq 1 ]; then
+            echo "  OK: expired lease $STALE_IP was dropped on load (not held for a new node)"
+        else
+            echo "FAIL: expired lease $STALE_IP was still present after server start" >&2
+            fail=1
+        fi
+        for c in "${CLIENTS[@]}"; do
+            if ! wait_ping "$c" "$SERVER_TUN_IP"; then
+                echo "FAIL: $c lost the tunnel after stale-lease inject" >&2
                 fail=1
             fi
-            # Live clients must still reach the server on their original IPs.
-            for c in "${CLIENTS[@]}"; do
-                if ! wait_ping "$c" "$SERVER_TUN_IP"; then
-                    echo "FAIL: $c lost the tunnel after stale-lease inject" >&2
-                    fail=1
-                fi
-            done
-        else
-            echo "  skip: stale-lease inject (could not copy leases.json back into the server)"
-            $COMPOSE start server >/dev/null 2>&1 || true
-        fi
-    else
-        echo "  skip: stale-lease inject (could not copy leases.json out of the server)"
-        $COMPOSE start server >/dev/null 2>&1 || true
+        done
     fi
-    rm -rf "$work"
 fi
+rm -rf "$work"
 
 echo "==> server log (tail):"
 $COMPOSE logs --no-color server 2>/dev/null | tail -20
