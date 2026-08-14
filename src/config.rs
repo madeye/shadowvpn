@@ -27,12 +27,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
-use ipnetwork::{IpNetwork, Ipv6Network};
+use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use serde::{Deserialize, Serialize};
 
+use crate::assign::DEFAULT_ASSIGN_TTL_SECS;
 use crate::crypto::Cipher;
-use crate::mesh::{RouteApproval, MAX_ROUTES};
+use crate::mesh::{canonical, RouteApproval, MAX_ROUTES};
 use crate::policy::{Mode, PolicyConfig};
+use crate::pool::host_range;
 use crate::protocol::DEFAULT_TUN_MTU;
 
 /// Default cipher used when none is specified.
@@ -202,6 +204,28 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_ttl_secs: Option<u64>,
 
+    /// Server-only: IPv4 CIDR the assigner may hand out (must be a subset of
+    /// the TUN network). Allocator-only; the Assign reply still carries the
+    /// TUN netmask. Ignored by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign_pool: Option<IpNetwork>,
+
+    /// Server-only: extra IPv4s never auto-assigned (unioned with `peer_ip`).
+    /// Ignored by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_ips: Option<Vec<Ipv4Addr>>,
+
+    /// Server-only: idle time-to-live for an assignment lease, in seconds
+    /// (default [`DEFAULT_ASSIGN_TTL_SECS`]). Ignored by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign_ttl_secs: Option<u64>,
+
+    /// Server-only: assignment lease persist path. `"-"` disables. Default is
+    /// next to `--config`, else `/var/lib/shadowvpn/leases.json` (Windows:
+    /// `%PROGRAMDATA%\shadowvpn\leases.json`). Ignored by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_file: Option<String>,
+
     /// Client-only: keepalive interval in seconds (default
     /// [`DEFAULT_KEEPALIVE_SECS`]). Must stay below the shortest UDP NAT
     /// timeout on the path or the flow rebinds to a new source port whenever
@@ -333,10 +357,19 @@ pub struct ServerConfig {
     /// NAT multiple clients onto distinct internal IPs (keyed by UDP endpoint).
     pub nat: bool,
     /// Idle time-to-live for a client's NAT mapping (reclamation threshold).
-    /// Also the expiry for advertised subnet routes whose owner went quiet.
+    /// Also the expiry for advertised subnet routes whose owner went quiet,
+    /// and for learned inner-IP → UDP mappings.
     pub lease_ttl: Duration,
     /// Approval policy for client-advertised subnet routes.
     pub route_approval: RouteApproval,
+    /// Allocator-only IPv4 CIDR (canonical). `None` means the full TUN host range.
+    pub assign_pool: Option<Ipv4Network>,
+    /// IPv4s never auto-assigned. Always includes [`TunConfig::peer_ip`].
+    pub reserved_ips: Vec<Ipv4Addr>,
+    /// Idle time before an assignment lease is reclaimed.
+    pub assign_ttl: Duration,
+    /// Assignment lease persist path. `None` disables persistence (`lease_file: "-"`).
+    pub lease_file: Option<PathBuf>,
 }
 
 /// Fully resolved, validated client configuration.
@@ -428,6 +461,22 @@ pub struct ServerArgs {
     /// Approve every route clients advertise (Tailscale "approve all").
     #[arg(long = "auto-approve-routes")]
     pub auto_approve_routes: bool,
+
+    /// IPv4 CIDR the assigner may hand out (subset of the TUN network).
+    #[arg(long = "assign-pool")]
+    pub assign_pool: Option<IpNetwork>,
+
+    /// Extra IPv4s never auto-assigned (unioned with `--peer-ip`).
+    #[arg(long = "reserved-ips", value_delimiter = ',')]
+    pub reserved_ips: Option<Vec<Ipv4Addr>>,
+
+    /// Idle time-to-live for an assignment lease, in seconds (default 604800).
+    #[arg(long = "assign-ttl-secs")]
+    pub assign_ttl_secs: Option<u64>,
+
+    /// Assignment lease persist path. "-" disables persistence.
+    #[arg(long = "lease-file")]
+    pub lease_file: Option<String>,
 }
 
 /// Command-line arguments for `shadowvpn-client`.
@@ -803,6 +852,88 @@ fn validate_advertised(routes: &[IpNetwork]) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Default server lease-file path: `<config>.leases.json` next to `--config`,
+/// else `/var/lib/shadowvpn/leases.json` (Windows: `%PROGRAMDATA%\shadowvpn\leases.json`).
+fn default_lease_file(config_path: Option<&Path>) -> PathBuf {
+    if let Some(cfg) = config_path {
+        let mut s = cfg.as_os_str().to_os_string();
+        s.push(".leases.json");
+        return PathBuf::from(s);
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("shadowvpn")
+            .join("leases.json")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/var/lib/shadowvpn/leases.json")
+    }
+}
+
+/// TUN IPv4 network from address + netmask, or an error if the mask is not
+/// a contiguous prefix (needed for `assign_pool` subset checks).
+fn tun_v4_network(ip: Ipv4Addr, netmask: Ipv4Addr) -> Result<Ipv4Network, ConfigError> {
+    let mask = u32::from(netmask);
+    if mask.leading_ones() + mask.trailing_zeros() != 32 {
+        return Err(ConfigError::Invalid {
+            field: "tun_netmask",
+            message: format!("{netmask} is not a contiguous IPv4 netmask"),
+        });
+    }
+    let prefix = mask.leading_ones() as u8;
+    let network = Ipv4Addr::from(u32::from(ip) & mask);
+    Ipv4Network::new(network, prefix).map_err(|e| ConfigError::Invalid {
+        field: "tun_ip",
+        message: e.to_string(),
+    })
+}
+
+/// Validate `assign_pool`: IPv4 only, canonical subset of `tun`, at least one
+/// host left after network/broadcast/server/reserved exclusions.
+fn validate_assign_pool(
+    pool: IpNetwork,
+    tun: Ipv4Network,
+    server_ip: Ipv4Addr,
+    reserved: &[Ipv4Addr],
+) -> Result<Ipv4Network, ConfigError> {
+    let IpNetwork::V4(pool) = canonical(pool) else {
+        return Err(ConfigError::Invalid {
+            field: "assign_pool",
+            message: "must be an IPv4 CIDR".to_string(),
+        });
+    };
+    if pool.prefix() < tun.prefix() || !tun.contains(pool.ip()) {
+        return Err(ConfigError::Invalid {
+            field: "assign_pool",
+            message: format!("{pool} is not a subset of the TUN network {tun}"),
+        });
+    }
+    let (start, end) = host_range(pool.network(), pool.mask());
+    let mut usable = 0usize;
+    if start <= end {
+        for host in start..=end {
+            let addr = Ipv4Addr::from(host);
+            if addr != server_ip && !reserved.contains(&addr) {
+                usable += 1;
+            }
+        }
+    }
+    if usable == 0 {
+        return Err(ConfigError::Invalid {
+            field: "assign_pool",
+            message: format!(
+                "{pool} has no assignable hosts after excluding the network, \
+                 broadcast, server IP, and reserved addresses"
+            ),
+        });
+    }
+    Ok(pool)
+}
+
 impl ServerArgs {
     /// Merge these CLI args over the (optional) JSON file and produce a
     /// validated [`ServerConfig`]. CLI flags take precedence over file values.
@@ -856,6 +987,34 @@ impl ServerArgs {
             });
         }
 
+        // `peer_ip` is always reserved so mixed static/auto fleets keep .2.
+        let extra_reserved = self.reserved_ips.or(file.reserved_ips).unwrap_or_default();
+        let mut reserved_ips = Vec::with_capacity(extra_reserved.len() + 1);
+        reserved_ips.push(tun.peer_ip);
+        for ip in extra_reserved {
+            if !reserved_ips.contains(&ip) {
+                reserved_ips.push(ip);
+            }
+        }
+
+        let assign_pool = match self.assign_pool.or(file.assign_pool) {
+            Some(pool) => {
+                let tun_net = tun_v4_network(tun.ip, tun.netmask)?;
+                Some(validate_assign_pool(pool, tun_net, tun.ip, &reserved_ips)?)
+            }
+            None => None,
+        };
+        let assign_ttl = Duration::from_secs(
+            self.assign_ttl_secs
+                .or(file.assign_ttl_secs)
+                .unwrap_or(DEFAULT_ASSIGN_TTL_SECS),
+        );
+        let lease_file = match self.lease_file.as_deref().or(file.lease_file.as_deref()) {
+            Some("-") => None,
+            Some(path) => Some(PathBuf::from(path)),
+            None => Some(default_lease_file(self.config.as_deref())),
+        };
+
         Ok(ServerConfig {
             listen,
             cipher,
@@ -865,6 +1024,10 @@ impl ServerArgs {
             nat,
             lease_ttl,
             route_approval,
+            assign_pool,
+            reserved_ips,
+            assign_ttl,
+            lease_file,
         })
     }
 }
@@ -934,6 +1097,43 @@ impl ClientArgs {
 mod tests {
     use super::*;
 
+    impl ServerArgs {
+        /// All-`None` server args, for building test cases with struct update
+        /// syntax (`..ServerArgs::empty()`).
+        fn empty() -> Self {
+            ServerArgs {
+                config: None,
+                listen: None,
+                password: None,
+                cipher: None,
+                tun_name: None,
+                tun_ip: None,
+                tun_netmask: None,
+                peer_ip: None,
+                tun_ip6: None,
+                mtu: None,
+                nat: false,
+                lease_ttl_secs: None,
+                approve_routes: None,
+                auto_approve_routes: false,
+                assign_pool: None,
+                reserved_ips: None,
+                assign_ttl_secs: None,
+                lease_file: None,
+            }
+        }
+
+        fn test_base() -> Self {
+            ServerArgs {
+                listen: Some("0.0.0.0:1".to_string()),
+                password: Some("pw".to_string()),
+                tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
+                peer_ip: Some(Ipv4Addr::new(10, 9, 0, 2)),
+                ..Self::empty()
+            }
+        }
+    }
+
     impl ClientArgs {
         /// All-`None` client args, for building test cases with struct update
         /// syntax (`..ClientArgs::empty()`).
@@ -987,6 +1187,10 @@ mod tests {
             lease_ttl_secs: None,
             approve_routes: None,
             auto_approve_routes: false,
+            assign_pool: None,
+            reserved_ips: None,
+            assign_ttl_secs: None,
+            lease_file: None,
         };
         let cfg = args.resolve().expect("resolve");
         assert_eq!(cfg.listen, "0.0.0.0:9000");
@@ -1192,6 +1396,10 @@ mod tests {
             lease_ttl_secs: None,
             approve_routes: None,
             auto_approve_routes: false,
+            assign_pool: None,
+            reserved_ips: None,
+            assign_ttl_secs: None,
+            lease_file: None,
         };
         let cfg = args.resolve().expect("resolve");
         assert!(cfg.nat);
@@ -1272,6 +1480,10 @@ mod tests {
             lease_ttl_secs: None,
             approve_routes: None,
             auto_approve_routes: false,
+            assign_pool: None,
+            reserved_ips: None,
+            assign_ttl_secs: None,
+            lease_file: None,
         };
 
         let cfg = base.clone().resolve().expect("resolve");
@@ -1293,5 +1505,120 @@ mod tests {
             n.resolve(),
             Err(ConfigError::Invalid { field: "nat", .. })
         ));
+    }
+
+    #[test]
+    fn assign_pool_ipv4_subset_and_defaults() {
+        let cfg = ServerArgs::test_base().resolve().expect("resolve");
+        assert!(cfg.assign_pool.is_none());
+        assert_eq!(cfg.reserved_ips, vec![Ipv4Addr::new(10, 9, 0, 2)]);
+        assert_eq!(cfg.assign_ttl, Duration::from_secs(DEFAULT_ASSIGN_TTL_SECS));
+        #[cfg(not(windows))]
+        assert_eq!(
+            cfg.lease_file.as_deref(),
+            Some(Path::new("/var/lib/shadowvpn/leases.json"))
+        );
+        #[cfg(windows)]
+        {
+            let p = cfg.lease_file.expect("default lease file");
+            assert_eq!(p.file_name().unwrap(), "leases.json");
+            assert!(p.to_string_lossy().contains("shadowvpn"));
+        }
+
+        let mut a = ServerArgs::test_base();
+        a.assign_pool = Some("10.9.0.128/25".parse().unwrap());
+        a.reserved_ips = Some(vec![Ipv4Addr::new(10, 9, 0, 10)]);
+        a.assign_ttl_secs = Some(3600);
+        a.lease_file = Some("/tmp/leases.json".into());
+        let cfg = a.resolve().expect("valid subset");
+        assert_eq!(cfg.assign_pool.unwrap().to_string(), "10.9.0.128/25");
+        assert_eq!(
+            cfg.reserved_ips,
+            vec![Ipv4Addr::new(10, 9, 0, 2), Ipv4Addr::new(10, 9, 0, 10)]
+        );
+        assert_eq!(cfg.assign_ttl, Duration::from_secs(3600));
+        assert_eq!(
+            cfg.lease_file.as_deref(),
+            Some(Path::new("/tmp/leases.json"))
+        );
+
+        let mut d = ServerArgs::test_base();
+        d.lease_file = Some("-".into());
+        assert!(d.resolve().unwrap().lease_file.is_none());
+
+        assert_eq!(
+            default_lease_file(Some(Path::new("/etc/shadowvpn/server.json"))),
+            PathBuf::from("/etc/shadowvpn/server.json.leases.json")
+        );
+    }
+
+    #[test]
+    fn assign_pool_rejects_ipv6_non_subset_and_degenerate() {
+        let mut v6 = ServerArgs::test_base();
+        v6.assign_pool = Some("fd07:7::/64".parse().unwrap());
+        assert!(matches!(
+            v6.resolve(),
+            Err(ConfigError::Invalid {
+                field: "assign_pool",
+                ..
+            })
+        ));
+
+        let mut outside = ServerArgs::test_base();
+        outside.assign_pool = Some("10.8.0.0/24".parse().unwrap());
+        assert!(matches!(
+            outside.resolve(),
+            Err(ConfigError::Invalid {
+                field: "assign_pool",
+                ..
+            })
+        ));
+
+        let mut supernet = ServerArgs::test_base();
+        supernet.assign_pool = Some("10.9.0.0/16".parse().unwrap());
+        assert!(matches!(
+            supernet.resolve(),
+            Err(ConfigError::Invalid {
+                field: "assign_pool",
+                ..
+            })
+        ));
+
+        // /30 = network, server, reserved peer, broadcast → no hosts.
+        let mut empty = ServerArgs::test_base();
+        empty.assign_pool = Some("10.9.0.0/30".parse().unwrap());
+        assert!(matches!(
+            empty.resolve(),
+            Err(ConfigError::Invalid {
+                field: "assign_pool",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tun_ip6_prefix_over_96_still_resolves() {
+        let mut args = ServerArgs::test_base();
+        args.tun_ip6 = Some("fd07:7::1/128".parse().unwrap());
+        let cfg = args
+            .resolve()
+            .expect("static-only /128 hub must still start");
+        assert_eq!(cfg.tun.ip6.unwrap().prefix(), 128);
+    }
+
+    #[test]
+    fn file_config_parses_assign_keys() {
+        let json = r#"{
+            "server": "0.0.0.0:8388",
+            "assign_pool": "10.9.0.128/25",
+            "reserved_ips": ["10.9.0.10"],
+            "assign_ttl_secs": 3600,
+            "lease_file": "-"
+        }"#;
+        let fc: FileConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(fc.assign_pool.unwrap().to_string(), "10.9.0.128/25");
+        assert_eq!(fc.reserved_ips.unwrap(), vec![Ipv4Addr::new(10, 9, 0, 10)]);
+        assert_eq!(fc.assign_ttl_secs, Some(3600));
+        assert_eq!(fc.lease_file.as_deref(), Some("-"));
     }
 }
