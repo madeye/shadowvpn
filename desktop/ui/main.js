@@ -897,11 +897,16 @@
     if (!invoke) return;
     try {
       await invoke("init_privileges");
-    } catch (_err) {
-      toast(
-        "Administrator access not granted — you'll be asked when connecting.",
-        "info",
-      );
+    } catch (err) {
+      const msg = errText(err);
+      if (/cancel/i.test(msg)) {
+        toast(
+          "Administrator access not granted — you'll be asked when connecting.",
+          "info",
+        );
+      } else {
+        toast("Could not start elevated helper: " + msg, "info");
+      }
     }
   }
 

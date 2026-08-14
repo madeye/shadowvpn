@@ -18,10 +18,17 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::helper_ipc::{self, Cmd, Request, Response};
 use crate::paths;
 use crate::settings;
+
+/// Serializes elevation so a Connect click during the startup dialog cannot
+/// double-spawn an orphaned root helper (two prompts, two listeners, one
+/// leftover until reboot).
+static ENSURE_LOCK: Mutex<()> = Mutex::new(());
 
 /// How long to wait for the helper's port file + first ping after the user
 /// approved the elevation dialog.
@@ -109,6 +116,9 @@ pub fn ping(app: &tauri::AppHandle) -> Option<Response> {
 /// other OS — by the per-session helper (one credential prompt when none is
 /// running).
 pub fn ensure(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
+    let _guard = ENSURE_LOCK
+        .lock()
+        .map_err(|_| "elevation lock poisoned".to_string())?;
     #[cfg(target_os = "macos")]
     if let Some(port) = daemon_ensure(app, client_bin)? {
         return Ok(port);
@@ -274,6 +284,10 @@ fn spawn(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
     crate::runner::check_path_safe("helper port file", &port_str)?;
     crate::runner::check_path_safe("client binary", client_bin)?;
 
+    // Stop a helper still bound to the previous port before we rewrite the
+    // token; otherwise the leftover process stays up until reboot.
+    shutdown_session_best_effort(app);
+
     let mut raw = [0u8; 32];
     getrandom::fill(&mut raw).map_err(|e| format!("cannot generate session token: {e}"))?;
     let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
@@ -281,21 +295,56 @@ fn spawn(app: &tauri::AppHandle, client_bin: &str) -> Result<u16, String> {
         .map_err(|e| format!("cannot write token file: {e}"))?;
     let _ = std::fs::remove_file(&port_path);
 
-    spawn_elevated_helper(&helper_str, &token_str, &port_str, client_bin)?;
+    let mut elev_child = spawn_elevated_helper(&helper_str, &token_str, &port_str, client_bin)?;
 
     // The elevation call returns once the user approved (the helper itself is
-    // backgrounded); give it a moment to bind and publish its port.
+    // backgrounded); give it a moment to bind and publish its port. On Linux
+    // pkexec is still our child — if the user declines it exits immediately
+    // and we must not sit on the full 15s poll.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SPAWN_WAIT_MS);
     while std::time::Instant::now() < deadline {
         if let Some(resp) = ping_endpoint(app, Endpoint::Session) {
             if resp.client_bin.as_deref() == Some(client_bin) {
+                if let Some(child) = elev_child.take() {
+                    std::thread::spawn(move || {
+                        let mut child = child;
+                        let _ = child.wait();
+                    });
+                }
                 let (port_path, _) = endpoint_files(app, Endpoint::Session)?;
                 return read_port_at(&port_path).ok_or("helper port file vanished".to_string());
+            }
+        }
+        if let Some(child) = elev_child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "authorization cancelled or elevation failed (pkexec {status})"
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("failed to monitor pkexec: {e}")),
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     Err("elevated helper did not start (no response within 15s)".to_string())
+}
+
+fn shutdown_session_best_effort(app: &tauri::AppHandle) {
+    let Ok((port_path, token_path)) = endpoint_files(app, Endpoint::Session) else {
+        return;
+    };
+    if let (Some(port), Some(token)) = (read_port_at(&port_path), read_token_at(&token_path)) {
+        let _ = helper_ipc::call_with_io_timeout(
+            port,
+            &Request {
+                token,
+                cmd: Cmd::Shutdown,
+            },
+            Duration::from_secs(2),
+        );
+    }
 }
 
 /// On app exit: tear the per-session helper down when idle; leave it
@@ -370,7 +419,7 @@ fn spawn_elevated_helper(
     token_file: &str,
     port_file: &str,
     client_bin: &str,
-) -> Result<(), String> {
+) -> Result<Option<std::process::Child>, String> {
     use crate::runner::sh_quote;
     let inner = format!(
         "{} --token-file {} --port-file {} --client-bin {} </dev/null >/dev/null 2>&1 &",
@@ -396,7 +445,7 @@ fn spawn_elevated_helper(
             stderr.trim()
         ));
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -405,7 +454,7 @@ fn spawn_elevated_helper(
     token_file: &str,
     port_file: &str,
     client_bin: &str,
-) -> Result<(), String> {
+) -> Result<Option<std::process::Child>, String> {
     use crate::runner::{pkexec_on_path, sh_quote};
     if !pkexec_on_path() {
         return Err(format!(
@@ -416,10 +465,9 @@ fn spawn_elevated_helper(
             sh_quote(client_bin)
         ));
     }
-    // pkexec stays in the foreground for the helper's whole lifetime, so
-    // spawn it detached and reap it from a thread; the port-file poll in
-    // `spawn()` is what detects success, and a declined dialog surfaces as
-    // the poll timing out (pkexec exits 126/127 without ever writing it).
+    // pkexec stays in the foreground for the helper's whole lifetime. Keep
+    // the Child so `spawn()` can `try_wait` it: a declined dialog exits
+    // immediately (126/127) and must not burn the 15s port-file poll.
     let child = Command::new("pkexec")
         .args([
             helper,
@@ -435,11 +483,7 @@ fn spawn_elevated_helper(
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to launch pkexec: {e}"))?;
-    std::thread::spawn(move || {
-        let mut child = child;
-        let _ = child.wait();
-    });
-    Ok(())
+    Ok(Some(child))
 }
 
 #[cfg(windows)]
@@ -448,7 +492,7 @@ fn spawn_elevated_helper(
     token_file: &str,
     port_file: &str,
     client_bin: &str,
-) -> Result<(), String> {
+) -> Result<Option<std::process::Child>, String> {
     use crate::runner::ps_quote;
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -482,7 +526,7 @@ fn spawn_elevated_helper(
             stderr.trim()
         ));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// UI-invoked at startup: acquire the session's admin authority up front.
