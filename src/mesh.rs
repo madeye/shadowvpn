@@ -34,12 +34,17 @@
 //! keepalive   : 00 ip4[4]               (legacy, 5 bytes)
 //! route advert: 00 01 flags ip4[4] ip6[16] count { family plen addr[4|16] }*
 //! route push  : 00 02 00    count { family plen addr[4|16] }*
+//! assign req  : 00 03 flags node[16] hint4[4] hint6[16]
+//! assign      : 00 04 status ip4[4] mask[4] peer[4] ip6[16] plen6 flags ttl[4]
 //! ```
 //!
-//! `flags` bit 0 is *accept routes* (the client asks for pushes). `family` is
-//! the literal byte `4` or `6`; `addr` is the network address (host bits are
-//! masked off on both ends). The 1- and 5-byte keepalives are distinguished
-//! from typed messages by length alone, preserving the historical format.
+//! `flags` bit 0 on a route advert is *accept routes* (the client asks for
+//! pushes). On an assign request it is *want IPv6*. `family` is the literal
+//! byte `4` or `6`; `addr` is the network address (host bits are masked off
+//! on both ends). The 1- and 5-byte keepalives are distinguished from typed
+//! messages by length alone, so typed messages must not be 1 or 5 bytes.
+//! Assign request and reply are exact-length (39 and 37); any other length
+//! or unknown type is dropped.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -59,8 +64,24 @@ const TYPE_ROUTE_ADVERT: u8 = 0x01;
 /// Type byte of a server→client [`RoutePush`].
 const TYPE_ROUTE_PUSH: u8 = 0x02;
 
+/// Type byte of a client→server [`AssignReq`].
+const TYPE_ASSIGN_REQ: u8 = 0x03;
+
+/// Type byte of a server→client [`Assign`].
+const TYPE_ASSIGN: u8 = 0x04;
+
+/// Exact length of an [`AssignReq`] payload. Not 1 or 5: those stay keepalives.
+pub const ASSIGN_REQ_LEN: usize = 39;
+
+/// Exact length of an [`Assign`] payload. Not 1 or 5: those stay keepalives.
+pub const ASSIGN_LEN: usize = 37;
+
 /// `flags` bit: the advertising client also wants approved routes pushed back.
 const FLAG_ACCEPT_ROUTES: u8 = 0x01;
+
+/// `AssignReq.flags` bit: the client wants an IPv6 assignment when the server
+/// has a prefix.
+pub const FLAG_WANT_IP6: u8 = 0x01;
 
 /// Maximum number of routes carried in one advert or push. Bounds the message
 /// well under the tunnel MTU (64 IPv6 entries ≈ 1.2 KB) so control messages
@@ -87,6 +108,10 @@ pub enum Control {
     RouteAdvert(RouteAdvert),
     /// A server→client push of the approved route set.
     RoutePush(RoutePush),
+    /// A client→server request for a tunnel address.
+    AssignReq(AssignReq),
+    /// A server→client tunnel-address assignment (or a non-Ok status).
+    Assign(Assign),
 }
 
 /// Client→server: "these subnets are reachable through me".
@@ -112,6 +137,63 @@ pub struct RouteAdvert {
 pub struct RoutePush {
     /// Approved subnets reachable through the tunnel.
     pub routes: Vec<IpNetwork>,
+}
+
+/// Client→server: request a unique tunnel address keyed by `node_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignReq {
+    /// Bit 0 is [`FLAG_WANT_IP6`]; other bits are 0 in v1.
+    pub flags: u8,
+    /// Persistent 16-byte node identity.
+    pub node_id: [u8; 16],
+    /// Preferred IPv4; `0.0.0.0` = no hint.
+    pub hint_ip4: Ipv4Addr,
+    /// Preferred IPv6; wire `::` decodes to `None`.
+    pub hint_ip6: Option<Ipv6Addr>,
+}
+
+/// Outcome of an [`Assign`] reply. There is no `Conflict` discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AssignStatus {
+    /// Assignment succeeded.
+    Ok = 0,
+    /// Pool exhausted.
+    Exhausted = 1,
+    /// Server is in `--nat` mode; assignment is disabled.
+    NatMode = 2,
+}
+
+impl AssignStatus {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Ok),
+            1 => Some(Self::Exhausted),
+            2 => Some(Self::NatMode),
+            _ => None,
+        }
+    }
+}
+
+/// Server→client: assigned tunnel addresses, or a non-Ok status with zeros.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assign {
+    /// Whether the request was granted.
+    pub status: AssignStatus,
+    /// Assigned tunnel IPv4.
+    pub tun_ip: Ipv4Addr,
+    /// Server TUN IPv4 netmask.
+    pub netmask: Ipv4Addr,
+    /// Server TUN IPv4 (the client's point-to-point destination).
+    pub peer_ip: Ipv4Addr,
+    /// `None` when `plen6 == 0` (wire IPv6 bytes are `::`).
+    pub tun_ip6: Option<Ipv6Addr>,
+    /// IPv6 prefix length; `0` means no IPv6.
+    pub plen6: u8,
+    /// Reserved; v1 senders write 0.
+    pub flags: u8,
+    /// Lease lifetime in seconds.
+    pub ttl_secs: u32,
 }
 
 /// Canonicalize a network: mask the host bits off so `10.0.0.7/24` and
@@ -199,6 +281,38 @@ impl RoutePush {
     }
 }
 
+impl AssignReq {
+    /// Serialize into a 39-byte control payload.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ASSIGN_REQ_LEN);
+        buf.push(CONTROL_MARKER);
+        buf.push(TYPE_ASSIGN_REQ);
+        buf.push(self.flags);
+        buf.extend_from_slice(&self.node_id);
+        buf.extend_from_slice(&self.hint_ip4.octets());
+        buf.extend_from_slice(&self.hint_ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets());
+        buf
+    }
+}
+
+impl Assign {
+    /// Serialize into a 37-byte control payload.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ASSIGN_LEN);
+        buf.push(CONTROL_MARKER);
+        buf.push(TYPE_ASSIGN);
+        buf.push(self.status as u8);
+        buf.extend_from_slice(&self.tun_ip.octets());
+        buf.extend_from_slice(&self.netmask.octets());
+        buf.extend_from_slice(&self.peer_ip.octets());
+        buf.extend_from_slice(&self.tun_ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets());
+        buf.push(self.plen6);
+        buf.push(self.flags);
+        buf.extend_from_slice(&self.ttl_secs.to_be_bytes());
+        buf
+    }
+}
+
 /// Decode a control payload (a payload for which [`is_control`] is true).
 ///
 /// Returns `None` for malformed or unknown messages, which callers drop —
@@ -242,6 +356,45 @@ pub fn parse_control(payload: &[u8]) -> Option<Control> {
             }
             let routes = parse_routes(payload.get(4..)?, count)?;
             Some(Control::RoutePush(RoutePush { routes }))
+        }
+        TYPE_ASSIGN_REQ => {
+            if payload.len() != ASSIGN_REQ_LEN {
+                return None;
+            }
+            let flags = payload[2];
+            let node_id = <[u8; 16]>::try_from(&payload[3..19]).expect("16 bytes");
+            let hint_ip4 = Ipv4Addr::new(payload[19], payload[20], payload[21], payload[22]);
+            let hint6 = Ipv6Addr::from(<[u8; 16]>::try_from(&payload[23..39]).expect("16 bytes"));
+            Some(Control::AssignReq(AssignReq {
+                flags,
+                node_id,
+                hint_ip4,
+                hint_ip6: (!hint6.is_unspecified()).then_some(hint6),
+            }))
+        }
+        TYPE_ASSIGN => {
+            if payload.len() != ASSIGN_LEN {
+                return None;
+            }
+            let status = AssignStatus::from_u8(payload[2])?;
+            let tun_ip = Ipv4Addr::new(payload[3], payload[4], payload[5], payload[6]);
+            let netmask = Ipv4Addr::new(payload[7], payload[8], payload[9], payload[10]);
+            let peer_ip = Ipv4Addr::new(payload[11], payload[12], payload[13], payload[14]);
+            let ip6 = Ipv6Addr::from(<[u8; 16]>::try_from(&payload[15..31]).expect("16 bytes"));
+            let plen6 = payload[31];
+            let flags = payload[32];
+            let ttl_secs =
+                u32::from_be_bytes(<[u8; 4]>::try_from(&payload[33..37]).expect("4 bytes"));
+            Some(Control::Assign(Assign {
+                status,
+                tun_ip,
+                netmask,
+                peer_ip,
+                tun_ip6: (plen6 != 0).then_some(ip6),
+                plen6,
+                flags,
+                ttl_secs,
+            }))
         }
         _ => None,
     }
@@ -651,6 +804,123 @@ mod tests {
         // Bad family / bad prefix.
         assert_eq!(parse_control(&[0, 2, 0, 1, 5, 24, 1, 2, 3, 4]), None);
         assert_eq!(parse_control(&[0, 2, 0, 1, 4, 33, 1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn assign_ok_hex_example_roundtrips() {
+        let hex = [
+            0x00, 0x04, 0x00, // marker, type, Ok
+            0x0a, 0x09, 0x00, 0x25, // 10.9.0.37
+            0xff, 0xff, 0xff, 0x00, // /24
+            0x0a, 0x09, 0x00, 0x01, // peer 10.9.0.1
+            0xfd, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x09,
+            0x00, 0x25, // fd07:7::a09:25
+            0x40, // plen6 = 64
+            0x00, // flags
+            0x00, 0x09, 0x3a, 0x80, // ttl 604800
+        ];
+        assert_eq!(hex.len(), ASSIGN_LEN);
+        let expected = Assign {
+            status: AssignStatus::Ok,
+            tun_ip: Ipv4Addr::new(10, 9, 0, 37),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            peer_ip: Ipv4Addr::new(10, 9, 0, 1),
+            tun_ip6: Some("fd07:7::a09:25".parse().unwrap()),
+            plen6: 64,
+            flags: 0,
+            ttl_secs: 604_800,
+        };
+        assert_eq!(parse_control(&hex), Some(Control::Assign(expected.clone())));
+        assert_eq!(expected.encode(), hex);
+    }
+
+    #[test]
+    fn assign_req_roundtrips() {
+        let req = AssignReq {
+            flags: FLAG_WANT_IP6,
+            node_id: [
+                0xc0, 0xff, 0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01,
+            ],
+            hint_ip4: Ipv4Addr::new(10, 9, 0, 37),
+            hint_ip6: Some("fd07:7::a09:25".parse().unwrap()),
+        };
+        let bytes = req.encode();
+        assert_eq!(bytes.len(), ASSIGN_REQ_LEN);
+        assert_eq!(parse_control(&bytes), Some(Control::AssignReq(req)));
+
+        let no_hints = AssignReq {
+            flags: 0,
+            node_id: [0; 16],
+            hint_ip4: Ipv4Addr::UNSPECIFIED,
+            hint_ip6: None,
+        };
+        match parse_control(&no_hints.encode()) {
+            Some(Control::AssignReq(r)) => {
+                assert_eq!(r.hint_ip4, Ipv4Addr::UNSPECIFIED);
+                assert_eq!(r.hint_ip6, None);
+            }
+            other => panic!("expected AssignReq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn five_byte_00_03_is_still_keepalive() {
+        // Length-dispatch claims 5-byte payloads before the type byte; 0x03 is
+        // an IP octet here, not TYPE_ASSIGN_REQ.
+        assert_eq!(
+            parse_control(&[0x00, 0x03, 0xaa, 0xbb, 0xcc]),
+            Some(Control::Keepalive(Some(Ipv4Addr::new(
+                0x03, 0xaa, 0xbb, 0xcc
+            ))))
+        );
+    }
+
+    #[test]
+    fn assign_wrong_length_and_unknown_type_are_none() {
+        let mut short = vec![0x00, 0x04];
+        short.resize(36, 0);
+        assert_eq!(parse_control(&short), None);
+
+        let mut long = vec![0x00, 0x04];
+        long.resize(38, 0);
+        assert_eq!(parse_control(&long), None);
+
+        // Unknown type 0x05.
+        assert_eq!(parse_control(&[0x00, 0x05, 0x00, 0x00]), None);
+    }
+
+    #[test]
+    fn assign_plen6_zero_clears_tun_ip6() {
+        // plen6 is authoritative: a non-:: address with plen6=0 is still None.
+        let mut bytes = Assign {
+            status: AssignStatus::Ok,
+            tun_ip: Ipv4Addr::new(10, 9, 0, 37),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            peer_ip: Ipv4Addr::new(10, 9, 0, 1),
+            tun_ip6: Some("fd07:7::a09:25".parse().unwrap()),
+            plen6: 64,
+            flags: 0,
+            ttl_secs: 604_800,
+        }
+        .encode();
+        bytes[31] = 0;
+        match parse_control(&bytes) {
+            Some(Control::Assign(a)) => {
+                assert_eq!(a.tun_ip6, None);
+                assert_eq!(a.plen6, 0);
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_status_has_no_conflict() {
+        // Exhaustiveness: a Conflict discriminant would fail this match.
+        match AssignStatus::Ok {
+            AssignStatus::Ok | AssignStatus::Exhausted | AssignStatus::NatMode => {}
+        }
+        assert_eq!(AssignStatus::from_u8(3), None);
     }
 
     #[test]

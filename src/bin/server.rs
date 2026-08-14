@@ -545,6 +545,10 @@ fn handle_control(
             debug!("ignoring route push from {peer}: pushes only flow server→client");
             None
         }
+        (Routing::Learn(_), Control::AssignReq(_) | Control::Assign(_)) => {
+            debug!("ignoring assign control from {peer}");
+            None
+        }
     }
 }
 
