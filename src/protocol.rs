@@ -34,6 +34,14 @@ pub const MAX_IP_PACKET: usize = 65535;
 /// the rest of the datagram. There is no nonce on the wire
 /// ([`crate::crypto::NONCE_LEN`] bytes of all-zero nonce are implicit), so it
 /// does not appear here.
+///
+/// ```
+/// use shadowvpn::crypto::Cipher;
+/// use shadowvpn::protocol::crypto_overhead;
+///
+/// assert_eq!(crypto_overhead(Cipher::Aes128Gcm), 32); // 16-byte salt + 16-byte tag
+/// assert_eq!(crypto_overhead(Cipher::ChaCha20Poly1305), 48);
+/// ```
 pub fn crypto_overhead(cipher: Cipher) -> usize {
     cipher.salt_len() + TAG_LEN
 }

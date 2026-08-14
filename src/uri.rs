@@ -56,6 +56,24 @@ pub enum UriError {
 ///
 /// The config is serialized to compact JSON and Base64url-encoded. Serialization
 /// of a `FileConfig` cannot fail (it is plain data), so this is infallible.
+///
+/// # Example
+///
+/// ```
+/// use shadowvpn::config::FileConfig;
+/// use shadowvpn::uri;
+///
+/// let cfg = FileConfig {
+///     server: Some("vpn.example.com:8388".into()),
+///     password: Some("secret".into()),
+///     ..FileConfig::default()
+/// };
+/// let encoded = uri::encode(&cfg);
+/// assert!(encoded.starts_with(uri::SCHEME));
+/// let decoded = uri::decode(&encoded).unwrap();
+/// assert_eq!(decoded.server, cfg.server);
+/// assert_eq!(decoded.password, cfg.password);
+/// ```
 pub fn encode(cfg: &FileConfig) -> String {
     let json = serde_json::to_vec(cfg).expect("FileConfig always serializes to JSON");
     format!("{SCHEME}{}", B64.encode(json))

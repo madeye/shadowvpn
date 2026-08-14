@@ -7,6 +7,9 @@
 //! UDP datagram, and sends it to the server; the server decrypts, routes, and
 //! tunnels return traffic back. The async runtime is [`tokio`].
 //!
+//! Guides, configuration, and the wire-protocol spec also live on the
+//! [project site](https://madeye.github.io/shadowvpn/).
+//!
 //! ## Wire protocol
 //!
 //! The on-wire crypto matches the **shadowsocks.org AEAD UDP scheme** exactly,
@@ -25,6 +28,21 @@
 //! with no SOCKS address header — this is a tunnel, not a SOCKS proxy. See
 //! [`protocol`].
 //!
+//! ## Example
+//!
+//! The library is the same data plane the binaries use. Encrypt a raw IP
+//! packet into a shadowsocks-AEAD UDP datagram and decrypt it back:
+//!
+//! ```
+//! use shadowvpn::crypto::{decrypt_packet, encrypt_packet, evp_bytes_to_key, Cipher};
+//!
+//! let cipher = Cipher::ChaCha20Poly1305;
+//! let key = evp_bytes_to_key(b"correct horse battery staple", cipher.key_len());
+//! let packet = b"\x45\x00\x00\x1chello, tun"; // stand-in for a TUN IP packet
+//! let wire = encrypt_packet(cipher, &key, packet).unwrap();
+//! assert_eq!(decrypt_packet(cipher, &key, &wire).unwrap(), packet);
+//! ```
+//!
 //! ## Multiple clients
 //!
 //! One server serves many clients. By default it routes by *learning* each
@@ -40,6 +58,12 @@
 //! (always built), and `shadowvpn-uri` — a config import/export tool gated behind
 //! the optional `uri` feature so the server/client builds stay lean (see the
 //! `uri` module, compiled only with that feature).
+//!
+//! ## Crate features
+//!
+//! * `uri` — enables the `uri` module (`shadowvpn://` import/export + QR codes)
+//!   and the `shadowvpn-uri` binary. Off by default so server/client builds stay
+//!   lean.
 //!
 //! ## Modules
 //!

@@ -493,7 +493,7 @@ impl RouteInstaller {
         }
     }
 
-    /// Remove every installed route. Best-effort, like [`apply`]'s removals.
+    /// Remove every installed route. Best-effort, like [`Self::apply`]'s removals.
     pub fn remove_all(&self) {
         let nets: Vec<IpNetwork> = {
             let mut installed = self.installed.lock().unwrap();
