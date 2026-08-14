@@ -95,22 +95,8 @@ impl Assigner {
         if this.persist_path.is_some() {
             this.load(SystemTime::now());
         }
-        let file = this
-            .persist_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "-".into());
-        info!(
-            "assignment: ON ({}/{} leased, reserved {}, ttl {}s, file {file})",
-            this.by_node.len(),
-            this.capacity(),
-            this.reserved
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-            this.ttl.as_secs(),
-        );
+        // Caller (server banner) logs after optional set_host_range so
+        // assigned/capacity reflects assign_pool, not the unscoped TUN range.
         this
     }
 
