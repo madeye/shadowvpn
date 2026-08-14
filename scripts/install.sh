@@ -289,6 +289,15 @@ if [ "$SETUP" = 1 ]; then
   SUBNET="${TUN_IP%.*}.0/24"
   [ "$PASSWORD" = CHANGE-ME ] && warn "$CFG still has the CHANGE-ME password — edit it before real use"
 
+  # Previous --setup wrote "nat": true and we never overwrite. json_str only
+  # reads quoted strings, so grep the boolean.
+  NAT_ON=0
+  if grep -Eq '"nat"[[:space:]]*:[[:space:]]*true' "$CFG"; then
+    NAT_ON=1
+    PEER_IP=$(json_str "$CFG" peer_ip); PEER_IP="${PEER_IP:-10.9.0.2}"
+    warn "$CFG has \"nat\": true — auto-assign clients get NatMode (fatal); drop \"nat\" for learning + auto-assign, or use the static snippet below"
+  fi
+
   # systemd unit: patch the WAN interface / tunnel subnet / binary path, enable.
   UNIT_SRC="$PKG/systemd/shadowvpn-server.service"
   [ -f "$UNIT_SRC" ] || die "release package has no systemd unit — use a newer SHADOWVPN_VERSION"
@@ -336,12 +345,22 @@ if [ "$SETUP" = 1 ]; then
   echo "IMPORTANT: also open UDP $PORT in your cloud firewall / security group"
   echo "(DigitalOcean, AWS, GCP, ...) — the host firewall alone is not enough."
   echo
-  echo "matching client config (no tun_ip/peer_ip: the server auto-assigns):"
+  if [ "$NAT_ON" = 1 ]; then
+    echo "matching client config (NAT is on: static tun_ip/peer_ip; drop \"nat\" from $CFG for auto-assign):"
+  else
+    echo "matching client config (no tun_ip/peer_ip: the server auto-assigns):"
+  fi
   echo '  {'
   echo "    \"server\": \"$PUB_IP:$PORT\","
   echo "    \"password\": \"$PASSWORD\","
   echo "    \"cipher\": \"$CIPHER\","
+  if [ "$NAT_ON" = 1 ]; then
+    echo "    \"tun_ip\": \"$PEER_IP\","
+  fi
   echo '    "tun_netmask": "255.255.255.0",'
+  if [ "$NAT_ON" = 1 ]; then
+    echo "    \"peer_ip\": \"$TUN_IP\","
+  fi
   if [ "$OBFS" != none ]; then
     echo "    \"mtu\": $MTU,"
     echo "    \"obfs\": \"$OBFS\""
