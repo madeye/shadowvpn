@@ -203,6 +203,30 @@ jobs:
       - name: Verify mesh subnet routing
         run: ./docker/run-e2e-mesh.sh "${{ matrix.approval }}"
 
+  # Auto-assign spoke-to-spoke test: one learning-mode server (no --nat) and
+  # three identical auto clients (omit tun_ip / peer_ip). Verifies distinct
+  # leased IPv4s, client↔client IPv4 + embedded IPv6, and persist across
+  # client (state volume) and server (lease volume) restarts. Self-contained.
+  e2e-assign:
+    name: docker e2e assign (${{ matrix.cipher }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cipher:
+          - chacha20-poly1305
+          - aes-128-gcm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the TUN device is available on the runner
+        run: |
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+
+      - name: Verify auto-assign spoke-to-spoke
+        run: ./docker/run-e2e-assign.sh "${{ matrix.cipher }}"
+
   # Multi-client auto-IP test: one --auto-assign server and three auto_ip
   # clients. Verifies each client is leased a distinct tunnel IP, every client
   # reaches the server through the tunnel, and clients reach each other via the
