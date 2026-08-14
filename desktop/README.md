@@ -183,12 +183,14 @@ RPCs to it — newline-delimited JSON over `127.0.0.1:<random port>`,
 authenticated per request by a 32-byte random token stored 0600 in
 `<app-data-dir>/runs/helper.token` (the port lands in `runs/helper.port`).
 The helper's capabilities are deliberately narrow: it only ever executes the
-one client binary fixed on its command line at spawn time, and only ever
-signals the child it spawned itself — requests cannot name a program or a
-PID. Because the helper is the client's **parent**, disconnect delivers a
-real `SIGTERM` on macOS/Linux (graceful: DNS restore, route removal, cache
-save) with a `SIGKILL` backstop after 10s; on Windows it terminates the
-child process (forced, as before).
+one client binary fixed on its command line at spawn time, only ever
+signals the child it spawned itself, and only writes `shadowvpn.log` /
+`shadowvpn.pid` inside the GUI `runs/` directory (opened `O_NOFOLLOW`) —
+requests cannot name a program, a PID, or an arbitrary file. Because the
+helper is the client's **parent**, disconnect delivers a real `SIGTERM` on
+macOS/Linux (graceful: DNS restore, route removal, cache save) with a
+`SIGKILL` backstop after 10s; on Windows it terminates the child process
+(forced, as before).
 
 Lifecycle: quitting the app while disconnected shuts the helper down (and
 removes the token). Quitting while **connected** leaves the helper
@@ -242,9 +244,10 @@ output, ad-hoc sign it first: `codesign --force --deep -s - ShadowVPN.app`.
   **helper process** for the whole session; any process running as your user
   account that can read `runs/helper.token` can then ask it to start the
   configured client with a config of its choosing (it can never run another
-  program). This is the same same-user trust boundary as the previous
-  per-connect design — the GUI itself is never elevated. Paths containing a
-  `"` character are refused outright rather than risk shell-quoting bugs.
+  program, or write a file outside `runs/shadowvpn.log` / `runs/shadowvpn.pid`).
+  This is the same same-user trust boundary as the previous per-connect design
+  — the GUI itself is never elevated. Paths containing a `"` character are
+  refused outright rather than risk shell-quoting bugs.
 * **Windows disconnect is still a forced kill** (`TerminateProcess`) — the
   client never gets the chance to run its graceful shutdown path (DNS
   resolver restore, per-destination route removal, DNS cache save), the same

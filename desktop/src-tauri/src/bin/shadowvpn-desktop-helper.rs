@@ -11,8 +11,13 @@
 //!   name a PID.
 //! - Every request must carry the token from the `--token-file`, which the
 //!   GUI creates with 0600 permissions before requesting elevation. The file
-//!   is re-read per request so a new GUI session can re-key a running helper.
-//! - It listens on 127.0.0.1 only.
+//!   is re-read per request so a new GUI session can re-key a running helper;
+//!   a world-readable or non-regular replacement is rejected.
+//! - Connect `log` / `pid_file` writes are allowlisted (fixed basenames under
+//!   a `runs/` directory — the session token dir, or a user-home app-data
+//!   path in daemon mode) and opened `O_NOFOLLOW`, so a request cannot point
+//!   root at an arbitrary file.
+//! - It listens on 127.0.0.1 only. Requests are capped before the token check.
 //!
 //! Lifecycle: exits on a `shutdown` request, or when the token file has been
 //! missing for ~30s while no client child is running (a crashed/closed GUI
@@ -34,14 +39,23 @@
 #[path = "../helper_ipc.rs"]
 mod helper_ipc;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use helper_ipc::{Cmd, Request, Response};
+
+/// Last path component of the app's data/config directory. Connect writes
+/// must live under a directory of this name so a request cannot aim the root
+/// helper at `/tmp/.../runs/shadowvpn.log`.
+const APP_ID: &str = "io.github.madeye.shadowvpn.desktop";
+
+/// Hard cap on one RPC line. Paths + a 64-hex token do not need more, and
+/// the listen socket is reachable by every local uid.
+const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 
 struct Args {
     token_file: PathBuf,
@@ -50,6 +64,10 @@ struct Args {
     /// launchd daemon mode (macOS): launchd owns the lifecycle — never exit
     /// on `shutdown`, never remove the port file, no token-file janitor.
     daemon: bool,
+    /// Session helper: Connect log/pid writes must stay inside this directory
+    /// (the token file's parent, i.e. the GUI `runs/` dir). `None` in daemon
+    /// mode, which uses a user-home + app-id + `runs/` rule instead.
+    write_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,11 +84,14 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    let token_file = token_file.ok_or("--token-file is required")?;
+    let write_dir = token_file.parent().map(|p| p.to_path_buf());
     Ok(Args {
-        token_file: token_file.ok_or("--token-file is required")?,
+        token_file,
         port_file: port_file.ok_or("--port-file is required")?,
         client_bin: client_bin.ok_or("--client-bin is required")?,
         daemon: false,
+        write_dir,
     })
 }
 
@@ -137,6 +158,7 @@ fn daemon_args() -> Result<Args, String> {
         port_file: PathBuf::from(helper_ipc::DAEMON_PORT_FILE),
         client_bin: client.to_string_lossy().to_string(),
         daemon: true,
+        write_dir: None,
     })
 }
 
@@ -154,7 +176,32 @@ fn admin_gid() -> libc::gid_t {
 }
 
 fn read_token(path: &Path) -> Option<String> {
-    let tok = std::fs::read_to_string(path).ok()?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: a symlink swap after elevation must not redirect us at
+        // a FIFO (which would block the accept thread) or another uid's file.
+        // O_NONBLOCK: a FIFO that slipped through still cannot hang us.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut f = opts.open(path).ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // World-readable/writable or group-writable: leaked or hijackable.
+        // Group-readable is intentional for the macOS daemon (root:admin 0640).
+        if meta.permissions().mode() & 0o047 != 0 {
+            return None;
+        }
+    }
+    let mut tok = String::new();
+    f.read_to_string(&mut tok).ok()?;
     let tok = tok.trim().to_string();
     (!tok.is_empty()).then_some(tok)
 }
@@ -185,10 +232,12 @@ fn spawn_client(
     profile: &str,
     log: &str,
     pid_file: &str,
+    write_dir: Option<&Path>,
 ) -> Result<Child, String> {
-    // O_NOFOLLOW (Unix): the log/pid paths come from the GUI request and this
-    // process runs as root — refuse to be tricked into writing through a
-    // symlink planted at a user-controlled path.
+    let log = resolve_write_path(log, WriteKind::Log, write_dir)?;
+    let pid_file = resolve_write_path(pid_file, WriteKind::Pid, write_dir)?;
+    // O_NOFOLLOW (Unix): even an allowlisted path can be swapped for a
+    // symlink between the check and the open.
     let mut log_opts = std::fs::OpenOptions::new();
     log_opts.create(true).append(true);
     #[cfg(unix)]
@@ -197,8 +246,8 @@ fn spawn_client(
         log_opts.custom_flags(libc::O_NOFOLLOW);
     }
     let log_out = log_opts
-        .open(log)
-        .map_err(|e| format!("cannot open log file {log}: {e}"))?;
+        .open(&log)
+        .map_err(|e| format!("cannot open log file {}: {e}", log.display()))?;
     let log_err = log_out
         .try_clone()
         .map_err(|e| format!("cannot clone log handle: {e}"))?;
@@ -219,12 +268,12 @@ fn spawn_client(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start {client_bin}: {e}"))?;
-    if let Err(e) = write_nofollow(Path::new(pid_file), format!("{}\n", child.id()).as_bytes()) {
+    if let Err(e) = write_nofollow(&pid_file, format!("{}\n", child.id()).as_bytes()) {
         // Without the pidfile the GUI can neither show nor stop this run;
         // don't leave an orphaned root client behind.
         let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("cannot write pid file {pid_file}: {e}"));
+        let _ = wait_with_timeout(&mut child, Duration::from_secs(2));
+        return Err(format!("cannot write pid file {}: {e}", pid_file.display()));
     }
     Ok(child)
 }
@@ -243,6 +292,124 @@ fn write_nofollow(path: &Path, data: &[u8]) -> std::io::Result<()> {
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     opts.open(path)?.write_all(data)
+}
+
+#[derive(Clone, Copy)]
+enum WriteKind {
+    Log,
+    Pid,
+}
+
+impl WriteKind {
+    fn allows(self, name: &str) -> bool {
+        match self {
+            WriteKind::Log => name == "shadowvpn.log" || name == "shadowvpn.log.out",
+            WriteKind::Pid => name == "shadowvpn.pid",
+        }
+    }
+}
+
+/// Refuse Connect paths that would let this root process create/truncate an
+/// arbitrary file. Session helpers pin writes to the token file's directory;
+/// the daemon (no GUI-supplied dir) requires a user-home prefix, the app-id
+/// component, a `runs/` parent, and a fixed basename.
+fn resolve_write_path(
+    requested: &str,
+    kind: WriteKind,
+    allow_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let path = Path::new(requested);
+    if !path.is_absolute() {
+        return Err(format!("{requested}: write path must be absolute"));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("{requested}: write path must not contain '..'"));
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("{requested}: write path has no file name"))?;
+    if !kind.allows(name) {
+        return Err(format!(
+            "{requested}: writes are restricted to shadowvpn.log / shadowvpn.pid"
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{requested}: write path has no parent"))?;
+    if parent.file_name().and_then(|n| n.to_str()) != Some("runs") {
+        return Err(format!(
+            "{requested}: writes are restricted to a runs/ directory"
+        ));
+    }
+    let parent_canon = parent.canonicalize().map_err(|e| {
+        format!(
+            "{}: runs directory is missing or unreachable ({e})",
+            parent.display()
+        )
+    })?;
+    if let Some(dir) = allow_dir {
+        let dir_canon = dir.canonicalize().map_err(|e| {
+            format!(
+                "{}: session runs directory is missing or unreachable ({e})",
+                dir.display()
+            )
+        })?;
+        if parent_canon != dir_canon {
+            return Err(format!(
+                "{requested}: write path is outside the session runs directory"
+            ));
+        }
+    } else {
+        if !parent_canon.components().any(|c| c.as_os_str() == APP_ID) {
+            return Err(format!(
+                "{requested}: write path is not under the ShadowVPN app directory"
+            ));
+        }
+        if !has_user_home_prefix(&parent_canon) {
+            return Err(format!(
+                "{requested}: write path is not under a user home directory"
+            ));
+        }
+    }
+    Ok(parent_canon.join(name))
+}
+
+fn has_user_home_prefix(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        path.starts_with("/Users/")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        path.starts_with("/home/") || path.starts_with("/root/")
+    }
+    #[cfg(windows)]
+    {
+        path.components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("Users"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        false
+    }
+}
+
+/// Poll `try_wait` until the child exits or `timeout` elapses.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("wait for client exit failed: {e}")),
+        }
+    }
 }
 
 /// `Command::output()` with a deadline: this helper serves all requests on a
@@ -300,13 +467,8 @@ fn stop_child(child: &mut Child) -> Result<(), String> {
     {
         let pid = child.id() as i32;
         let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
-        if ret == 0 {
-            for _ in 0..50 {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
+        if ret == 0 && wait_with_timeout(child, Duration::from_secs(10))? {
+            return Ok(());
         }
         // Never delivered, ignored, or hung mid-cleanup: force it.
         let _ = child.kill();
@@ -315,10 +477,14 @@ fn stop_child(child: &mut Child) -> Result<(), String> {
     {
         let _ = child.kill();
     }
-    child
-        .wait()
-        .map(|_| ())
-        .map_err(|e| format!("wait for client exit failed: {e}"))
+    if wait_with_timeout(child, Duration::from_secs(10))? {
+        Ok(())
+    } else {
+        // D-state I/O (the case `wait_for_exit` already worries about on the
+        // GUI side) would block `Child::wait` forever and wedge this
+        // single-threaded helper with the IPC mutex held.
+        Err("client did not exit after SIGKILL".to_string())
+    }
 }
 
 fn handle_conn(stream: TcpStream, args: &Args, slot: &ChildSlot) -> bool {
@@ -328,10 +494,13 @@ fn handle_conn(stream: TcpStream, args: &Args, slot: &ChildSlot) -> bool {
         Ok(w) => w,
         Err(_) => return false,
     };
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream.take(MAX_REQUEST_BYTES + 1));
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return false;
+    match reader.read_line(&mut line) {
+        Ok(0) => return false,
+        Ok(_) if line.len() as u64 > MAX_REQUEST_BYTES || !line.ends_with('\n') => return false,
+        Ok(_) => {}
+        Err(_) => return false,
     }
 
     let (resp, shutdown) = respond(&line, args, slot);
@@ -381,7 +550,13 @@ fn respond(line: &str, args: &Args, slot: &ChildSlot) -> (Response, bool) {
             if guard.is_some() {
                 return (Response::err("client already running"), false);
             }
-            match spawn_client(&args.client_bin, &profile, &log, &pid_file) {
+            match spawn_client(
+                &args.client_bin,
+                &profile,
+                &log,
+                &pid_file,
+                args.write_dir.as_deref(),
+            ) {
                 Ok(child) => {
                     let pid = child.id();
                     *guard = Some(child);
@@ -408,7 +583,13 @@ fn respond(line: &str, args: &Args, slot: &ChildSlot) -> (Response, bool) {
                     },
                     false,
                 ),
-                Err(e) => (Response::err(e), false),
+                Err(e) => {
+                    // Rust does not kill on drop. Put the child back so the
+                    // next Connect cannot start a second root client while
+                    // this one is still alive.
+                    *guard = Some(child);
+                    (Response::err(e), false)
+                }
             },
             None => (
                 // Idempotent, but flagged so the GUI can fall back to a
@@ -584,5 +765,98 @@ fn main() {
         if handle_conn(stream, &args, &slot) {
             break; // shutdown requested (response already sent)
         }
+    }
+}
+
+#[cfg(test)]
+mod write_path_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn uniq_dir() -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "svpn-helper-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rejects_relative_and_dotdot() {
+        let err = resolve_write_path("runs/shadowvpn.log", WriteKind::Log, None).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        let err = resolve_write_path("/tmp/runs/../runs/shadowvpn.log", WriteKind::Log, None)
+            .unwrap_err();
+        assert!(err.contains(".."), "{err}");
+    }
+
+    #[test]
+    fn rejects_wrong_basename_or_parent() {
+        let root = uniq_dir();
+        let runs = root.join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        let err = resolve_write_path(
+            &runs.join("evil.log").to_string_lossy(),
+            WriteKind::Log,
+            Some(&runs),
+        )
+        .unwrap_err();
+        assert!(err.contains("restricted"), "{err}");
+        let other = root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        let err = resolve_write_path(
+            &other.join("shadowvpn.log").to_string_lossy(),
+            WriteKind::Log,
+            Some(&runs),
+        )
+        .unwrap_err();
+        assert!(err.contains("runs/"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_allows_only_token_dir() {
+        let root = uniq_dir();
+        let runs = root.join("runs");
+        let other = root.join("other").join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let ok = resolve_write_path(
+            &runs.join("shadowvpn.pid").to_string_lossy(),
+            WriteKind::Pid,
+            Some(&runs),
+        )
+        .unwrap();
+        assert_eq!(ok.file_name().unwrap(), "shadowvpn.pid");
+        let err = resolve_write_path(
+            &other.join("shadowvpn.pid").to_string_lossy(),
+            WriteKind::Pid,
+            Some(&runs),
+        )
+        .unwrap_err();
+        assert!(err.contains("outside"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn daemon_rejects_tmp_even_with_app_id() {
+        let root = uniq_dir();
+        let runs = root.join(APP_ID).join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        let err = resolve_write_path(
+            &runs.join("shadowvpn.log").to_string_lossy(),
+            WriteKind::Log,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("home") || err.contains("ShadowVPN app"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
