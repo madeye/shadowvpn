@@ -74,8 +74,10 @@ aes-gcm = { version = "0.11.0-rc.4", features = ["alloc"] }
 chacha20poly1305 = { version = "0.11.0-rc.3", features = ["alloc"] }
 
 # Key derivation: HKDF-SHA1 subkeys + MD5-based EVP_BytesToKey master key.
+# SHA-256: assigner probe offset + client state-file name (must be stable).
 hkdf = "0.13"
 sha1 = "0.11"
+sha2 = "0.11"
 md-5 = "0.11"
 
 # Error handling.

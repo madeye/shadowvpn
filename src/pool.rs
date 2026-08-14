@@ -29,22 +29,29 @@ pub struct LeasePool {
     cursor: u32,
 }
 
+/// Inclusive host-order range of subnet hosts (network and broadcast excluded).
+///
+/// `start > end` means the range is empty (e.g. `/31`, `/32`). The server's
+/// own address is still inside the range when it is a host; callers skip it.
+pub fn host_range(addr: Ipv4Addr, netmask: Ipv4Addr) -> (u32, u32) {
+    let ip = u32::from(addr);
+    let mask = u32::from(netmask);
+    let network = ip & mask;
+    let broadcast = network | !mask;
+    let start = network.saturating_add(1);
+    let end = broadcast.saturating_sub(1);
+    (start, end)
+}
+
 impl LeasePool {
     /// Build a pool spanning the host addresses of `server_ip`'s subnet (per
     /// `netmask`), excluding the network, broadcast, and server addresses.
     pub fn new(server_ip: Ipv4Addr, netmask: Ipv4Addr, ttl: Duration) -> Self {
-        let ip = u32::from(server_ip);
-        let mask = u32::from(netmask);
-        let network = ip & mask;
-        let broadcast = network | !mask;
-        // First/last host; for a degenerate mask (/31, /32) this yields an empty
-        // range (start > end), which `allocate` reports as exhausted.
-        let start = network.saturating_add(1);
-        let end = broadcast.saturating_sub(1);
+        let (start, end) = host_range(server_ip, netmask);
         Self {
             start,
             end,
-            server_ip: ip,
+            server_ip: u32::from(server_ip),
             ttl,
             leases: HashMap::new(),
             cursor: start,
