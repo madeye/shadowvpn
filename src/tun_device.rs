@@ -27,7 +27,7 @@ use crate::config::TunConfig;
 /// dropped.
 pub struct TunDevice {
     inner: AsyncDevice,
-    /// Last IPv6 this wrapper programmed. Initialized by every constructor.
+    /// Last IPv6 this wrapper programmed, so apply can remove it.
     programmed_ip6: Mutex<Option<IpAddr>>,
 }
 
@@ -67,7 +67,7 @@ impl TunDevice {
     /// Create a TUN with only a name and MTU, leaving addresses unset.
     ///
     /// Auto-assign clients apply the server's assignment afterwards via
-    /// [`Self::apply_assignment`]. `programmed_ip6` starts as `None`.
+    /// [`Self::apply_assignment`].
     pub fn create_unaddressed(name: Option<&str>, mtu: u16) -> std::io::Result<Self> {
         let mut builder = DeviceBuilder::new().mtu(mtu);
         if let Some(name) = name {
@@ -94,8 +94,8 @@ impl TunDevice {
         self.inner
             .set_network_address(ip, netmask, assignment_destination(peer))?;
 
-        if let Some(old) = take_programmed_ip6(&self.programmed_ip6) {
-            let _ = self.inner.remove_address(old);
+        if let Some(old) = peek_programmed_ip6(&self.programmed_ip6) {
+            forget_if_removed(&self.programmed_ip6, self.inner.remove_address(old))?;
         }
         if let Some(n) = ip6 {
             self.inner.add_address_v6(n.ip(), n.prefix())?;
@@ -150,12 +150,49 @@ fn assignment_destination(peer: Ipv4Addr) -> Option<Ipv4Addr> {
     Some(peer)
 }
 
+fn peek_programmed_ip6(slot: &Mutex<Option<IpAddr>>) -> Option<IpAddr> {
+    *slot.lock().unwrap()
+}
+
 fn take_programmed_ip6(slot: &Mutex<Option<IpAddr>>) -> Option<IpAddr> {
     slot.lock().unwrap().take()
 }
 
 fn record_programmed_ip6(slot: &Mutex<Option<IpAddr>>, ip: Ipv6Addr) {
     *slot.lock().unwrap() = Some(IpAddr::V6(ip));
+}
+
+fn address_already_gone(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::AddrNotAvailable
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_FOUND — netsh/IP Helper when the address is already gone
+        if err.raw_os_error() == Some(1168) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Forget the slot only after the address is gone from the TUN, so a failed
+/// remove can be retried on the next apply.
+fn forget_if_removed(slot: &Mutex<Option<IpAddr>>, remove: io::Result<()>) -> io::Result<()> {
+    match remove {
+        Ok(()) => {
+            take_programmed_ip6(slot);
+            Ok(())
+        }
+        Err(e) if address_already_gone(&e) => {
+            take_programmed_ip6(slot);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// A prefix actually installed on the TUN (network address, not a host `/32`/`/128`).
@@ -341,8 +378,6 @@ mod tests {
         assert_eq!(old, Some(IpAddr::V6(create_v6)));
         assert_eq!(*slot.lock().unwrap(), Some(IpAddr::V6(first.ip())));
 
-        // Re-apply the same assignment: the previous v6 is taken for remove,
-        // then a single new one is recorded.
         let old = take_programmed_ip6(&slot);
         record_programmed_ip6(&slot, first.ip());
         assert_eq!(old, Some(IpAddr::V6(first.ip())));
@@ -352,6 +387,24 @@ mod tests {
         record_programmed_ip6(&slot, second.ip());
         assert_eq!(old, Some(IpAddr::V6(first.ip())));
         assert_eq!(*slot.lock().unwrap(), Some(IpAddr::V6(second.ip())));
+    }
+
+    #[test]
+    fn failed_remove_keeps_programmed_ip6() {
+        let ip: Ipv6Addr = "fd07:7::1".parse().unwrap();
+        let slot = Mutex::new(Some(IpAddr::V6(ip)));
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "busy");
+        assert!(forget_if_removed(&slot, Err(err)).is_err());
+        assert_eq!(*slot.lock().unwrap(), Some(IpAddr::V6(ip)));
+    }
+
+    #[test]
+    fn gone_remove_forgets_programmed_ip6() {
+        let ip: Ipv6Addr = "fd07:7::1".parse().unwrap();
+        let slot = Mutex::new(Some(IpAddr::V6(ip)));
+        let err = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert!(forget_if_removed(&slot, Err(err)).is_ok());
+        assert!(slot.lock().unwrap().is_none());
     }
 
     #[test]
