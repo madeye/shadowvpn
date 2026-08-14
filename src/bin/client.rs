@@ -854,6 +854,16 @@ async fn start_policy_and_installer(
     Ok(())
 }
 
+/// Abort the DNS-proxy task and wait for it to exit so `dns_listen` is released
+/// before a replacement `spawn` (dropping the JoinHandle would detach it).
+async fn shutdown_policy(handle: &mut Option<shadowvpn::policy::PolicyHandle>) {
+    if let Some(mut old) = handle.take() {
+        old.task.abort();
+        let _ = (&mut old.task).await;
+        drop(old);
+    }
+}
+
 fn reply_ip6(
     want_ip6: bool,
     reply: &Assign,
@@ -913,7 +923,17 @@ async fn handle_assign_reply(
     let static_ip6 = if cfg.want_ip6 { None } else { cfg.tun.ip6 };
     let ip6 = reply_ip6(cfg.want_ip6, &reply, static_ip6);
     let old_ip = cfg.tun.ip;
+    let old_ip6 = cfg.tun.ip6;
     let ipv4_changed = !old_ip.is_unspecified() && old_ip != reply.tun_ip;
+    // Periodic refresh: do not re-program the TUN / persist / log every 15s.
+    if !first_ok
+        && reply.tun_ip == cfg.tun.ip
+        && reply.netmask == cfg.tun.netmask
+        && reply.peer_ip == cfg.tun.peer_ip
+        && ip6 == cfg.tun.ip6
+    {
+        return Ok(());
+    }
 
     tun.apply_assignment(reply.tun_ip, reply.netmask, reply.peer_ip, ip6)
         .context("failed to apply tunnel assignment")?;
@@ -943,10 +963,8 @@ async fn handle_assign_reply(
             "TUN IPv4 changed from {old_ip} to {}; in-flight sockets bound to the old address will break",
             reply.tun_ip
         );
-        // Both store an immutable tun_ip; Drop uninstalls the old routes.
-        if cfg.policy.mode.is_enabled() {
-            drop(policy_handle.take());
-        }
+        // JoinHandle drop would detach the proxy and leave 127.0.0.1:53 bound.
+        shutdown_policy(policy_handle).await;
         if cfg.accept_routes {
             *installer_slot.lock().unwrap() = None;
             *route_guard = None;
@@ -966,7 +984,7 @@ async fn handle_assign_reply(
 
     persist_assignment(state_path, &cfg.server, node_id, &reply, ip6);
 
-    if !*got_ok {
+    if first_ok {
         assigned_ok.store(true, Ordering::Release);
         *got_ok = true;
         *assign_retry = None;
@@ -984,13 +1002,13 @@ async fn handle_assign_reply(
     let v6 = ip6
         .map(|n| n.to_string())
         .unwrap_or_else(|| "-".to_string());
-    if ipv4_changed || old_ip.is_unspecified() {
+    if first_ok && !old_ip.is_unspecified() && !ipv4_changed && ip6 == old_ip6 {
+        info!("assignment confirmed (cached): {} / {v6}", reply.tun_ip);
+    } else {
         info!(
             "TUN assigned: {} / {v6} (peer {} ttl {}s)",
             reply.tun_ip, reply.peer_ip, reply.ttl_secs
         );
-    } else {
-        info!("assignment confirmed (cached): {} / {v6}", reply.tun_ip);
     }
 
     // Immediate advert on first Ok (and if the IPv4 moved); later ticks send it.
