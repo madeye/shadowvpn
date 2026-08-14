@@ -86,7 +86,7 @@ Auto-assign clients ([omit `tun_ip` / `peer_ip`](./auto-assign)) wait up to
 - **Server `--nat`** — assignment is exclusive with NAT. A new NAT server
   replies `NatMode` (fatal); an old one times out. Drop `"nat": true` from
   `server.json` if you want client↔client, or put static IPs back on the
-  client. Note: `install.sh --setup` still writes `"nat": true`.
+  client. `install.sh --setup` writes learning mode (no `"nat"`).
 - **Pool exhausted** — status `Exhausted`. Widen `tun_netmask` /
   `assign_pool`, or wait for idle leases (default 7 days) to expire.
 - **Only one of `tun_ip` / `peer_ip` set** — both must be present

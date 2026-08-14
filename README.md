@@ -356,8 +356,9 @@ with a single command (see
 # server
 curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server
 
-# server, full setup (Linux): generate config (random password, NAT on), install
-# + enable the systemd service, open the firewall port, print the client config
+# server, full setup (Linux): generate config (random password, learning
+# mode + auto-assign), install + enable the systemd service, open the
+# firewall port, print the client config (no tun_ip/peer_ip)
 curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup
 
 # client (also installs the bundled gfwlist.txt for policy routing)

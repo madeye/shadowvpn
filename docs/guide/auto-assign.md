@@ -44,11 +44,9 @@ valid: the server assigns IPv4 and the client keeps the configured ULA.
 Once two clients are up they can ping each other (`10.9.0.37` ↔ `10.9.0.4`)
 and the server (`10.9.0.1`) without any extra routing on the server.
 
-::: warning `--setup` still enables NAT
-`install.sh --setup` still writes `"nat": true` until that default flips.
-A no-`tun_ip` client against a NAT server exits fatal (`NatMode`). Either
-drop `"nat"` from the generated `server.json`, or keep static `tun_ip` /
-`peer_ip` on the client.
+::: tip
+`install.sh --setup` writes this learning-mode `server.json` (no `"nat"`)
+and prints a matching client snippet with `tun_ip` / `peer_ip` omitted.
 :::
 
 ## How it works

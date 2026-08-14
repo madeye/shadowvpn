@@ -26,12 +26,14 @@ curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/insta
 On a Linux server, add `--setup` to go from zero to a **running service** in
 one command. Beyond installing the binary, it:
 
-- writes `/etc/shadowvpn/server.json` with a **random password** and
-  [`"nat": true`](./multi-client) (an existing config is never overwritten),
+- writes `/etc/shadowvpn/server.json` with a **random password** in
+  [learning mode](./auto-assign) (assignment always on; `peer_ip` `.2` is
+  reserved; an existing config is never overwritten),
 - installs the systemd unit with the **detected WAN interface** and tunnel
   subnet, then enables + starts it,
 - opens the UDP port in **ufw/firewalld** (if active),
-- prints the **matching client config**, ready to paste on your devices.
+- prints the **matching client config** (no `tun_ip` / `peer_ip` — the
+  server auto-assigns), ready to paste on your devices.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup
