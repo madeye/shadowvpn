@@ -109,7 +109,7 @@ Assignment is always on in learning mode — any client that sends
 | `assign_pool`     | `--assign-pool`      | TUN host range | Allocator-only IPv4 CIDR; must be a subset of the TUN network. The reply still carries the TUN netmask. |
 | `reserved_ips`    | `--reserved-ips`     | `[peer_ip]` | Extra IPv4s never auto-assigned. Unioned with `peer_ip`, not a replacement. |
 | `assign_ttl_secs` | `--assign-ttl-secs`  | `604800` (7d) | Idle time before an assignment is reclaimed. |
-| `lease_file`      | `--lease-file`       | next to `--config`, else `/var/lib/shadowvpn/leases.json` | Persist path. `"-"` disables. |
+| `lease_file`      | `--lease-file`       | `<config>.leases.json` next to `--config`, else `/var/lib/shadowvpn/leases.json` | Persist path. `"-"` disables. |
 
 A `/24` minus network / broadcast / server / reserved `.2` is 252
 assignable addresses. The server logs `assigned/capacity` and warns at 80%.

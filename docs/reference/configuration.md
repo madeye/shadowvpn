@@ -33,7 +33,7 @@ The alias `chacha20-ietf-poly1305` is accepted for `cipher` and treated as
 | `assign_pool`    | `--assign-pool`    | IPv4 CIDR the assigner may hand out (subset of the TUN network). Allocator-only; the Assign reply still carries the TUN netmask ([auto-assign](/guide/auto-assign)) | TUN host range |
 | `reserved_ips`   | `--reserved-ips`   | extra IPv4s never auto-assigned (unioned with `peer_ip`, which is always reserved — typically `.2`) | `[peer_ip]` |
 | `assign_ttl_secs` | `--assign-ttl-secs` | idle time before an assignment lease is reclaimed        | `604800` (7d) |
-| `lease_file`     | `--lease-file`     | assignment lease persist path. `"-"` disables. Default: next to `--config`, else `/var/lib/shadowvpn/leases.json` (`%PROGRAMDATA%\shadowvpn\leases.json` on Windows) | see left |
+| `lease_file`     | `--lease-file`     | assignment lease persist path. `"-"` disables. Default: `<config>.leases.json` next to `--config`, else `/var/lib/shadowvpn/leases.json` (`%PROGRAMDATA%\shadowvpn\leases.json` on Windows) | see left |
 
 Mesh routing (`approve_routes` / `auto_approve_routes` / `tun_ip6`) and
 [automatic assignment](/guide/auto-assign) require the default learning
