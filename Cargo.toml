@@ -1,6 +1,6 @@
 [package]
 name = "shadowvpn"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "A UDP-based, pre-shared-key (PSK), user-mode VPN using the shadowsocks AEAD UDP wire scheme."
 license = "MIT"
@@ -11,12 +11,17 @@ readme = "README.md"
 keywords = ["vpn", "tunnel", "shadowsocks", "udp", "aead"]
 categories = ["network-programming", "command-line-utilities"]
 # Keep the published package lean: ship the crate sources, README, and LICENSE,
-# but not the CI / Docker test harness or platform launcher scripts.
-exclude = ["/docker", "/.github", "/scripts", "/desktop"]
+# but not the CI / Docker test harness, desktop app, or agent skills.
+exclude = ["/docker", "/.github", "/scripts", "/desktop", "/.claude"]
 
 # docs.rs builds with all features so the optional `uri` module is documented.
+# Feature-gate badges are automatic on current rustdoc (the old
+# `feature(doc_auto_cfg)` nightly gate was removed).
 [package.metadata.docs.rs]
 all-features = true
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
 
 # Release builds are the ones that move packets, so optimize for the data plane:
 # fat LTO + a single codegen unit let the per-packet crypto/obfs/relay code inline

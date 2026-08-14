@@ -97,7 +97,7 @@ impl QuicObfs {
 }
 
 /// Carrier obfuscation applied to every datagram. Both ends must select the same
-/// variant; wire formats are documented in DESIGN.md.
+/// variant; see the module-level docs for the QUIC short-header wire format.
 pub enum Obfuscator {
     /// QUIC 1-RTT short-header shaping — binary, looks like HTTP/3.
     Quic(QuicObfs),
