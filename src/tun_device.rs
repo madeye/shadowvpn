@@ -169,14 +169,17 @@ fn address_already_gone(err: &io::Error) -> bool {
     ) {
         return true;
     }
-    #[cfg(windows)]
-    {
-        // ERROR_NOT_FOUND — netsh/IP Helper when the address is already gone
-        if err.raw_os_error() == Some(1168) {
-            return true;
-        }
-    }
-    false
+    // tun-rs 2.8.1 wraps netsh failures as Error::other("cmd=…,out=…") with no OS code.
+    err.kind() == io::ErrorKind::Other && netsh_address_gone(err)
+}
+
+fn netsh_address_gone(err: &io::Error) -> bool {
+    let msg = err.to_string();
+    let Some(out) = msg.split("out=").nth(1) else {
+        return false;
+    };
+    let out = out.to_ascii_lowercase();
+    out.contains("not present") || out.contains("element not found")
 }
 
 /// Forget the slot only after the address is gone from the TUN, so a failed
@@ -405,6 +408,30 @@ mod tests {
         let err = io::Error::new(io::ErrorKind::NotFound, "gone");
         assert!(forget_if_removed(&slot, Err(err)).is_ok());
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn windows_netsh_gone_forgets_programmed_ip6() {
+        let ip: Ipv6Addr = "fd07:7::1".parse().unwrap();
+        let slot = Mutex::new(Some(IpAddr::V6(ip)));
+        let err = io::Error::other(
+            r#"cmd="netsh interface ipv6 delete address 12 fd07:7::1",out="The specified address is not present on the interface.""#,
+        );
+        assert!(address_already_gone(&err));
+        assert!(forget_if_removed(&slot, Err(err)).is_ok());
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn windows_netsh_denied_keeps_programmed_ip6() {
+        let ip: Ipv6Addr = "fd07:7::1".parse().unwrap();
+        let slot = Mutex::new(Some(IpAddr::V6(ip)));
+        let err = io::Error::other(
+            r#"cmd="netsh interface ipv6 delete address 12 fd07:7::1",out="Access is denied.""#,
+        );
+        assert!(!address_already_gone(&err));
+        assert!(forget_if_removed(&slot, Err(err)).is_err());
+        assert_eq!(*slot.lock().unwrap(), Some(IpAddr::V6(ip)));
     }
 
     #[test]
