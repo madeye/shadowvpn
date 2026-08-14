@@ -126,24 +126,24 @@
               <label>
                 Mode
                 <select id="f-mode">
-                  <option value="">full (default)</option>
-                  <option value="full">full</option>
+                  <option value="">off (don't touch routing)</option>
+                  <option value="full">full (same as off)</option>
                   <option value="gfwlist">gfwlist</option>
                   <option value="chinadns">chinadns</option>
                 </select>
               </label>
 
-              <label>
+              <label class="policy-field" data-for-mode="gfwlist chinadns">
                 dns_listen
                 <input id="f-dns_listen" type="text" placeholder="127.0.0.1:53" />
               </label>
 
-              <label>
+              <label class="policy-field" data-for-mode="gfwlist chinadns">
                 dns_local
                 <input id="f-dns_local" type="text" placeholder="114.114.114.114:53" />
               </label>
 
-              <label>
+              <label class="policy-field" data-for-mode="gfwlist chinadns">
                 dns_remote
                 <input id="f-dns_remote" type="text" placeholder="8.8.8.8:53" />
               </label>
@@ -180,8 +180,8 @@
                 <input id="f-geoip_country" type="text" placeholder="CN" />
               </label>
 
-              <label class="checkbox-label">
-                <input id="f-set_dns" type="checkbox" checked />
+              <label class="checkbox-label policy-field" data-for-mode="gfwlist chinadns">
+                <input id="f-set_dns" type="checkbox" />
                 Manage system DNS (set_dns)
               </label>
             </fieldset>

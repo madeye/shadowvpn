@@ -318,7 +318,8 @@
     fChnroute.value = config.chnroute || "";
     fGeoip.value = config.geoip || "";
     fGeoipCountry.value = config.geoip_country || "";
-    fSetDns.checked = config.set_dns !== false;
+    // set_dns only applies in gfwlist/chinadns; leave it off when routing is untouched.
+    fSetDns.checked = isPolicyMode(config.mode) && config.set_dns !== false;
 
     fDnsTimeoutMs.value =
       config.dns_timeout_ms != null ? String(config.dns_timeout_ms) : "";
@@ -483,8 +484,12 @@
     }
   });
 
+  function isPolicyMode(mode) {
+    return mode === "gfwlist" || mode === "chinadns";
+  }
+
   function updatePolicyFieldsState() {
-    const mode = fMode.value || "full";
+    const mode = fMode.value;
     document.querySelectorAll(".policy-field").forEach((label) => {
       // `data-for-mode` may list several modes (space-separated), e.g. the
       // gfwlist path is used by gfwlist mode and as a chinadns force-tunnel
@@ -539,7 +544,10 @@
     updatePathHints();
   }
 
-  fMode.addEventListener("change", updatePolicyFieldsState);
+  fMode.addEventListener("change", () => {
+    if (isPolicyMode(fMode.value)) fSetDns.checked = true;
+    updatePolicyFieldsState();
+  });
   fAutoTun.addEventListener("change", updateAutoTunFields);
   [fGfwlist, fChnroute, fGeoip].forEach((input) => {
     input.addEventListener("input", updatePathHints);
@@ -593,7 +601,12 @@
       chnroute: strOrUndef(fChnroute),
       geoip: strOrUndef(fGeoip),
       geoip_country: strOrUndef(fGeoipCountry),
-      set_dns: fSetDns.checked ? undefined : false,
+      // Omit set_dns unless a policy mode is on (client default is unused in full/off).
+      set_dns: isPolicyMode(fMode.value)
+        ? fSetDns.checked
+          ? undefined
+          : false
+        : undefined,
       dns_timeout_ms: intOrUndef(fDnsTimeoutMs),
       cache_file: strOrUndef(fCacheFile),
     });
