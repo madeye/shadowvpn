@@ -76,17 +76,43 @@ from the start, run with `--no-set-dns`.
   (possibly poisoned) address goes direct; add it to a `--gfwlist` force list
   to always tunnel it.
 
+## Assignment failed / "server did not assign an IP"
+
+Auto-assign clients ([omit `tun_ip` / `peer_ip`](./auto-assign)) wait up to
+10 seconds for an `Assign` Ok. Common causes:
+
+- **Old server** — it drops unknown `0x03` control types. Upgrade the
+  server, or set a static `tun_ip` / `peer_ip`.
+- **Server `--nat`** — assignment is exclusive with NAT. A new NAT server
+  replies `NatMode` (fatal); an old one times out. Drop `"nat": true` from
+  `server.json` if you want client↔client, or put static IPs back on the
+  client. Note: `install.sh --setup` still writes `"nat": true`.
+- **Pool exhausted** — status `Exhausted`. Widen `tun_netmask` /
+  `assign_pool`, or wait for idle leases (default 7 days) to expire.
+- **Only one of `tun_ip` / `peer_ip` set** — both must be present
+  (static) or both omitted (auto).
+
+The `node_id` is in `<config>.state`, not the JSON. Do not copy that file
+onto a second live machine — both clients will flap on the same IP. Copying
+it is the supported way to *move* a node.
+
+A static client that uses an address the server has already leased is not
+learned (`warn` on the server). Add that address to `reserved_ips`.
+`.2` (`peer_ip`) is reserved by default.
+
 ## Keepalives, NAT timeouts, and idle drops
 
 The client sends an encrypted keepalive every **15 seconds** by default so
 stateful NAT/firewall mappings stay open and the server keeps an up-to-date
-view of the client's UDP address. If your NAT/router expires UDP mappings
-faster than the keepalive interval, the server sees the client's address
-"churn" — each keepalive arrives from a fresh mapping. Either raise the
-router's UDP session timeout or lower `--keepalive-secs` so it stays below the
-timeout. In server [NAT mode](./multi-client), idle client leases are
-reclaimed after `lease_ttl_secs` (default 120) — an idle-but-alive client
-keeps its lease via the keepalive alone.
+view of the client's UDP address. Auto-assign clients send `AssignRequest`
+on that same tick instead of the 5-byte keepalive. If your NAT/router
+expires UDP mappings faster than the keepalive interval, the server sees the
+client's address "churn" — each keepalive arrives from a fresh mapping.
+Either raise the router's UDP session timeout or lower `--keepalive-secs` so
+it stays below the timeout. In server [NAT mode](./multi-client), idle
+client leases are reclaimed after `lease_ttl_secs` (default 120) — an
+idle-but-alive client keeps its lease via the keepalive alone. Assignment
+leases last 7 days by default (`assign_ttl_secs`).
 
 ## MTU problems (some sites hang, large transfers stall)
 

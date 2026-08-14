@@ -59,7 +59,10 @@ accepting clients on their next push.
 
 Mesh routing requires the default learning mode — it identifies clients by
 their distinct tunnel IPs, which `--nat` mode deliberately erases, so the two
-cannot be combined.
+cannot be combined. [Automatic assignment](./auto-assign) works on top:
+clients may omit `tun_ip` / `peer_ip` and still advertise, accept, and
+hub-relay subnets. Assignment is the node-IP piece; this page is the
+subnet-router piece.
 
 ## Subnet router client: advertise
 
@@ -147,7 +150,15 @@ keepalive   : 00                      (legacy, 1 byte)
 keepalive   : 00 ip4[4]               (legacy, 5 bytes)
 route advert: 00 01 flags ip4[4] ip6[16] count { family plen addr[4|16] }*
 route push  : 00 02 00    count { family plen addr[4|16] }*
+assign req  : 00 03 flags node[16] hint4[4] hint6[16]     (39 bytes)
+assign      : 00 04 status ip4[4] mask[4] peer[4] ip6[16] plen6 flags ttl[4]
+                                                              (37 bytes)
 ```
+
+Auto clients replace the 5-byte keepalive with `AssignRequest` and, when
+mesh is active, send a `RouteAdvert` immediately on `Assign` Ok and again
+on every tick. See [automatic assignment](./auto-assign) and the
+[wire protocol](/reference/wire-protocol#control-channel).
 
 Like every ShadowVPN datagram, control messages are AEAD-authenticated with
 the pre-shared key — a route advert is exactly as trustworthy as the header

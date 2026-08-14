@@ -220,14 +220,14 @@ if [ "$SETUP" = 0 ] && [ "$IS_ROOT" = 1 ] && [ ! -f "$ETC_DIR/$ROLE.json" ]; the
 }
 EOF
   else
+    # this client.json is for a learning-mode server; install.sh --setup
+    # still writes nat: true until that default flips.
     cat > "$ETC_DIR/client.json" <<'EOF'
 {
   "server": "vpn.example.com:8388",
   "password": "CHANGE-ME",
   "cipher": "chacha20-poly1305",
-  "tun_ip": "10.9.0.2",
   "tun_netmask": "255.255.255.0",
-  "peer_ip": "10.9.0.1",
   "mtu": 1400
 }
 EOF

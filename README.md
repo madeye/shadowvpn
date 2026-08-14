@@ -71,9 +71,12 @@ source address before any real traffic flows. In the default learning mode the
 announced tunnel IP lets the server map (and re-map, after a NAT rebind) the
 client's UDP address from the keepalive alone; in `--nat` mode the keepalive
 refreshes an existing lease, and the mapping itself is allocated by the first
-real packet. The server drops any decrypted payload smaller than a 20-byte
-IPv4 header, so the keepalive never reaches the TUN write path (older 1-byte
-`0x00` keepalives are still accepted and treated as refresh-only).
+real packet. Auto-assign clients (omit `tun_ip` / `peer_ip`) send an
+`AssignRequest` (`00 03`, 39 bytes) on the same interval instead of the
+5-byte keepalive. The server drops any decrypted payload smaller than a
+20-byte IPv4 header, so the keepalive never reaches the TUN write path
+(older 1-byte `0x00` keepalives are still accepted and treated as
+refresh-only).
 
 ---
 
@@ -155,9 +158,9 @@ supplied.
 | `password`    | `-k, --password`  | pre-shared password; master key derived from it                | yes      | —                    |
 | `cipher`      | `-m, --cipher`    | AEAD cipher name                                               | no       | `chacha20-poly1305`  |
 | `tun_name`    | `--tun-name`      | explicit TUN interface name (e.g. `utun7`, `tun0`)            | no       | OS picks             |
-| `tun_ip`      | `--tun-ip`        | local IPv4 address on the TUN interface                       | yes      | —                    |
+| `tun_ip`      | `--tun-ip`        | local IPv4 on the TUN; client may omit with `peer_ip` for auto-assign | server: yes | —          |
 | `tun_netmask` | `--tun-netmask`   | IPv4 netmask for the TUN interface                            | no       | `255.255.255.0`      |
-| `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: client IP; client: server IP)| yes     | —                    |
+| `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: reserved static client; client: server IP) | server: yes | — |
 | `mtu`         | `--mtu`           | TUN interface MTU                                              | no       | `1400`               |
 | `tun_ip6`     | `--tun-ip6`       | optional IPv6 address + prefix on the TUN (e.g. `fd07:7::2/64`) | no      | none                 |
 | `obfs`        | *(config only)*   | carrier obfuscation: `none` \| `quic` \| `base64` (both ends must match) | no | `none`               |
@@ -201,7 +204,9 @@ On the **server** the `server` field is the UDP bind/listen address; on the
 ```
 
 Note how `tun_ip` and `peer_ip` are mirror images: the server's local tunnel IP
-is the client's peer, and vice versa.
+is the client's peer, and vice versa. On the client you can omit both and let
+the server assign a unique address (see
+[automatic assignment](#automatic-tunnel-ip-assignment)).
 
 ### Share a client config as a URI / QR code (`shadowvpn-uri`)
 
@@ -232,19 +237,45 @@ shadowvpn-uri qr 'shadowvpn://…'
 
 The URI carries every config field, but file-path fields (`gfwlist`, `chnroute`,
 `geoip`, `cache_file`) are only meaningful on the host that has those files —
-re-point them after importing. When several clients share one server, either give
-each a distinct `tun_ip`, or run the server with `--nat` (below) so every client
-can share one identical config.
+re-point them after importing. The persisted `node_id` is **not** in the URI; it
+lives in `<config>.state` next to the imported JSON. When several clients share
+one server, omit `tun_ip` and `peer_ip` (below) so one URI works on every
+device, or give each a distinct static `tun_ip`, or run the server with `--nat`
+so every client can share one identical placeholder config (no client↔client).
+
+### Automatic tunnel-IP assignment
+
+Omit `tun_ip` and `peer_ip` on the client and the (learning-mode) server
+assigns a unique tunnel IPv4 — and, when it has a ULA prefix of length ≤ 96,
+a matching IPv6 by embedding the IPv4 in octets `[12..16]`
+(`10.9.0.37` → `fd07:7::a09:25`). Clients can then ping each other through
+the existing hub relay. The same `client.json` / URI / QR can be copied to
+every device; `node_id` lives in `<config>.state`, not in the shared file.
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "password": "correct horse battery staple"
+}
+```
+
+The server still requires `tun_ip` + `peer_ip`. `peer_ip` (typically `.2`) is
+**reserved** so mixed static/auto fleets do not hand `.2` to the first auto
+laptop. Assignment is always on in learning mode. `--nat` is exclusive (a
+NAT server replies `NatMode`; auto clients exit fatal). Wire: `AssignRequest`
+`00 03` (39 bytes) / `Assign` `00 04` (37 bytes). See the
+[automatic assignment guide](https://madeye.github.io/shadowvpn/guide/auto-assign).
 
 ### Multiple clients with one shared config (`--nat`)
 
 By default the server routes by learning each client's inner tunnel source IP, so
-clients must use distinct `tun_ip`s. With `--nat` the server instead tells clients
-apart by their UDP endpoint and maps each onto a **distinct internal IP** drawn
-from the TUN subnet, rewriting inner addresses as packets pass through. Every
-client can then run the **same static config** (same placeholder `tun_ip`) — no
-per-client setup, and no IP-assignment handshake (0-RTT: a client just starts
-sending).
+clients must use distinct `tun_ip`s (or omit them and let the server assign).
+With `--nat` the server instead tells clients apart by their UDP endpoint and
+maps each onto a **distinct internal IP** drawn from the TUN subnet, rewriting
+inner addresses as packets pass through. Every client can then run the **same
+static config** (same placeholder `tun_ip`) — no per-client setup, and no
+IP-assignment handshake (0-RTT: a client just starts sending). `--nat` cannot
+be combined with assignment or mesh routing.
 
 **Server** — add `"nat": true` (or `--nat`):
 
@@ -303,9 +334,12 @@ The server **hub-relays** spoke↔spoke traffic UDP→UDP by longest-prefix matc
 so client↔client and client↔subnet packets never touch the server's TUN and
 need no IP forwarding on the server. Give every node an IPv6 ULA with
 `--tun-ip6` (e.g. `fd07:7::1/64`) to route globally-unique IPv6 prefixes
-between sites whose private IPv4 ranges overlap. Control messages start with a
-`0x00` byte (an impossible IP version nibble), so old and new peers
-interoperate — unknown control payloads are simply dropped. See the
+between sites whose private IPv4 ranges overlap — or omit client `tun_ip` /
+`peer_ip` and let [automatic assignment](https://madeye.github.io/shadowvpn/guide/auto-assign)
+hand out both families. Mesh routing still works on top of assigned
+addresses. Control messages start with a `0x00` byte (an impossible IP
+version nibble), so old and new peers interoperate — unknown control
+payloads are simply dropped. See the
 [mesh routing guide](https://madeye.github.io/shadowvpn/guide/mesh-routing)
 for the full walkthrough and validation ladder.
 

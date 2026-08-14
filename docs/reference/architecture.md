@@ -21,8 +21,10 @@ Design notes:
   `SO_RCVBUF`/`SO_SNDBUF` so bursts aren't dropped at the socket.
 - **Client-address learning** — the server maps each client's inner tunnel IP
   to its current UDP endpoint, learning (and re-learning after NAT rebinds)
-  from keepalives and traffic. In [`--nat` mode](/guide/multi-client) the
-  mapping is keyed by UDP 4-tuple instead, with inner-address rewriting.
+  from keepalives, `AssignRequest`s, and traffic. Clients may
+  [omit `tun_ip` / `peer_ip`](/guide/auto-assign) and receive a unique
+  address. In [`--nat` mode](/guide/multi-client) the mapping is keyed by
+  UDP 4-tuple instead, with inner-address rewriting (no client↔client).
 
 ## Policy routing (client)
 

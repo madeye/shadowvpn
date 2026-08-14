@@ -36,9 +36,12 @@ shadowvpn-uri qr 'shadowvpn://…'
   `shadowvpn://` URI (or its QR code) as a secret.
 - File-path fields (`gfwlist`, `chnroute`, `geoip`, `cache_file`) are only
   meaningful on the host that has those files — re-point them after importing.
-- When several clients share one server, either give each a distinct
-  `tun_ip`, or run the server with [`--nat`](./multi-client) so every client
-  can share one identical config.
+- When several clients share one server, [omit `tun_ip` and `peer_ip`](./auto-assign)
+  so one URI/QR works on every device and each still gets a unique tunnel
+  IP. The persisted `node_id` lives in `<config>.state` next to the imported
+  JSON — it is **not** in the URI. Alternatively give each client a distinct
+  static `tun_ip`, or run the server with [`--nat`](./multi-client) (no
+  client↔client) so every device can share one identical placeholder config.
 
 The [desktop app](./desktop) supports `shadowvpn://` URI import/export in its
 profile manager, so a QR/URI produced here drops straight into the GUI.
