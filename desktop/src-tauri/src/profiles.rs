@@ -33,6 +33,8 @@ pub struct ProfileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tun_ip6: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obfs: Option<String>,
@@ -49,7 +51,17 @@ pub struct ProfileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertise_routes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accept_routes: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approve_routes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_approve_routes: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,6 +86,12 @@ pub struct ProfileConfig {
     pub cache_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magic_dns: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magic_dns_suffix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -372,11 +390,20 @@ mod tests {
         let json = r#"{
             "server": "vpn.example.com:8388",
             "password": "pw",
+            "tun_ip6": "fd07:7::2/64",
             "assign_pool": "10.9.0.0/24",
             "reserved_ips": ["10.9.0.2"],
             "assign_ttl_secs": 604800,
             "lease_file": "-",
-            "state_file": "/tmp/custom.state"
+            "keepalive_secs": 15,
+            "state_file": "/tmp/custom.state",
+            "advertise_routes": ["192.168.200.0/24"],
+            "accept_routes": true,
+            "approve_routes": ["192.168.0.0/16"],
+            "auto_approve_routes": false,
+            "hostname": "tyo",
+            "magic_dns": true,
+            "magic_dns_suffix": "svpn"
         }"#;
         let cfg: ProfileConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.assign_pool.as_deref(), Some("10.9.0.0/24"));
@@ -387,8 +414,36 @@ mod tests {
         assert_eq!(cfg.assign_ttl_secs, Some(604800));
         assert_eq!(cfg.lease_file.as_deref(), Some("-"));
         assert_eq!(cfg.state_file.as_deref(), Some("/tmp/custom.state"));
+        assert_eq!(cfg.tun_ip6.as_deref(), Some("fd07:7::2/64"));
+        assert_eq!(cfg.keepalive_secs, Some(15));
+        assert_eq!(
+            cfg.advertise_routes.as_deref(),
+            Some(["192.168.200.0/24".to_string()].as_slice())
+        );
+        assert_eq!(cfg.accept_routes, Some(true));
+        assert_eq!(
+            cfg.approve_routes.as_deref(),
+            Some(["192.168.0.0/16".to_string()].as_slice())
+        );
+        assert_eq!(cfg.auto_approve_routes, Some(false));
+        assert_eq!(cfg.hostname.as_deref(), Some("tyo"));
+        assert_eq!(cfg.magic_dns, Some(true));
+        assert_eq!(cfg.magic_dns_suffix.as_deref(), Some("svpn"));
         let back = serde_json::to_value(&cfg).unwrap();
         assert!(back.get("node_id").is_none());
+    }
+
+    #[test]
+    fn hostname_only_profile_parses() {
+        // Regression: Magic DNS added `hostname` to FileConfig; a CLI-written
+        // profile must open in the desktop editor.
+        let json = r#"{
+            "server": "vpn.example.com:8388",
+            "password": "pw",
+            "hostname": "tyo"
+        }"#;
+        let cfg: ProfileConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.hostname.as_deref(), Some("tyo"));
     }
 
     #[test]

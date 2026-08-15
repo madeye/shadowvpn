@@ -94,6 +94,10 @@ DNS is on, but the table stays empty.
 `hostname` is **not** carried in a URI / QR code — cloning a share must not
 clone identity, same as `node_id`.
 
+The [desktop app](./desktop) accepts these keys on a profile (a profile file
+**is** a client config) and exposes `hostname` in the editor. Leave it blank
+to keep the OS-hostname default.
+
 ## Validating
 
 From one client, after another is up:

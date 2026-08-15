@@ -53,6 +53,7 @@
   const passwordToggleBtn = document.getElementById("password-toggle-btn");
   const fCipher = document.getElementById("f-cipher");
   const fObfs = document.getElementById("f-obfs");
+  const fHostname = document.getElementById("f-hostname");
 
   const fTunName = document.getElementById("f-tun_name");
   const fAutoTun = document.getElementById("f-auto_tun");
@@ -118,6 +119,7 @@
     "peer_ip",
     "mtu",
     "obfs",
+    "hostname",
     "mode",
     "dns_listen",
     "dns_local",
@@ -302,6 +304,7 @@
     fPassword.value = config.password || "";
     fCipher.value = config.cipher || "";
     fObfs.value = config.obfs || "";
+    fHostname.value = config.hostname || "";
 
     fTunName.value = config.tun_name || "";
     fTunIp.value = config.tun_ip || "";
@@ -593,6 +596,7 @@
       peer_ip: autoTun ? undefined : strOrUndef(fPeerIp),
       mtu: intOrUndef(fMtu),
       obfs: strOrUndef(fObfs),
+      hostname: strOrUndef(fHostname),
       mode: strOrUndef(fMode),
       dns_listen: strOrUndef(fDnsListen),
       dns_local: strOrUndef(fDnsLocal),
