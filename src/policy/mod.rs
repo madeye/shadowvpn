@@ -146,6 +146,10 @@ pub struct PolicyConfig {
     pub cache_file: Option<PathBuf>,
     /// Per-query upstream timeout.
     pub dns_timeout: Duration,
+    /// Answer joined-peer hostnames from the local Magic DNS table.
+    pub magic_dns: bool,
+    /// Suffix for Magic DNS names (`laptop` and `laptop.<suffix>`).
+    pub magic_dns_suffix: String,
 }
 
 /// A running policy-routing setup: the DNS proxy task plus a guard that removes
@@ -185,10 +189,17 @@ pub async fn spawn(
     tun_ip: std::net::Ipv4Addr,
     server_ip: std::net::IpAddr,
     direct_src: std::net::IpAddr,
+    peers: std::sync::Arc<crate::magic::PeerTable>,
 ) -> anyhow::Result<PolicyHandle> {
     use anyhow::Context;
     use std::net::IpAddr;
     use std::sync::Arc;
+
+    let policy_on = cfg.mode.is_enabled();
+    let magic_on = cfg.magic_dns;
+    if !policy_on && !magic_on {
+        anyhow::bail!("policy::spawn called with neither policy routing nor magic DNS");
+    }
 
     let gfwlist = match cfg.mode {
         // Required in gfwlist mode: it is the sole routing decision.
@@ -261,11 +272,14 @@ pub async fn spawn(
     let router = Arc::new(router);
 
     // The clean upstream must itself be reached through the tunnel, so route it
-    // there up front (before any query is forwarded to it).
-    if let IpAddr::V4(v4) = cfg.dns_remote.ip() {
-        router
-            .add_route(v4)
-            .with_context(|| format!("routing clean DNS upstream {v4} through the tunnel"))?;
+    // there up front (before any query is forwarded to it). Full-mode Magic DNS
+    // only forwards to dns_local and does not install per-dest routes.
+    if policy_on {
+        if let IpAddr::V4(v4) = cfg.dns_remote.ip() {
+            router
+                .add_route(v4)
+                .with_context(|| format!("routing clean DNS upstream {v4} through the tunnel"))?;
+        }
     }
 
     // Shared DNS cache, pre-loaded from disk if persistence is enabled.
@@ -294,16 +308,31 @@ pub async fn spawn(
     );
     #[cfg(windows)]
     let resolver = resolver.with_bind_sources(direct_src, IpAddr::V4(tun_ip));
+    let resolver = if magic_on {
+        resolver.with_magic(peers, cfg.magic_dns_suffix.clone())
+    } else {
+        let _ = peers;
+        resolver
+    };
     let resolver = Arc::new(resolver);
 
     let listener = tokio::net::UdpSocket::bind(cfg.dns_listen)
         .await
         .with_context(|| format!("binding DNS proxy on {}", cfg.dns_listen))?;
-    log::info!(
-        "policy routing active (mode={}); DNS proxy on {}",
-        cfg.mode.name(),
-        cfg.dns_listen
-    );
+    if policy_on {
+        log::info!(
+            "policy routing active (mode={}); DNS proxy on {}",
+            cfg.mode.name(),
+            cfg.dns_listen
+        );
+    }
+    if magic_on {
+        log::info!(
+            "magic DNS active (suffix={}); DNS proxy on {}",
+            cfg.magic_dns_suffix,
+            cfg.dns_listen
+        );
+    }
 
     // Point the system resolver at the proxy (and restore it on exit) unless the
     // operator opted out; otherwise just tell them how to do it themselves.
@@ -320,7 +349,8 @@ pub async fn spawn(
     };
 
     // Pre-warm common domains in the background so their first real lookup is hot.
-    if !cfg.prewarm.is_empty() {
+    // Full-mode Magic DNS is a forwarder, not a policy cache — skip.
+    if policy_on && !cfg.prewarm.is_empty() {
         log::info!("pre-warming {} common domains", cfg.prewarm.len());
         tokio::spawn(proxy::prewarm(Arc::clone(&resolver), cfg.prewarm.clone()));
     }

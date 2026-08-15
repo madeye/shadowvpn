@@ -153,6 +153,8 @@ route push  : 00 02 00    count { family plen addr[4|16] }*
 assign req  : 00 03 flags node[16] hint4[4] hint6[16]     (39 bytes)
 assign      : 00 04 status ip4[4] mask[4] peer[4] ip6[16] plen6 flags ttl[4]
                                                               (37 bytes)
+name advert : 00 05 flags ip4[4] ip6[16] nlen name[nlen]
+peer push   : 00 06 flags count { eflags ip4[4] ip6[16] nlen name[nlen] }*
 ```
 
 Auto clients replace the 5-byte keepalive with `AssignRequest` and, when

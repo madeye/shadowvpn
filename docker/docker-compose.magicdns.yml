@@ -1,0 +1,58 @@
+# Magic DNS end-to-end test: learning-mode server + two auto clients with
+# distinct hostnames. The driver (run-e2e-magicdns.sh) queries each client's
+# local stub at 127.0.0.1:53.
+#
+#   docker/run-e2e-magicdns.sh
+
+x-shadowvpn: &shadowvpn
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: shadowvpn-e2e:latest
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: "0"
+    net.ipv6.conf.default.disable_ipv6: "0"
+  environment:
+    CIPHER: ${CIPHER:-chacha20-poly1305}
+    RUST_LOG: ${RUST_LOG:-info}
+
+services:
+  server:
+    <<: *shadowvpn
+    container_name: svpn-magicdns-server
+    command: ["run-server-magicdns.sh"]
+    volumes:
+      - leases:/var/lib/shadowvpn
+
+  laptop:
+    <<: *shadowvpn
+    container_name: svpn-magicdns-laptop
+    depends_on: [server]
+    command: ["run-client-magicdns.sh"]
+    environment:
+      CIPHER: ${CIPHER:-chacha20-poly1305}
+      RUST_LOG: ${RUST_LOG:-info}
+      PEER_NAME: laptop
+    volumes:
+      - laptop-state:/var/lib/shadowvpn
+
+  pi:
+    <<: *shadowvpn
+    container_name: svpn-magicdns-pi
+    depends_on: [server]
+    command: ["run-client-magicdns.sh"]
+    environment:
+      CIPHER: ${CIPHER:-chacha20-poly1305}
+      RUST_LOG: ${RUST_LOG:-info}
+      PEER_NAME: pi
+    volumes:
+      - pi-state:/var/lib/shadowvpn
+
+volumes:
+  leases:
+  laptop-state:
+  pi-state:

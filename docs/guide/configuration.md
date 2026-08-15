@@ -60,7 +60,8 @@ There are more client-only fields for policy routing — see
 ::: tip Mirror images
 `tun_ip` and `peer_ip` swap between the two ends: the server's local tunnel IP
 is the client's peer, and vice versa. On the client you can [omit both](./auto-assign)
-and let the server assign a unique address.
+and let the server assign a unique address. Joined peers resolve by hostname
+with [Magic DNS](./magic-dns) (`ping laptop`, `ssh pi.svpn`).
 :::
 
 ## Choosing a cipher
@@ -100,7 +101,8 @@ wire formats: [carrier obfuscation](/reference/obfuscation).
 ## Sharing configs between devices
 
 - [Omit `tun_ip` and `peer_ip`](./auto-assign) so every device can share one
-  client config and still get a unique, pingable tunnel IP.
+  client config and still get a unique, pingable tunnel IP. [Magic DNS](./magic-dns)
+  then lets you `ping laptop` instead of remembering `10.9.0.37`.
 - Export/import a client config as a single `shadowvpn://` URI or QR code —
   see [Config URIs & QR codes](./uri-qr). The `node_id` is **not** in the
   URI; it lives in `<config>.state`.

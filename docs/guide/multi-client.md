@@ -6,7 +6,8 @@ There are three multi-client stories. They solve different problems:
    Clients can ping each other; you hand-edit every config.
 2. **[Automatic assignment](./auto-assign)** — omit `tun_ip` / `peer_ip`.
    The server pushes a unique address. Same shared config, and
-   clients can still ping each other.
+   clients can still ping each other. Pair with
+   [Magic DNS](./magic-dns) to reach peers by hostname.
 3. **`--nat`** (this page) — every client shares one placeholder `tun_ip`.
    Zero handshake, but clients **cannot address each other**.
 

@@ -124,6 +124,7 @@ under a new name — only the JSON is written; the next connect creates a new
 There is no rename command. The helper still launches `shadowvpn-client -c
 <profile>` with no `--state-file`; the client then uses that default sibling
 path. New optional `FileConfig` keys (`assign_pool`, `reserved_ips`,
+`hostname`, `magic_dns`, `magic_dns_suffix`,
 `assign_ttl_secs`, `lease_file`, `state_file`) are accepted so a URI or
 hand-edited profile is not rejected by `deny_unknown_fields`.
 

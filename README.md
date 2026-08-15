@@ -343,6 +343,17 @@ payloads are simply dropped. See the
 [mesh routing guide](https://madeye.github.io/shadowvpn/guide/mesh-routing)
 for the full walkthrough and validation ladder.
 
+### Magic DNS (peer hostnames)
+
+Joined peers resolve by hostname — Tailscale-like Magic DNS, no control plane.
+Each client announces a name (OS hostname, or `hostname` / `--hostname`); the
+server grants it (collisions become `name-aabb`) and pushes the map. The
+client stub answers `A`/`AAAA` for `laptop` and `laptop.svpn`. On by default
+in learning mode; `--no-magic-dns` restores the old behaviour. Full mode now
+starts a forwarding stub and, with default `set_dns`, takes over the system
+resolver (same as gfwlist/chinadns). See the
+[Magic DNS guide](https://madeye.github.io/shadowvpn/guide/magic-dns).
+
 ---
 
 ## Install (one-liner)
@@ -455,6 +466,16 @@ both modes tunnel the selected domain and leave the other direct:
 ```
 
 Fully self-contained (no external network), so CI runs it on every PR.
+
+### Magic DNS test (Docker)
+
+A learning-mode hub named `vpn` and two auto clients (`laptop`, `pi`). Each
+client's stub at `127.0.0.1:53` must answer the other peer (A and AAAA),
+NXDOMAIN an unknown `*.svpn`, and resolve the server name.
+
+```sh
+./docker/run-e2e-magicdns.sh
+```
 
 ### Throughput / latency benchmark (Docker + netem)
 
@@ -799,6 +820,7 @@ src/
   protocol.rs     tunnel framing constants and buffer sizing
   config.rs       JSON file + clap CLI config, merge/validate
   tun_device.rs   async TUN wrapper (tun-rs: macOS utun, Linux, Windows Wintun)
+  magic.rs        Magic DNS: hostname table + peer lookup
   policy/         client policy routing (gfwlist / chinadns, user-mode)
     mod.rs        Mode, PolicyConfig, orchestration
     gfwlist.rs    domain-suffix matching

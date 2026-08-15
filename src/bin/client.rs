@@ -43,6 +43,7 @@ use tokio::sync::mpsc;
 
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
+use shadowvpn::magic::{apply_push, PeerTable};
 use shadowvpn::mesh::{self, Assign, AssignStatus, RouteInstaller};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::protocol::{max_datagram_size, MAX_IP_PACKET};
@@ -243,6 +244,15 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
     if cfg.accept_routes {
         info!("accepting subnet routes pushed by the server");
     }
+    if cfg.magic_dns {
+        info!(
+            "magic DNS: hostname={} suffix={}",
+            cfg.hostname, cfg.magic_dns_suffix
+        );
+    }
+
+    let peers = Arc::new(PeerTable::new());
+    let magic_suffix = cfg.magic_dns_suffix.clone();
 
     // Policy / RouteInstaller store an immutable tun_ip: only build once IPv4
     // is known (a cache counts). Recreated below if the server hands out a new IP.
@@ -261,6 +271,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
             &mut policy_handle,
             &installer_slot,
             &mut _route_guard,
+            Arc::clone(&peers),
         )
         .await?;
         if cfg.auto_tun {
@@ -299,24 +310,25 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         obfuscator.clone(),
         Arc::clone(&installer_slot),
         cfg.auto_tun.then_some(assign_tx),
+        Arc::clone(&peers),
+        magic_suffix,
     ));
 
-    // Static clients keep the 5-byte keepalive / RouteAdvert tick.
+    // Static clients keep the 5-byte keepalive / RouteAdvert / NameAdvert tick.
     let mut keepalive = if cfg.auto_tun {
         None
     } else {
-        let periodic_payload: Vec<u8> = if cfg.mesh_active() {
-            cfg.route_advert().encode()
-        } else {
-            keepalive_payload(cfg.tun.ip).to_vec()
-        };
+        let mut periodic = cfg.static_tick_payloads();
+        if periodic.is_empty() {
+            periodic.push(keepalive_payload(cfg.tun.ip).to_vec());
+        }
         Some(tokio::spawn(keepalive_loop(
             Arc::clone(&socket),
             cipher,
             Arc::clone(&master_key),
             obfuscator.clone(),
             cfg.keepalive,
-            periodic_payload,
+            periodic,
         )))
     };
 
@@ -398,6 +410,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
                 cipher,
                 master_key.as_ref(),
                 obfuscator.as_deref(),
+                Arc::clone(&peers),
             )
             .await?;
         }
@@ -586,6 +599,7 @@ async fn tun_to_net(
 /// drains the socket into a bounded channel (so reply bursts are not dropped
 /// while a packet is being decrypted), and a single **processor** de-obfuscates,
 /// decrypts, and writes to TUN (order preserved).
+#[allow(clippy::too_many_arguments)]
 async fn net_to_tun(
     tun: Arc<TunDevice>,
     socket: Arc<UdpSocket>,
@@ -594,6 +608,8 @@ async fn net_to_tun(
     obfuscator: Option<Arc<Obfuscator>>,
     installer_slot: InstallerSlot,
     assign_tx: Option<mpsc::Sender<Assign>>,
+    peers: Arc<PeerTable>,
+    magic_suffix: String,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
@@ -684,6 +700,10 @@ async fn net_to_tun(
                         }
                         None => debug!("dropping Assign: not in auto mode"),
                     },
+                    Some(mesh::Control::PeerPush(push)) => {
+                        apply_push(&peers, &push, &magic_suffix);
+                        debug!("magic-dns: applied {} peer name(s)", push.peers.len());
+                    }
                     other => debug!(
                         "dropping {}-byte control payload ({other:?})",
                         plaintext.len()
@@ -734,7 +754,7 @@ async fn keepalive_loop(
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
     interval: Duration,
-    payload: Vec<u8>,
+    payloads: Vec<Vec<u8>>,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
     // Don't fire a burst if we ever fall behind schedule.
@@ -742,26 +762,28 @@ async fn keepalive_loop(
 
     loop {
         ticker.tick().await;
-        let datagram = match encrypt_packet(cipher, &master_key, &payload) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("failed to encrypt keepalive, skipping: {e}");
-                continue;
+        for payload in &payloads {
+            let datagram = match encrypt_packet(cipher, &master_key, payload) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("failed to encrypt keepalive, skipping: {e}");
+                    continue;
+                }
+            };
+            // Keepalives ride the same obfs framing so the whole flow is uniform.
+            let wire = match obfuscator {
+                Some(ref o) => o.wrap(&datagram),
+                None => datagram,
+            };
+            if let Err(e) = socket.send(&wire).await {
+                if is_transient_udp_error(&e) {
+                    warn!("transient keepalive send error, retrying next tick: {e}");
+                    continue;
+                }
+                return Err(e).context("failed to send keepalive to server");
             }
-        };
-        // Keepalives ride the same obfs framing so the whole flow is uniform.
-        let wire = match obfuscator {
-            Some(ref o) => o.wrap(&datagram),
-            None => datagram,
-        };
-        if let Err(e) = socket.send(&wire).await {
-            if is_transient_udp_error(&e) {
-                warn!("transient keepalive send error, retrying next tick: {e}");
-                continue;
-            }
-            return Err(e).context("failed to send keepalive to server");
+            debug!("sent {}-byte keepalive", wire.len());
         }
-        debug!("sent {}-byte keepalive", wire.len());
     }
 }
 
@@ -831,16 +853,27 @@ async fn start_policy_and_installer(
     policy_handle: &mut Option<shadowvpn::policy::PolicyHandle>,
     installer_slot: &InstallerSlot,
     route_guard: &mut Option<mesh::InstallerGuard>,
+    peers: Arc<PeerTable>,
 ) -> Result<()> {
-    if cfg.policy.mode.is_enabled() && policy_handle.is_none() {
-        info!(
-            "policy routing mode = {}; only matched destinations are tunneled",
-            cfg.policy.mode.name()
-        );
+    let want_dns = cfg.policy.mode.is_enabled() || cfg.magic_dns;
+    if want_dns && policy_handle.is_none() {
+        if cfg.policy.mode.is_enabled() {
+            info!(
+                "policy routing mode = {}; only matched destinations are tunneled",
+                cfg.policy.mode.name()
+            );
+        }
         *policy_handle = Some(
-            shadowvpn::policy::spawn(&cfg.policy, iface_name, cfg.tun.ip, server_ip, direct_src)
-                .await
-                .context("failed to start policy routing")?,
+            shadowvpn::policy::spawn(
+                &cfg.policy,
+                iface_name,
+                cfg.tun.ip,
+                server_ip,
+                direct_src,
+                peers,
+            )
+            .await
+            .context("failed to start DNS proxy")?,
         );
     }
     if cfg.accept_routes && installer_slot.lock().unwrap().is_none() {
@@ -902,6 +935,7 @@ async fn handle_assign_reply(
     cipher: Cipher,
     master_key: &[u8],
     obfuscator: Option<&Obfuscator>,
+    peers: Arc<PeerTable>,
 ) -> Result<()> {
     match reply.status {
         AssignStatus::Ok => {}
@@ -979,6 +1013,7 @@ async fn handle_assign_reply(
         policy_handle,
         installer_slot,
         route_guard,
+        peers,
     )
     .await?;
 
@@ -1019,6 +1054,16 @@ async fn handle_assign_reply(
             master_key,
             obfuscator,
             &cfg.route_advert().encode(),
+        )
+        .await?;
+    }
+    if cfg.magic_dns && (first_ok || ipv4_changed) {
+        send_control(
+            socket,
+            cipher,
+            master_key,
+            obfuscator,
+            &cfg.name_advert().encode(),
         )
         .await?;
     }

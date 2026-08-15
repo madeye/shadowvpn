@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::assign::DEFAULT_ASSIGN_TTL_SECS;
 use crate::crypto::Cipher;
-use crate::mesh::{canonical, AssignReq, RouteAdvert, RouteApproval, FLAG_WANT_IP6, MAX_ROUTES};
+use crate::magic::{self, DEFAULT_SUFFIX};
+use crate::mesh::{
+    canonical, AssignReq, NameAdvert, RouteAdvert, RouteApproval, FLAG_WANT_IP6, MAX_ROUTES,
+};
 use crate::policy::{Mode, PolicyConfig};
 use crate::pool::host_range;
 use crate::protocol::DEFAULT_TUN_MTU;
@@ -313,6 +316,19 @@ pub struct FileConfig {
     /// Per-query DNS upstream timeout, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_timeout_ms: Option<u64>,
+
+    /// Magic DNS hostname (single label). Default: sanitized OS hostname.
+    /// Not carried in a URI/QR — cloning a share must not clone identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    /// Client-only: answer joined-peer hostnames locally (default `true`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magic_dns: Option<bool>,
+
+    /// Client-only: suffix for Magic DNS names (default `svpn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magic_dns_suffix: Option<String>,
 }
 
 impl FileConfig {
@@ -376,6 +392,8 @@ pub struct ServerConfig {
     pub assign_ttl: Duration,
     /// Assignment lease persist path. `None` disables persistence (`lease_file: "-"`).
     pub lease_file: Option<PathBuf>,
+    /// Magic DNS hostname published as this server's tunnel address.
+    pub hostname: String,
 }
 
 /// Fully resolved, validated client configuration.
@@ -406,6 +424,12 @@ pub struct ClientConfig {
     pub advertise_routes: Vec<IpNetwork>,
     /// Whether to accept and install subnet routes pushed by the server.
     pub accept_routes: bool,
+    /// This client's Magic DNS hostname (sanitized single label).
+    pub hostname: String,
+    /// Answer joined-peer hostnames from the local peer table.
+    pub magic_dns: bool,
+    /// Suffix for Magic DNS names (`laptop` and `laptop.<suffix>`).
+    pub magic_dns_suffix: String,
 }
 
 /// Command-line arguments for `shadowvpn-server`.
@@ -489,6 +513,11 @@ pub struct ServerArgs {
     /// Assignment lease persist path. "-" disables persistence.
     #[arg(long = "lease-file")]
     pub lease_file: Option<String>,
+
+    /// Magic DNS hostname published as this server's tunnel address
+    /// (default: sanitized OS hostname).
+    #[arg(long = "hostname")]
+    pub hostname: Option<String>,
 }
 
 /// Command-line arguments for `shadowvpn-client`.
@@ -616,6 +645,22 @@ pub struct ClientArgs {
     /// or a hashed path under the OS state directory).
     #[arg(long = "state-file")]
     pub state_file: Option<PathBuf>,
+
+    /// Magic DNS hostname announced to the server (default: sanitized OS hostname).
+    #[arg(long = "hostname")]
+    pub hostname: Option<String>,
+
+    /// Enable Magic DNS (the default): resolve joined peers by hostname.
+    #[arg(long = "magic-dns")]
+    pub magic_dns: bool,
+
+    /// Disable Magic DNS.
+    #[arg(long = "no-magic-dns")]
+    pub no_magic_dns: bool,
+
+    /// Suffix for Magic DNS names (default `svpn`).
+    #[arg(long = "magic-dns-suffix")]
+    pub magic_dns_suffix: Option<String>,
 }
 
 /// Load the optional file config referenced by a `--config` path.
@@ -827,7 +872,36 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
         prewarm,
         cache_file,
         dns_timeout: Duration::from_millis(file.dns_timeout_ms.unwrap_or(DEFAULT_DNS_TIMEOUT_MS)),
+        magic_dns: resolve_magic_dns(args, file),
+        magic_dns_suffix: resolve_magic_suffix(args, file)?,
     })
+}
+
+fn resolve_magic_dns(args: &ClientArgs, file: &FileConfig) -> bool {
+    if args.no_magic_dns {
+        false
+    } else if args.magic_dns {
+        true
+    } else {
+        file.magic_dns.unwrap_or(true)
+    }
+}
+
+fn resolve_magic_suffix(args: &ClientArgs, file: &FileConfig) -> Result<String, ConfigError> {
+    let raw = args
+        .magic_dns_suffix
+        .clone()
+        .or_else(|| file.magic_dns_suffix.clone())
+        .unwrap_or_else(|| DEFAULT_SUFFIX.to_string());
+    magic::sanitize_suffix(&raw).ok_or_else(|| ConfigError::Invalid {
+        field: "magic_dns_suffix",
+        message: "must be a non-empty DNS label".to_string(),
+    })
+}
+
+fn resolve_hostname(cli: Option<String>, file: Option<String>) -> String {
+    let raw = cli.or(file).unwrap_or_else(magic::os_hostname);
+    magic::sanitize_hostname(&raw)
 }
 
 /// Build the validated [`TunConfig`] from merged file + CLI values.
@@ -1069,6 +1143,8 @@ impl ServerArgs {
             None => Some(default_lease_file(self.config.as_deref())),
         };
 
+        let hostname = resolve_hostname(self.hostname, file.hostname);
+
         Ok(ServerConfig {
             listen,
             cipher,
@@ -1082,6 +1158,7 @@ impl ServerArgs {
             reserved_ips,
             assign_ttl,
             lease_file,
+            hostname,
         })
     }
 }
@@ -1140,6 +1217,10 @@ impl ClientArgs {
                 .unwrap_or_else(|| default_client_state_path(self.config.as_deref(), &server)),
         );
 
+        let hostname = resolve_hostname(self.hostname, file.hostname);
+        let magic_dns = policy.magic_dns;
+        let magic_dns_suffix = policy.magic_dns_suffix.clone();
+
         Ok(ClientConfig {
             server,
             cipher,
@@ -1153,6 +1234,9 @@ impl ClientArgs {
             keepalive: Duration::from_secs(keepalive_secs),
             advertise_routes,
             accept_routes,
+            hostname,
+            magic_dns,
+            magic_dns_suffix,
         })
     }
 }
@@ -1206,6 +1290,32 @@ impl ClientConfig {
         if self.mesh_active() {
             out.push(self.route_advert().encode());
         }
+        if self.magic_dns {
+            out.push(self.name_advert().encode());
+        }
+        out
+    }
+
+    /// Magic DNS name advert carrying the addresses currently on `tun`.
+    pub fn name_advert(&self) -> NameAdvert {
+        magic::name_advert(
+            &self.hostname,
+            self.tun.ip,
+            self.tun.ip6.map(|n| n.ip()),
+            self.magic_dns,
+        )
+    }
+
+    /// Static-mode tick payloads (mesh advert and/or name advert). Empty when
+    /// the caller should fall back to the 5-byte keepalive.
+    pub fn static_tick_payloads(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if self.mesh_active() {
+            out.push(self.route_advert().encode());
+        }
+        if self.magic_dns {
+            out.push(self.name_advert().encode());
+        }
         out
     }
 }
@@ -1237,6 +1347,7 @@ mod tests {
                 reserved_ips: None,
                 assign_ttl_secs: None,
                 lease_file: None,
+                hostname: None,
             }
         }
 
@@ -1284,6 +1395,10 @@ mod tests {
                 no_cache_persist: false,
                 keepalive_secs: None,
                 state_file: None,
+                hostname: None,
+                magic_dns: false,
+                no_magic_dns: false,
+                magic_dns_suffix: None,
             }
         }
     }
@@ -1309,6 +1424,7 @@ mod tests {
             reserved_ips: None,
             assign_ttl_secs: None,
             lease_file: None,
+            hostname: None,
         };
         let cfg = args.resolve().expect("resolve");
         assert_eq!(cfg.listen, "0.0.0.0:9000");
@@ -1518,6 +1634,7 @@ mod tests {
             reserved_ips: None,
             assign_ttl_secs: None,
             lease_file: None,
+            hostname: None,
         };
         let cfg = args.resolve().expect("resolve");
         assert!(cfg.nat);
@@ -1602,6 +1719,7 @@ mod tests {
             reserved_ips: None,
             assign_ttl_secs: None,
             lease_file: None,
+            hostname: None,
         };
 
         let cfg = base.clone().resolve().expect("resolve");
@@ -1839,21 +1957,56 @@ mod tests {
             None,
         );
         let node_id = [0x11u8; 16];
+        // Magic DNS defaults on, so the tick is AssignRequest + NameAdvert.
         let ticks = cfg.auto_tick_payloads(node_id);
-        assert_eq!(ticks.len(), 1, "no mesh → AssignRequest only");
+        assert_eq!(ticks.len(), 2, "AssignRequest + NameAdvert");
         assert!(ticks[0].starts_with(&[0x00, 0x03]));
         assert_eq!(&ticks[0][3..19], &node_id);
+        assert!(ticks[1].starts_with(&[0x00, 0x05]));
         assert!(
             ticks.iter().all(|p| p.len() != 5),
             "auto mode must not send a 5-byte keepalive"
         );
 
+        cfg.magic_dns = false;
+        let ticks = cfg.auto_tick_payloads(node_id);
+        assert_eq!(ticks.len(), 1, "no mesh, no magic → AssignRequest only");
+        assert!(ticks[0].starts_with(&[0x00, 0x03]));
+
         cfg.accept_routes = true;
+        cfg.magic_dns = true;
         let mesh_ticks = cfg.auto_tick_payloads(node_id);
-        assert_eq!(mesh_ticks.len(), 2);
+        assert_eq!(mesh_ticks.len(), 3);
         assert!(mesh_ticks[0].starts_with(&[0x00, 0x03]));
         assert_eq!(&mesh_ticks[0][3..19], &node_id);
         assert!(mesh_ticks.iter().all(|p| p.len() != 5));
+    }
+
+    #[test]
+    fn magic_dns_defaults_and_hostname_sanitize() {
+        let cfg = auto_client_base().resolve().expect("resolve");
+        assert!(cfg.magic_dns);
+        assert_eq!(cfg.magic_dns_suffix, "svpn");
+        assert!(!cfg.hostname.is_empty());
+
+        let mut args = auto_client_base();
+        args.hostname = Some("My-Laptop.local".into());
+        args.no_magic_dns = true;
+        args.magic_dns_suffix = Some("SVPN".into());
+        let cfg = args.resolve().expect("resolve");
+        assert_eq!(cfg.hostname, "my-laptop");
+        assert!(!cfg.magic_dns);
+        assert_eq!(cfg.magic_dns_suffix, "svpn");
+
+        let mut bad = auto_client_base();
+        bad.magic_dns_suffix = Some("   ".into());
+        assert!(matches!(
+            bad.resolve(),
+            Err(ConfigError::Invalid {
+                field: "magic_dns_suffix",
+                ..
+            })
+        ));
     }
 
     #[test]

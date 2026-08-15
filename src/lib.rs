@@ -75,6 +75,7 @@
 //! * [`tun_device`] — async TUN interface wrapper (macOS utun + Linux + Windows).
 //! * [`policy`] — client-side policy routing (gfwlist / chinadns split tunnel).
 //! * [`mesh`] — Tailscale-like subnet routing (advertise / approve / accept).
+//! * [`magic`] — Magic DNS: resolve joined peers by hostname.
 //! * [`assign`] — node-id keyed tunnel-IP assignment (learning mode).
 //! * [`state`] — private state-file helpers (client identity, server leases).
 //! * [`nat`] — server-side per-client NAT (multiple clients, one shared config).
@@ -86,6 +87,7 @@
 pub mod assign;
 pub mod config;
 pub mod crypto;
+pub mod magic;
 pub mod mesh;
 pub mod nat;
 pub mod net;

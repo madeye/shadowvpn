@@ -36,7 +36,8 @@ shadowvpn-uri qr 'shadowvpn://…'
   `shadowvpn://` URI (or its QR code) as a secret.
 - File-path fields (`gfwlist`, `chnroute`, `geoip`, `cache_file`) are only
   meaningful on the host that has those files — re-point them after importing.
-- When several clients share one server, [omit `tun_ip` and `peer_ip`](./auto-assign)
+- When several clients share one server, [omit `tun_ip` and `peer_ip`](./auto-assign).
+  [Magic DNS](./magic-dns) `hostname` is **not** in the URI (same as `node_id`).
   so one URI/QR works on every device and each still gets a unique tunnel
   IP. The persisted `node_id` lives in `<config>.state` next to the imported
   JSON — it is **not** in the URI. Alternatively give each client a distinct

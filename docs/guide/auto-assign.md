@@ -125,6 +125,10 @@ that also `--advertise-routes` or `--accept-routes` sends `AssignRequest`
 and `RouteAdvert` on the same tick; spoke↔spoke and client↔subnet traffic
 is hub-relayed exactly as with static `tun_ip`s.
 
+[Magic DNS](./magic-dns) sits on the same tick (`NameAdvert`): once two
+clients have unique tunnel IPs they resolve each other as `laptop` /
+`pi.svpn`.
+
 ## Versus `--nat`
 
 | | Auto-assign | [`--nat`](./multi-client) |

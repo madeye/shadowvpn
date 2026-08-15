@@ -227,6 +227,23 @@ jobs:
       - name: Verify auto-assign spoke-to-spoke
         run: ./docker/run-e2e-assign.sh "${{ matrix.cipher }}"
 
+  # Magic DNS: learning-mode server + two named auto clients. Verifies the
+  # local stub answers peer hostnames (A/AAAA), NXDOMAIN for unknown *.svpn,
+  # and the resolved address is the other spoke's tunnel IP. Self-contained.
+  e2e-magicdns:
+    name: docker e2e magicdns
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the TUN device is available on the runner
+        run: |
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+
+      - name: Verify Magic DNS peer hostnames
+        run: ./docker/run-e2e-magicdns.sh
+
   # Multi-client auto-IP test: one --auto-assign server and three auto_ip
   # clients. Verifies each client is leased a distinct tunnel IP, every client
   # reaches the server through the tunnel, and clients reach each other via the
