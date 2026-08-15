@@ -34,6 +34,7 @@ The alias `chacha20-ietf-poly1305` is accepted for `cipher` and treated as
 | `reserved_ips`   | `--reserved-ips`   | extra IPv4s never auto-assigned (unioned with `peer_ip`, which is always reserved — typically `.2`) | `[peer_ip]` |
 | `assign_ttl_secs` | `--assign-ttl-secs` | idle time before an assignment lease is reclaimed        | `604800` (7d) |
 | `lease_file`     | `--lease-file`     | assignment lease persist path. `"-"` disables. Default: `<config>.leases.json` next to `--config`, else `/var/lib/shadowvpn/leases.json` (`%PROGRAMDATA%\shadowvpn\leases.json` on Windows) | see left |
+| `hostname`       | `--hostname`       | Magic DNS name published as this server's tunnel IP ([Magic DNS](/guide/magic-dns)) | sanitized OS hostname |
 
 Mesh routing (`approve_routes` / `auto_approve_routes` / `tun_ip6`) and
 [automatic assignment](/guide/auto-assign) require the default learning
@@ -50,6 +51,9 @@ and `peer_ip` to request an assignment; setting only one is an error.
 | `state_file`     | `--state-file`      | persisted `node_id` + last assignment ([auto-assign](/guide/auto-assign)). Default: `<config>.state` next to `-c`, else a hash of the `server` string under the platform state dir. **Not** carried in a URI/QR. | see left |
 | `advertise_routes` | `--advertise-routes` | IPv4/IPv6 subnets behind this client to advertise to the server (comma-separated CIDRs on the CLI, array in JSON) | none |
 | `accept_routes`  | `--accept-routes`   | install subnet routes pushed by the server onto the TUN; removed on withdrawal and exit | `false` |
+| `hostname`       | `--hostname`        | Magic DNS name announced to the server. **Not** carried in a URI/QR. | sanitized OS hostname |
+| `magic_dns`      | `--magic-dns` / `--no-magic-dns` | resolve joined peers by hostname ([Magic DNS](/guide/magic-dns)) | `true` |
+| `magic_dns_suffix` | `--magic-dns-suffix` | suffix for Magic DNS names (`laptop` and `laptop.<suffix>`) | `svpn` |
 
 ### Policy routing
 
@@ -63,7 +67,7 @@ and `peer_ip` to request an assignment; setting only one is an error.
 | `chnroute`      | `--chnroute`    | China CIDR file (chinadns mode)                            | —                    |
 | `geoip`         | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it (takes precedence over `chnroute`) | auto-discovers a bundled `GeoLite2-Country.mmdb` |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database       | `CN`                 |
-| `set_dns`       | `--set-dns` / `--no-set-dns` | point the system resolver at the proxy (auto-restored on exit) | `true` (needs `dns_listen` port 53) |
+| `set_dns`       | `--set-dns` / `--no-set-dns` | point the system resolver at the proxy (auto-restored on exit). Also applied in full mode when Magic DNS is on. | `true` (needs `dns_listen` port 53) |
 | `prewarm`       | `--no-prewarm` (disable) | list of domains to pre-resolve into the cache on startup | built-in list       |
 | `cache_file`    | `--cache-file` / `--no-cache-persist` | persist the DNS cache across restarts     | `dns-cache.json` (next to the binary) |
 | `dns_timeout_ms` | *(config only)* | upstream DNS query timeout in milliseconds                | `3000`               |
@@ -82,4 +86,5 @@ live in the guides:
 - [Configuration guide](/guide/configuration) — basic server/client pairs
 - [Policy routing](/guide/policy-routing) — split-tunnel setups
 - [Automatic tunnel IPs](/guide/auto-assign) — omit `tun_ip` / `peer_ip`
+- [Magic DNS](/guide/magic-dns) — resolve joined peers by hostname
 - [Multiple clients](/guide/multi-client) — shared-config NAT mode

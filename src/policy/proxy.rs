@@ -37,6 +37,7 @@ use super::chnroute::ChnRoute;
 use super::dns;
 use super::gfwlist::GfwList;
 use super::Mode;
+use crate::magic::{is_magic_suffix_name, PeerTable, MAGIC_TTL_SECS};
 
 /// Maximum DNS-over-UDP message we will buffer (generous EDNS0 headroom).
 const MAX_DNS_MSG: usize = 4096;
@@ -96,6 +97,15 @@ pub struct Resolver {
     /// domestic lookup through the tunnel, so it returns foreign answers).
     local_bind: IpAddr,
     remote_bind: IpAddr,
+    /// Magic DNS overlay. When set, peer names are answered locally before
+    /// any cache or upstream lookup.
+    magic: Option<MagicDns>,
+}
+
+/// Local Magic DNS state shared with the control-plane peer table.
+struct MagicDns {
+    peers: Arc<PeerTable>,
+    suffix: String,
 }
 
 impl Resolver {
@@ -125,7 +135,15 @@ impl Resolver {
             cache,
             local_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             remote_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            magic: None,
         }
+    }
+
+    /// Answer Magic DNS names from `peers` (suffix `suffix`) before any
+    /// upstream lookup.
+    pub fn with_magic(mut self, peers: Arc<PeerTable>, suffix: String) -> Self {
+        self.magic = Some(MagicDns { peers, suffix });
+        self
     }
 
     /// Pin the source addresses used for direct (`local`) and tunneled (`remote`)
@@ -145,8 +163,12 @@ impl Resolver {
     /// and its result is cached. Either way, any tunnel-bound addresses are
     /// (re-)installed into the route set (the sink is idempotent).
     pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
+        if let Some(resp) = self.answer_magic(query) {
+            return Some(resp);
+        }
+
         if matches!(self.mode, Mode::Full) {
-            return None; // proxy is not run in full mode
+            return self.forward_local(query).await;
         }
 
         if let Some((response, tunnel_ips)) = self.cache.get(query) {
@@ -272,6 +294,40 @@ impl Resolver {
     fn tunnel(&self, ips: &[Ipv4Addr]) {
         for ip in ips {
             self.sink.add(*ip);
+        }
+    }
+
+    /// Answer a Magic DNS name from the local peer table, or NXDOMAIN for an
+    /// unknown name in the Magic suffix zone. Peer IPs are already on-link
+    /// on the TUN, so they are not added to the tunnel route sink.
+    fn answer_magic(&self, query: &[u8]) -> Option<Vec<u8>> {
+        let magic = self.magic.as_ref()?;
+        let (name, qtype, qclass) = dns::question(query)?;
+        if qclass != dns::CLASS_IN {
+            return None;
+        }
+        if let Some(addrs) = magic.peers.lookup(&name) {
+            let ips = match qtype {
+                dns::TYPE_A => vec![std::net::IpAddr::V4(addrs.ip4)],
+                dns::TYPE_AAAA => addrs.ip6.map(std::net::IpAddr::V6).into_iter().collect(),
+                _ => Vec::new(),
+            };
+            return dns::build_response(query, &ips, MAGIC_TTL_SECS);
+        }
+        if is_magic_suffix_name(&name, &magic.suffix) {
+            return dns::build_nxdomain(query);
+        }
+        None
+    }
+
+    /// Full-mode forwarder: send everything that isn't Magic DNS to `dns_local`.
+    async fn forward_local(&self, query: &[u8]) -> Option<Vec<u8>> {
+        match query_upstream(self.local, query, self.timeout, self.local_bind).await {
+            Ok(r) => Some(r),
+            Err(e) => {
+                debug!("magic-dns: forward to {} failed: {e}", self.local);
+                None
+            }
         }
     }
 }
@@ -640,5 +696,75 @@ mod tests {
             Decision::Tunnel
         );
         assert_eq!(chinadns_decision(&[], &chn), Decision::Tunnel);
+    }
+
+    #[tokio::test]
+    async fn magic_dns_answers_peers_and_nxdomains_suffix() {
+        let local = mock_upstream(vec![Ipv4Addr::new(1, 2, 3, 4)]).await;
+        let remote = mock_upstream(vec![Ipv4Addr::new(8, 8, 8, 8)]).await;
+        let table = Arc::new(PeerTable::new());
+        table.replace(
+            &[crate::mesh::PeerEntry {
+                name: "pi".into(),
+                ip4: Ipv4Addr::new(10, 9, 0, 7),
+                ip6: None,
+            }],
+            "svpn",
+        );
+        let sink = Arc::new(VecSink::default());
+        let r = Resolver::new(
+            Mode::GfwList,
+            GfwList::from_lines(["blocked.com"]),
+            ChnRoute::default(),
+            local,
+            remote,
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        )
+        .with_magic(table, "svpn".into());
+
+        let resp = r.resolve(&query("pi.svpn")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![Ipv4Addr::new(10, 9, 0, 7)]);
+        // Peer IPs are on-link: do not install a host route.
+        assert!(sink.ips().is_empty());
+
+        let nx = r.resolve(&query("nope.svpn")).await.unwrap();
+        assert_eq!(nx[3] & 0x0f, 3);
+
+        // Non-magic names still go upstream.
+        let other = r.resolve(&query("safe.cn")).await.unwrap();
+        assert_eq!(dns::a_records(&other), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+    }
+
+    #[tokio::test]
+    async fn full_mode_forwards_non_magic() {
+        let local = mock_upstream(vec![Ipv4Addr::new(9, 9, 9, 9)]).await;
+        let remote = mock_upstream(vec![Ipv4Addr::new(8, 8, 8, 8)]).await;
+        let table = Arc::new(PeerTable::new());
+        table.replace(
+            &[crate::mesh::PeerEntry {
+                name: "laptop".into(),
+                ip4: Ipv4Addr::new(10, 9, 0, 5),
+                ip6: None,
+            }],
+            "svpn",
+        );
+        let r = Resolver::new(
+            Mode::Full,
+            GfwList::default(),
+            ChnRoute::default(),
+            local,
+            remote,
+            Duration::from_secs(2),
+            Arc::new(VecSink::default()),
+            Arc::new(cache::DnsCache::new()),
+        )
+        .with_magic(table, "svpn".into());
+
+        let hit = r.resolve(&query("laptop")).await.unwrap();
+        assert_eq!(dns::a_records(&hit), vec![Ipv4Addr::new(10, 9, 0, 5)]);
+        let fwd = r.resolve(&query("example.com")).await.unwrap();
+        assert_eq!(dns::a_records(&fwd), vec![Ipv4Addr::new(9, 9, 9, 9)]);
     }
 }

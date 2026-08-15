@@ -83,6 +83,8 @@ route push  : 00 02 00    count { family plen addr[4|16] }*
 assign req  : 00 03 flags node[16] hint4[4] hint6[16]     (39 bytes)
 assign      : 00 04 status ip4[4] mask[4] peer[4] ip6[16] plen6 flags ttl[4]
                                                               (37 bytes)
+name advert : 00 05 flags ip4[4] ip6[16] nlen name[nlen]
+peer push   : 00 06 flags count { eflags ip4[4] ip6[16] nlen name[nlen] }*
 ```
 
 ### `AssignRequest` — 39 bytes, type `0x03`
@@ -134,6 +136,34 @@ Status ≠ Ok uses the same 37-byte layout with zeroed addresses; the client
 must not program them. There is no `Conflict` status — a taken hint is
 skipped and the server still returns Ok with a different address (or
 Exhausted).
+
+### `NameAdvert` — variable length, type `0x05`
+
+| Offset | Len | Field |
+|--------|-----|-------|
+| 0 | 1 | `0x00` marker |
+| 1 | 1 | type `0x05` |
+| 2 | 1 | `flags` (bit 0 = want peer push) |
+| 3 | 4 | client's tunnel IPv4 |
+| 7 | 16 | client's tunnel IPv6 (`::` = none) |
+| 23 | 1 | `nlen` (0–32) |
+| 24 | nlen | hostname label (UTF-8). `nlen = 0` withdraws the name |
+
+Minimum length 24 (empty name). Not 1 or 5 bytes. See
+[Magic DNS](/guide/magic-dns).
+
+### `PeerPush` — variable length, type `0x06`
+
+| Offset | Len | Field |
+|--------|-----|-------|
+| 0 | 1 | `0x00` marker |
+| 1 | 1 | type `0x06` |
+| 2 | 1 | reserved (0) |
+| 3 | 1 | `count` (0–24) |
+| 4 | … | `count` entries: `eflags`(1) `ip4`(4) `ip6`(16) `nlen`(1) `name` |
+
+`eflags` bit 0 = has IPv6 (`ip6` is `::` and ignored when clear). An empty
+push is 4 bytes. The snapshot includes the server and the requesting client.
 
 Route advert / push are documented in the
 [mesh routing guide](/guide/mesh-routing#wire-format).

@@ -23,7 +23,8 @@ Design notes:
   to its current UDP endpoint, learning (and re-learning after NAT rebinds)
   from keepalives, `AssignRequest`s, and traffic. Clients may
   [omit `tun_ip` / `peer_ip`](/guide/auto-assign) and receive a unique
-  address. In [`--nat` mode](/guide/multi-client) the mapping is keyed by
+  address. [Magic DNS](/guide/magic-dns) then resolves those peers by
+  hostname. In [`--nat` mode](/guide/multi-client) the mapping is keyed by
   UDP 4-tuple instead, with inner-address rewriting (no client↔client).
 
 ## Policy routing (client)
@@ -48,6 +49,7 @@ src/
   obfs.rs         optional carrier obfuscation (quic / base64 wire formats)
   config.rs       JSON file + clap CLI config, merge/validate
   tun_device.rs   async TUN wrapper (tun-rs: macOS utun, Linux, Windows Wintun)
+  magic.rs        Magic DNS: hostname table + peer lookup
   policy/         client policy routing (gfwlist / chinadns, user-mode)
     mod.rs        Mode, PolicyConfig, orchestration
     gfwlist.rs    domain-suffix matching

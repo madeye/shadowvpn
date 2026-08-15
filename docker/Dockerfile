@@ -21,8 +21,9 @@ RUN cargo build --release --locked --bins
 FROM debian:bookworm-slim
 
 # iproute2: interface/route inspection. iputils-ping: the cross-tunnel probe.
+# bind9-dnsutils: `dig` for the Magic DNS e2e.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 iputils-ping \
+    && apt-get install -y --no-install-recommends iproute2 iputils-ping bind9-dnsutils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/shadowvpn-server /usr/local/bin/shadowvpn-server
@@ -33,11 +34,13 @@ COPY docker/run-server.sh docker/test-client.sh \
      docker/run-server-multi.sh docker/run-client-multi.sh \
      docker/run-server-mesh.sh docker/run-client-mesh-router.sh \
      docker/run-client-mesh-accept.sh \
-     docker/run-server-assign.sh docker/run-client-assign.sh /usr/local/bin/
+     docker/run-server-assign.sh docker/run-client-assign.sh \
+     docker/run-server-magicdns.sh docker/run-client-magicdns.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/run-server.sh /usr/local/bin/test-client.sh \
     /usr/local/bin/run-server-multi.sh /usr/local/bin/run-client-multi.sh \
     /usr/local/bin/run-server-mesh.sh /usr/local/bin/run-client-mesh-router.sh \
     /usr/local/bin/run-client-mesh-accept.sh \
-    /usr/local/bin/run-server-assign.sh /usr/local/bin/run-client-assign.sh
+    /usr/local/bin/run-server-assign.sh /usr/local/bin/run-client-assign.sh \
+    /usr/local/bin/run-server-magicdns.sh /usr/local/bin/run-client-magicdns.sh
 
 ENV RUST_LOG=info

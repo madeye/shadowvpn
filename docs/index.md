@@ -45,6 +45,13 @@ features:
       tunnel, decided entirely in user space. No ipset, no nft.
     link: /guide/policy-routing
     linkText: Policy routing
+  - icon: ✨
+    title: Magic DNS
+    details: >-
+      Resolve joined peers by hostname — ping laptop, ssh pi.svpn — the same
+      way Tailscale Magic DNS works, with no extra control plane.
+    link: /guide/magic-dns
+    linkText: Magic DNS
   - icon: 🌏
     title: gfwlist · chinadns
     details: >-

@@ -36,6 +36,8 @@
 //! route push  : 00 02 00    count { family plen addr[4|16] }*
 //! assign req  : 00 03 flags node[16] hint4[4] hint6[16]
 //! assign      : 00 04 status ip4[4] mask[4] peer[4] ip6[16] plen6 flags ttl[4]
+//! name advert : 00 05 flags ip4[4] ip6[16] nlen name[nlen]
+//! peer push   : 00 06 flags count { eflags ip4[4] ip6[16] nlen name[nlen] }*
 //! ```
 //!
 //! `flags` bit 0 on a route advert is *accept routes* (the client asks for
@@ -70,6 +72,12 @@ const TYPE_ASSIGN_REQ: u8 = 0x03;
 /// Type byte of a server→client [`Assign`].
 const TYPE_ASSIGN: u8 = 0x04;
 
+/// Type byte of a client→server [`NameAdvert`].
+const TYPE_NAME_ADVERT: u8 = 0x05;
+
+/// Type byte of a server→client [`PeerPush`].
+const TYPE_PEER_PUSH: u8 = 0x06;
+
 /// Exact length of an [`AssignReq`] payload. Not 1 or 5: those stay keepalives.
 pub const ASSIGN_REQ_LEN: usize = 39;
 
@@ -87,6 +95,26 @@ pub const FLAG_WANT_IP6: u8 = 0x01;
 /// well under the tunnel MTU (64 IPv6 entries ≈ 1.2 KB) so control messages
 /// never fragment.
 pub const MAX_ROUTES: usize = 64;
+
+/// Maximum Magic DNS peers in one [`PeerPush`]. With a 32-byte name, 24
+/// entries stay under the 1400-byte tunnel MTU.
+pub const MAX_PEERS: usize = 24;
+
+/// Maximum length of a Magic DNS hostname label (bytes).
+pub const MAX_NAME_LEN: usize = 32;
+
+/// `NameAdvert.flags` bit: the client wants the current peer map pushed back.
+const FLAG_WANT_PEERS: u8 = 0x01;
+
+/// `PeerPush` entry `eflags` bit: `ip6` is present (otherwise the 16 bytes
+/// are `::` and ignored).
+const EFLAG_HAS_IP6: u8 = 0x01;
+
+/// Fixed name-advert header: marker + type + flags + ip4 + ip6 + nlen.
+const NAME_ADVERT_HEADER_LEN: usize = 3 + 4 + 16 + 1;
+
+/// Fixed peer-push header: marker + type + flags + count.
+const PEER_PUSH_HEADER_LEN: usize = 4;
 
 /// Fixed advert header: marker + type + flags + ip4 + ip6 + count.
 const ADVERT_HEADER_LEN: usize = 3 + 4 + 16 + 1;
@@ -112,6 +140,44 @@ pub enum Control {
     AssignReq(AssignReq),
     /// A server→client tunnel-address assignment (or a non-Ok status).
     Assign(Assign),
+    /// A client→server hostname announcement (also acts as a keepalive).
+    NameAdvert(NameAdvert),
+    /// A server→client push of the current peer name → address map.
+    PeerPush(PeerPush),
+}
+
+/// Client→server: "my hostname is `name`; here are my tunnel addresses".
+///
+/// Also carries the client's tunnel addresses so the server can learn/refresh
+/// its UDP mapping (exactly like the keepalive). An empty `name` withdraws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameAdvert {
+    /// Whether the client wants the server to push the peer map back.
+    pub want_peers: bool,
+    /// The client's tunnel IPv4 address.
+    pub tunnel_ip: Ipv4Addr,
+    /// The client's tunnel IPv6 address, when it has one.
+    pub tunnel_ip6: Option<Ipv6Addr>,
+    /// Requested DNS label (already sanitized by the sender). Empty = withdraw.
+    pub name: String,
+}
+
+/// One peer in a [`PeerPush`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerEntry {
+    /// Granted DNS label (no suffix).
+    pub name: String,
+    /// Tunnel IPv4.
+    pub ip4: Ipv4Addr,
+    /// Tunnel IPv6, when the peer has one.
+    pub ip6: Option<Ipv6Addr>,
+}
+
+/// Server→client: the current hostname → tunnel-IP map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerPush {
+    /// Peers (server included), truncated to [`MAX_PEERS`].
+    pub peers: Vec<PeerEntry>,
 }
 
 /// Client→server: "these subnets are reachable through me".
@@ -313,6 +379,57 @@ impl Assign {
     }
 }
 
+impl NameAdvert {
+    /// Serialize into a control payload. `name` is truncated to [`MAX_NAME_LEN`].
+    pub fn encode(&self) -> Vec<u8> {
+        let name = name_bytes(&self.name);
+        let mut buf = Vec::with_capacity(NAME_ADVERT_HEADER_LEN + name.len());
+        buf.push(CONTROL_MARKER);
+        buf.push(TYPE_NAME_ADVERT);
+        buf.push(if self.want_peers { FLAG_WANT_PEERS } else { 0 });
+        buf.extend_from_slice(&self.tunnel_ip.octets());
+        buf.extend_from_slice(&self.tunnel_ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets());
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf
+    }
+}
+
+impl PeerPush {
+    /// Serialize into a control payload. Entries beyond [`MAX_PEERS`] and
+    /// names longer than [`MAX_NAME_LEN`] are truncated.
+    pub fn encode(&self) -> Vec<u8> {
+        let peers = &self.peers[..self.peers.len().min(MAX_PEERS)];
+        let mut buf = Vec::with_capacity(PEER_PUSH_HEADER_LEN + peers.len() * 54);
+        buf.push(CONTROL_MARKER);
+        buf.push(TYPE_PEER_PUSH);
+        buf.push(0); // reserved
+        buf.push(peers.len() as u8);
+        for p in peers {
+            let name = name_bytes(&p.name);
+            buf.push(if p.ip6.is_some() { EFLAG_HAS_IP6 } else { 0 });
+            buf.extend_from_slice(&p.ip4.octets());
+            buf.extend_from_slice(&p.ip6.unwrap_or(Ipv6Addr::UNSPECIFIED).octets());
+            buf.push(name.len() as u8);
+            buf.extend_from_slice(name);
+        }
+        buf
+    }
+}
+
+/// Truncate `name` to [`MAX_NAME_LEN`] ASCII/UTF-8 bytes without splitting a
+/// codepoint (labels are ASCII in practice).
+fn name_bytes(name: &str) -> &[u8] {
+    let raw = name.as_bytes();
+    let n = raw.len().min(MAX_NAME_LEN);
+    // Walk back if we landed mid-character (should not happen for DNS labels).
+    let mut end = n;
+    while end > 0 && raw[end - 1] & 0b1100_0000 == 0b1000_0000 {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
 /// Decode a control payload (a payload for which [`is_control`] is true).
 ///
 /// Returns `None` for malformed or unknown messages, which callers drop —
@@ -371,6 +488,62 @@ pub fn parse_control(payload: &[u8]) -> Option<Control> {
                 hint_ip4,
                 hint_ip6: (!hint6.is_unspecified()).then_some(hint6),
             }))
+        }
+        TYPE_NAME_ADVERT => {
+            let body = payload.get(2..)?;
+            if body.len() < NAME_ADVERT_HEADER_LEN - 2 {
+                return None;
+            }
+            let flags = body[0];
+            let tunnel_ip = Ipv4Addr::new(body[1], body[2], body[3], body[4]);
+            let ip6 = Ipv6Addr::from(<[u8; 16]>::try_from(&body[5..21]).expect("16 bytes"));
+            let nlen = body[21] as usize;
+            if nlen > MAX_NAME_LEN {
+                return None;
+            }
+            let name_bytes = body.get(22..)?;
+            if name_bytes.len() != nlen {
+                return None;
+            }
+            let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+            Some(Control::NameAdvert(NameAdvert {
+                want_peers: flags & FLAG_WANT_PEERS != 0,
+                tunnel_ip,
+                tunnel_ip6: (!ip6.is_unspecified()).then_some(ip6),
+                name,
+            }))
+        }
+        TYPE_PEER_PUSH => {
+            let count = *payload.get(3)? as usize;
+            if count > MAX_PEERS {
+                return None;
+            }
+            let mut rest = payload.get(4..)?;
+            let mut peers = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (&eflags, after_flags) = rest.split_first()?;
+                let (ip4b, after_ip4) = after_flags.split_first_chunk::<4>()?;
+                let (ip6b, after_ip6) = after_ip4.split_first_chunk::<16>()?;
+                let (&nlen, after_nlen) = after_ip6.split_first()?;
+                let nlen = nlen as usize;
+                if nlen > MAX_NAME_LEN {
+                    return None;
+                }
+                if after_nlen.len() < nlen {
+                    return None;
+                }
+                let (nameb, after_name) = after_nlen.split_at(nlen);
+                let name = std::str::from_utf8(nameb).ok()?.to_string();
+                let ip6 = Ipv6Addr::from(*ip6b);
+                peers.push(PeerEntry {
+                    name,
+                    ip4: Ipv4Addr::from(*ip4b),
+                    ip6: (eflags & EFLAG_HAS_IP6 != 0 && !ip6.is_unspecified()).then_some(ip6),
+                });
+                rest = after_name;
+            }
+            rest.is_empty()
+                .then_some(Control::PeerPush(PeerPush { peers }))
         }
         TYPE_ASSIGN => {
             if payload.len() != ASSIGN_LEN {
@@ -886,7 +1059,9 @@ mod tests {
         long.resize(38, 0);
         assert_eq!(parse_control(&long), None);
 
-        // Unknown type 0x05.
+        // Unknown type 0x07 (0x05/0x06 are name advert / peer push).
+        assert_eq!(parse_control(&[0x00, 0x07, 0x00, 0x00]), None);
+        // Type 0x05 with a truncated header is still None.
         assert_eq!(parse_control(&[0x00, 0x05, 0x00, 0x00]), None);
     }
 
@@ -912,6 +1087,66 @@ mod tests {
             }
             other => panic!("expected Assign, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn name_advert_roundtrips() {
+        let advert = NameAdvert {
+            want_peers: true,
+            tunnel_ip: Ipv4Addr::new(10, 9, 0, 5),
+            tunnel_ip6: Some("fd07:7::a09:5".parse().unwrap()),
+            name: "laptop".into(),
+        };
+        let bytes = advert.encode();
+        assert_ne!(bytes.len(), 1);
+        assert_ne!(bytes.len(), 5);
+        assert_eq!(parse_control(&bytes), Some(Control::NameAdvert(advert)));
+
+        let empty = NameAdvert {
+            want_peers: false,
+            tunnel_ip: Ipv4Addr::new(10, 9, 0, 2),
+            tunnel_ip6: None,
+            name: String::new(),
+        };
+        assert_eq!(
+            parse_control(&empty.encode()),
+            Some(Control::NameAdvert(empty))
+        );
+    }
+
+    #[test]
+    fn peer_push_roundtrips_and_caps_name() {
+        let push = PeerPush {
+            peers: vec![
+                PeerEntry {
+                    name: "vpn".into(),
+                    ip4: Ipv4Addr::new(10, 9, 0, 1),
+                    ip6: Some("fd07:7::1".parse().unwrap()),
+                },
+                PeerEntry {
+                    name: "pi".into(),
+                    ip4: Ipv4Addr::new(10, 9, 0, 7),
+                    ip6: None,
+                },
+            ],
+        };
+        assert_eq!(parse_control(&push.encode()), Some(Control::PeerPush(push)));
+
+        // Empty push is 4 bytes (not 1 or 5).
+        let empty = PeerPush { peers: vec![] };
+        let bytes = empty.encode();
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(parse_control(&bytes), Some(Control::PeerPush(empty)));
+    }
+
+    #[test]
+    fn five_byte_00_05_is_still_keepalive() {
+        assert_eq!(
+            parse_control(&[0x00, 0x05, 0xaa, 0xbb, 0xcc]),
+            Some(Control::Keepalive(Some(Ipv4Addr::new(
+                0x05, 0xaa, 0xbb, 0xcc
+            ))))
+        );
     }
 
     #[test]

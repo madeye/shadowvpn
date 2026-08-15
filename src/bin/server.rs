@@ -36,7 +36,10 @@ use tokio::sync::mpsc;
 use shadowvpn::assign::{Assigner, Lease};
 use shadowvpn::config::{ServerArgs, ServerConfig};
 use shadowvpn::crypto::{decrypt_packet, encrypt_packet};
-use shadowvpn::mesh::{self, Assign, AssignStatus, Control, RouteApproval, RoutePush, SubnetTable};
+use shadowvpn::magic::{NameOutcome, NameTable};
+use shadowvpn::mesh::{
+    self, Assign, AssignStatus, Control, PeerPush, RouteApproval, RoutePush, SubnetTable,
+};
 use shadowvpn::nat::{Ingress, Nat};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::pool::host_range;
@@ -125,6 +128,8 @@ impl Learned {
 struct LearnState {
     learned: Learned,
     assigner: Assigner,
+    /// Hostname → tunnel-IP map for Magic DNS.
+    names: NameTable,
     /// Learned-mapping / subnet-route TTL (not the 7-day assignment TTL).
     lease_ttl: Duration,
 }
@@ -205,6 +210,11 @@ async fn run(cfg: ServerConfig) -> Result<()> {
         Routing::Learn(Box::new(LearnState {
             learned: Learned::default(),
             assigner,
+            names: NameTable::with_server(
+                cfg.hostname.clone(),
+                cfg.tun.ip,
+                cfg.tun.ip6.map(|n| n.ip()),
+            ),
             lease_ttl: cfg.lease_ttl,
         }))
     }));
@@ -266,9 +276,18 @@ async fn run(cfg: ServerConfig) -> Result<()> {
                         for net in state.learned.subnets.expire(lease_ttl, tick) {
                             info!("subnet route {net} expired (advertiser went quiet)");
                         }
+                        for name in state.names.expire(lease_ttl, tick) {
+                            info!("magic-dns name {name} expired (advertiser went quiet)");
+                        }
                         state.learned.expire_clients(lease_ttl, tick);
                         let dropped = state.assigner.reap(SystemTime::now());
-                        unlearn_dropped(&mut state.learned, &dropped, tick, lease_ttl);
+                        unlearn_dropped(
+                            &mut state.learned,
+                            &mut state.names,
+                            &dropped,
+                            tick,
+                            lease_ttl,
+                        );
                     }
                 }
             }
@@ -631,7 +650,13 @@ fn handle_control(
         }
         (Routing::Learn(state), Control::AssignReq(req)) => {
             let (reply, dropped) = state.assigner.allocate(&req, peer, SystemTime::now());
-            unlearn_dropped(&mut state.learned, &dropped, now, state.lease_ttl);
+            unlearn_dropped(
+                &mut state.learned,
+                &mut state.names,
+                &dropped,
+                now,
+                state.lease_ttl,
+            );
             if reply.status == AssignStatus::Ok {
                 state
                     .learned
@@ -646,6 +671,60 @@ fn handle_control(
             debug!("ignoring assign reply from {peer}: assigns only flow server→client");
             None
         }
+        (Routing::Learn(state), Control::NameAdvert(advert)) => {
+            maybe_learn(
+                &mut state.learned,
+                &state.assigner,
+                IpAddr::V4(advert.tunnel_ip),
+                peer,
+                " (name)",
+            );
+            if let Some(ip6) = advert.tunnel_ip6 {
+                maybe_learn(
+                    &mut state.learned,
+                    &state.assigner,
+                    IpAddr::V6(ip6),
+                    peer,
+                    " (name)",
+                );
+            }
+            let node_id = state.assigner.node_for_peer(peer);
+            let outcome = state.names.advertise(
+                peer,
+                &advert.name,
+                advert.tunnel_ip,
+                advert.tunnel_ip6,
+                node_id,
+                now,
+            );
+            match &outcome {
+                NameOutcome::Granted { name, renamed } if *renamed => {
+                    info!(
+                        "magic-dns name {} renamed to {name} (collision) from client {} ({peer})",
+                        advert.name, advert.tunnel_ip
+                    );
+                }
+                NameOutcome::Granted { name, .. } => {
+                    info!(
+                        "magic-dns name {name} via client {} ({peer})",
+                        advert.tunnel_ip
+                    );
+                }
+                NameOutcome::Withdrawn { name: Some(name) } => {
+                    info!("magic-dns name {name} withdrawn by {peer}");
+                }
+                NameOutcome::Refreshed { .. } | NameOutcome::Withdrawn { name: None } => {}
+            }
+            advert.want_peers.then(|| {
+                Control::PeerPush(PeerPush {
+                    peers: state.names.snapshot(),
+                })
+            })
+        }
+        (Routing::Learn(_), Control::PeerPush(_)) => {
+            debug!("ignoring peer push from {peer}: pushes only flow server→client");
+            None
+        }
         (Routing::Nat(nat), Control::Keepalive(_)) => {
             nat.touch(peer, now);
             None
@@ -656,10 +735,14 @@ fn handle_control(
         }
         (
             Routing::Nat(nat),
-            Control::RouteAdvert(_) | Control::RoutePush(_) | Control::Assign(_),
+            Control::RouteAdvert(_)
+            | Control::RoutePush(_)
+            | Control::Assign(_)
+            | Control::NameAdvert(_)
+            | Control::PeerPush(_),
         ) => {
             nat.touch(peer, now);
-            debug!("ignoring mesh/assign control from {peer}: NAT mode has no subnet routing");
+            debug!("ignoring mesh/assign/magic control from {peer}: NAT mode has no peer names");
             None
         }
     }
@@ -687,11 +770,20 @@ fn maybe_learn(
     learned.learn(src, peer, via);
 }
 
-fn unlearn_dropped(learned: &mut Learned, dropped: &[Lease], now: Instant, ttl: Duration) {
+fn unlearn_dropped(
+    learned: &mut Learned,
+    names: &mut NameTable,
+    dropped: &[Lease],
+    now: Instant,
+    ttl: Duration,
+) {
     for lease in dropped {
         learned.unlearn(IpAddr::V4(lease.ip4), lease.last_peer, now, ttl);
         if let Some(ip6) = lease.ip6 {
             learned.unlearn(IpAddr::V6(ip6), lease.last_peer, now, ttl);
+        }
+        if let Some(peer) = lease.last_peer {
+            names.withdraw(peer);
         }
     }
 }
@@ -700,7 +792,11 @@ fn encode_control(msg: &Control) -> Vec<u8> {
     match msg {
         Control::RoutePush(push) => push.encode(),
         Control::Assign(assign) => assign.encode(),
-        Control::Keepalive(_) | Control::RouteAdvert(_) | Control::AssignReq(_) => {
+        Control::PeerPush(push) => push.encode(),
+        Control::Keepalive(_)
+        | Control::RouteAdvert(_)
+        | Control::AssignReq(_)
+        | Control::NameAdvert(_) => {
             debug!("refusing to encode client-originated control {msg:?}");
             Vec::new()
         }
@@ -852,6 +948,7 @@ fn print_banner(cfg: &ServerConfig, tun_name: &str) {
         info!("  TUN IPv6       : {ip6}");
     }
     info!("  routing        : learn inner src IP -> UDP addr; route by inner dst IP");
+    info!("  magic DNS      : hostname={}", cfg.hostname);
     if cfg.route_approval.auto {
         info!("  mesh routes    : auto-approving every advertised subnet route");
     } else if !cfg.route_approval.allowlist.is_empty() {
@@ -955,6 +1052,7 @@ mod tests {
                 Duration::from_secs(shadowvpn::assign::DEFAULT_ASSIGN_TTL_SECS),
                 None,
             ),
+            names: NameTable::with_server("vpn".into(), Ipv4Addr::new(10, 77, 0, 1), None),
             lease_ttl: Duration::from_secs(120),
         }
     }
@@ -1290,6 +1388,7 @@ mod tests {
                 Duration::from_secs(shadowvpn::assign::DEFAULT_ASSIGN_TTL_SECS),
                 None,
             ),
+            names: NameTable::new(),
             lease_ttl: Duration::from_secs(120),
         };
         let peer: SocketAddr = "198.51.100.1:1000".parse().unwrap();
@@ -1361,5 +1460,54 @@ mod tests {
             encode_control(&Control::Assign(assign.clone())),
             assign.encode()
         );
+        let peers = shadowvpn::mesh::PeerPush {
+            peers: vec![shadowvpn::mesh::PeerEntry {
+                name: "vpn".into(),
+                ip4: Ipv4Addr::new(10, 77, 0, 1),
+                ip6: None,
+            }],
+        };
+        assert_eq!(
+            encode_control(&Control::PeerPush(peers.clone())),
+            peers.encode()
+        );
+    }
+
+    #[test]
+    fn name_advert_learns_and_pushes_peers() {
+        use shadowvpn::mesh::NameAdvert;
+
+        let routing = learn_routing();
+        let approval = RouteApproval {
+            auto: false,
+            allowlist: vec![],
+        };
+        let now = Instant::now();
+        let peer: SocketAddr = "198.51.100.1:1000".parse().unwrap();
+        let advert = NameAdvert {
+            want_peers: true,
+            tunnel_ip: "10.77.0.5".parse().unwrap(),
+            tunnel_ip6: None,
+            name: "laptop".into(),
+        };
+        let Control::PeerPush(push) =
+            handle_control(&routing, &approval, peer, &advert.encode(), now)
+                .expect("want-peers advert gets a push")
+        else {
+            panic!("expected PeerPush");
+        };
+        // Server name + this client.
+        assert!(push.peers.iter().any(|p| p.name == "vpn"));
+        assert!(push
+            .peers
+            .iter()
+            .any(|p| p.name == "laptop" && p.ip4 == Ipv4Addr::new(10, 77, 0, 5)));
+
+        // Refresh is quiet but still pushed.
+        let Control::PeerPush(_) = handle_control(&routing, &approval, peer, &advert.encode(), now)
+            .expect("refresh still pushed")
+        else {
+            panic!("expected PeerPush");
+        };
     }
 }

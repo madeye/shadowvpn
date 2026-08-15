@@ -63,6 +63,19 @@ tunnel the selected domain and leave the other direct:
 
 Fully self-contained (no external network), so CI runs it on every PR.
 
+## Magic DNS test
+
+Exercises [Magic DNS](/guide/magic-dns) end to end: a learning-mode hub
+named `vpn` and two auto clients named `laptop` and `pi`. Each client's
+stub at `127.0.0.1:53` must answer the other peer (A and AAAA), NXDOMAIN
+an unknown `*.svpn`, and resolve the server name to the hub's tunnel IP.
+
+```sh
+./docker/run-e2e-magicdns.sh
+```
+
+Self-contained; CI runs it on every PR.
+
 ## Throughput / latency benchmark
 
 `docker/run-bench.sh` measures the data plane over an emulated internet path

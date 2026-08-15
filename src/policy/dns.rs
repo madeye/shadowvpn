@@ -1,22 +1,23 @@
-//! Minimal DNS wire parsing — just enough for policy routing.
+//! Minimal DNS wire parsing — just enough for policy routing and Magic DNS.
 //!
-//! The proxy only needs two things from a DNS message: the queried name (to
-//! decide which upstream to use) and the IPv4 addresses in an answer (to add to
-//! the ipset). It never builds messages — queries and responses are relayed
-//! verbatim between the stub resolver and the upstreams — so this module is
-//! read-only and deliberately tiny. It is not a general-purpose DNS library.
+//! The proxy needs the queried name (to decide which upstream to use), the
+//! IPv4 addresses in an answer (to add to the ipset), and — for Magic DNS —
+//! the ability to synthesize a short `A`/`AAAA` or NXDOMAIN reply. Queries
+//! and upstream responses are otherwise relayed verbatim.
 //!
-//! Both helpers are total: any malformed input yields `None` / an empty vector
+//! Helpers are total: any malformed input yields `None` / an empty vector
 //! rather than panicking.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Fixed DNS header length in bytes.
 const HEADER_LEN: usize = 12;
 /// RR TYPE for an IPv4 address record (`A`).
-const TYPE_A: u16 = 1;
+pub const TYPE_A: u16 = 1;
+/// RR TYPE for an IPv6 address record (`AAAA`).
+pub const TYPE_AAAA: u16 = 28;
 /// RR CLASS for the Internet (`IN`).
-const CLASS_IN: u16 = 1;
+pub const CLASS_IN: u16 = 1;
 
 /// Build a standard recursive `A`/`IN` query for `name` with transaction id
 /// `id`. Used to pre-warm the cache; labels longer than 63 bytes are skipped.
@@ -159,6 +160,116 @@ pub fn a_records(msg: &[u8]) -> Vec<Ipv4Addr> {
         pos += rdlength;
     }
     out
+}
+
+/// Extract every IPv6 address from the answer section of a DNS response.
+pub fn aaaa_records(msg: &[u8]) -> Vec<Ipv6Addr> {
+    let mut out = Vec::new();
+    if msg.len() < HEADER_LEN {
+        return out;
+    }
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
+    let ancount = u16::from_be_bytes([msg[6], msg[7]]);
+
+    let mut pos = HEADER_LEN;
+    for _ in 0..qdcount {
+        pos = match skip_name(msg, pos) {
+            Some(p) => p,
+            None => return out,
+        };
+        pos += 4;
+        if pos > msg.len() {
+            return out;
+        }
+    }
+    for _ in 0..ancount {
+        pos = match skip_name(msg, pos) {
+            Some(p) => p,
+            None => return out,
+        };
+        if pos + 10 > msg.len() {
+            return out;
+        }
+        let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+        let rclass = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]);
+        let rdlength = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > msg.len() {
+            return out;
+        }
+        if rtype == TYPE_AAAA && rclass == CLASS_IN && rdlength == 16 {
+            if let Ok(octets) = <[u8; 16]>::try_from(&msg[pos..pos + 16]) {
+                out.push(Ipv6Addr::from(octets));
+            }
+        }
+        pos += rdlength;
+    }
+    out
+}
+
+/// Synthesize a response to `query` with `addrs` as answers (filtered by
+/// qtype: `A` → IPv4, `AAAA` → IPv6). Other types get an empty NOERROR.
+///
+/// Copies the question, sets QR/RD/RA, and uses a name pointer at `0xC0 0x0C`.
+pub fn build_response(query: &[u8], addrs: &[IpAddr], ttl: u32) -> Option<Vec<u8>> {
+    let (_, qtype, qclass) = question(query)?;
+    let qend = skip_name(query, HEADER_LEN)? + 4;
+    if qend > query.len() {
+        return None;
+    }
+    let mut m = query[..qend].to_vec();
+    m[2] = 0x81; // QR + RD
+    m[3] = 0x80; // RA, RCODE=0
+    m[4..6].copy_from_slice(&1u16.to_be_bytes());
+    m[8..12].copy_from_slice(&[0, 0, 0, 0]); // NSCOUNT / ARCOUNT
+    if qclass != CLASS_IN {
+        m[6..8].copy_from_slice(&0u16.to_be_bytes());
+        return Some(m);
+    }
+    let records: Vec<IpAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| match qtype {
+            TYPE_A => a.is_ipv4(),
+            TYPE_AAAA => a.is_ipv6(),
+            _ => false,
+        })
+        .collect();
+    m[6..8].copy_from_slice(&(records.len() as u16).to_be_bytes());
+    for addr in records {
+        m.extend_from_slice(&[0xC0, 0x0C]);
+        match addr {
+            IpAddr::V4(ip) => {
+                m.extend_from_slice(&TYPE_A.to_be_bytes());
+                m.extend_from_slice(&CLASS_IN.to_be_bytes());
+                m.extend_from_slice(&ttl.to_be_bytes());
+                m.extend_from_slice(&4u16.to_be_bytes());
+                m.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+                m.extend_from_slice(&CLASS_IN.to_be_bytes());
+                m.extend_from_slice(&ttl.to_be_bytes());
+                m.extend_from_slice(&16u16.to_be_bytes());
+                m.extend_from_slice(&ip.octets());
+            }
+        }
+    }
+    Some(m)
+}
+
+/// Synthesize an NXDOMAIN reply that echoes `query`'s question.
+pub fn build_nxdomain(query: &[u8]) -> Option<Vec<u8>> {
+    let qend = skip_name(query, HEADER_LEN)? + 4;
+    if qend > query.len() {
+        return None;
+    }
+    let mut m = query[..qend].to_vec();
+    m[2] = 0x81; // QR + RD
+    m[3] = 0x83; // RA + NXDOMAIN
+    m[4..6].copy_from_slice(&1u16.to_be_bytes());
+    m[6..12].copy_from_slice(&[0; 6]);
+    Some(m)
 }
 
 /// Read a (possibly compressed) name starting at `pos`, returning the dot-joined
@@ -316,6 +427,39 @@ mod tests {
         );
         assert_eq!(min_ttl(&m), Some(60));
         assert_eq!(min_ttl(&query("example.com")), None); // a query has no answers
+    }
+
+    #[test]
+    fn build_response_filters_by_qtype() {
+        let q = query("laptop.svpn");
+        let addrs = [
+            IpAddr::V4(Ipv4Addr::new(10, 9, 0, 7)),
+            IpAddr::V6("fd07:7::7".parse().unwrap()),
+        ];
+        let resp = build_response(&q, &addrs, 30).unwrap();
+        assert_eq!(a_records(&resp), vec![Ipv4Addr::new(10, 9, 0, 7)]);
+        assert!(aaaa_records(&resp).is_empty());
+        assert_eq!(min_ttl(&resp), Some(30));
+
+        // AAAA question.
+        let mut q6 = q.clone();
+        let n = q6.len();
+        q6[n - 4..n - 2].copy_from_slice(&TYPE_AAAA.to_be_bytes());
+        let resp6 = build_response(&q6, &addrs, 30).unwrap();
+        assert!(a_records(&resp6).is_empty());
+        assert_eq!(
+            aaaa_records(&resp6),
+            vec!["fd07:7::7".parse::<Ipv6Addr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn build_nxdomain_sets_rcode() {
+        let q = query("nope.svpn");
+        let r = build_nxdomain(&q).unwrap();
+        assert_eq!(r[3] & 0x0f, 3);
+        assert_eq!(question_name(&r).as_deref(), Some("nope.svpn"));
+        assert!(a_records(&r).is_empty());
     }
 
     #[test]
