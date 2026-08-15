@@ -148,6 +148,11 @@ pub enum ConfigError {
 /// exported config — and the `shadowvpn://` URI built from it — stays compact and
 /// matches the hand-written configs, which simply leave unused keys out. Missing
 /// keys deserialize back to `None`.
+///
+/// When adding a field, also add the same key to
+/// `desktop/src-tauri/src/profiles.rs` `ProfileConfig` (`deny_unknown_fields`).
+/// The GUI crate does not depend on this one; a missing key rejects a CLI-written
+/// or hand-edited profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {

@@ -109,6 +109,22 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_hostname() {
+        let uri = export_uri(ProfileConfig {
+            server: Some("h:443".to_string()),
+            hostname: Some("tyo".to_string()),
+            magic_dns: Some(true),
+            magic_dns_suffix: Some("svpn".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let back = import_uri(uri).unwrap();
+        assert_eq!(back.hostname.as_deref(), Some("tyo"));
+        assert_eq!(back.magic_dns, Some(true));
+        assert_eq!(back.magic_dns_suffix.as_deref(), Some("svpn"));
+    }
+
+    #[test]
     fn rejects_unknown_field() {
         // {"bogus":1} base64url-encoded — deny_unknown_fields must reject it.
         let json = br#"{"bogus":1}"#;
