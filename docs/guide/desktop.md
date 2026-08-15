@@ -73,3 +73,18 @@ Each package bundles the matching-arch `shadowvpn-client` next to the app
 executable, and — on macOS and Windows — the `gfwlist.txt` +
 `GeoLite2-Country.mmdb` policy data (plus `wintun.dll` on Windows), so
 [policy routing](./policy-routing) works out of the box.
+
+## Profiles and Magic DNS
+
+A saved profile **is** a `shadowvpn-client --config` file: only
+[`FileConfig`](/reference/configuration) keys, same `deny_unknown_fields`
+schema as the CLI. That includes [Magic DNS](./magic-dns) fields
+(`hostname`, `magic_dns`, `magic_dns_suffix`) and the mesh / auto-assign
+keys (`tun_ip6`, `keepalive_secs`, `advertise_routes`, `accept_routes`, …).
+A CLI-written `client.json` that sets `"hostname": "tyo"` opens in the
+editor instead of being rejected.
+
+The profile form has a **Magic DNS hostname** field (blank = sanitized OS
+hostname). Other optional keys without a control are preserved on save.
+`hostname` is identity: it is not meant to be cloned by a share, the same
+way `node_id` is kept out of a [`shadowvpn://` URI](./uri-qr).
