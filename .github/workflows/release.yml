@@ -367,12 +367,25 @@ jobs:
       # the cargo cache (restore-keys falls back across lockfile changes);
       # stale versioned bundles alongside fresh ones break the packaging
       # steps' globs, so start from a clean slate.
+      #
+      # Retried: the bundler downloads tooling at bundle time (NSIS +
+      # nsis_tauri_utils.dll on Windows, linuxdeploy on Linux) with no retry of
+      # its own, and those fetches occasionally get connection-reset. Compilation
+      # is cached, so a retry only redoes the bundling.
       - name: Build desktop app
         working-directory: desktop/src-tauri
         shell: bash
         run: |
           rm -rf "target/${{ matrix.target }}/release/bundle"
-          tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config ci-overlay.json
+          for attempt in 1 2 3; do
+            if tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config ci-overlay.json; then
+              exit 0
+            fi
+            echo "tauri build failed (attempt $attempt/3); retrying in 10s..." >&2
+            sleep 10
+          done
+          echo "tauri build failed after 3 attempts" >&2
+          exit 1
 
       # macOS: the bundler placed the client sidecar in Contents/MacOS; drop the
       # policy data files next to it (that's where the client auto-discovers
