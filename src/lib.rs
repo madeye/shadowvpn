@@ -7,6 +7,11 @@
 //! UDP datagram, and sends it to the server; the server decrypts, routes, and
 //! tunnels return traffic back. The async runtime is [`tokio`].
 //!
+//! On top of the tunnel it offers Tailscale-like conveniences, all negotiated
+//! in-band with no external control plane: automatic tunnel-IP assignment
+//! ([`assign`]), Magic DNS peer hostnames ([`magic`]), and subnet-route
+//! advertise / approve / accept ([`mesh`]).
+//!
 //! Guides, configuration, and the wire-protocol spec also live on the
 //! [project site](https://madeye.github.io/shadowvpn/).
 //!
@@ -46,7 +51,10 @@
 //! ## Multiple clients
 //!
 //! One server serves many clients. By default it routes by *learning* each
-//! client's inner tunnel source IP, so clients need distinct addresses. With the
+//! client's inner tunnel source IP, so clients need distinct addresses — a
+//! client that omits its address is handed a stable, distinct tunnel IP by the
+//! server automatically, keyed by a persisted node id (see [`assign`] and
+//! [`state`]). With the
 //! server's NAT mode every client may share one identical config (same
 //! placeholder IP): the server tells them apart by UDP endpoint and maps each
 //! onto a distinct internal IP, rewriting inner addresses in flight. See [`nat`]
