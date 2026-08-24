@@ -342,7 +342,9 @@ fn kill_elevated(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+// Runs off the main thread (`command(async)`): do_connect blocks on the
+// elevation prompt and helper IPC (helper.rs), which froze the whole UI.
+#[tauri::command(async)]
 pub fn connect(
     app: tauri::AppHandle,
     state: tauri::State<AppState>,
@@ -462,7 +464,9 @@ pub fn do_connect(
     }
 }
 
-#[tauri::command]
+// Runs off the main thread (`command(async)`): the helper's graceful stop and
+// `wait_for_exit` together block for many seconds (runner.rs).
+#[tauri::command(async)]
 pub fn disconnect(
     app: tauri::AppHandle,
     state: tauri::State<AppState>,

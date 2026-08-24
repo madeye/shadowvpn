@@ -625,8 +625,9 @@ pub struct ClientArgs {
     pub no_set_dns: bool,
 
     /// Restore the system resolver from the journal left by a run that did
-    /// not exit cleanly, then exit (no tunnel is brought up). Used by the
-    /// desktop app to heal DNS after a crashed client.
+    /// not exit cleanly, or reset a leftover 127.0.0.1 to automatic/DHCP
+    /// DNS, then exit (no tunnel is brought up). Used by the desktop app
+    /// on launch to heal DNS after a crashed client.
     #[arg(long = "restore-dns")]
     pub restore_dns: bool,
 

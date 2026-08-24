@@ -57,8 +57,11 @@ split-DNS proxy and restores the previous setting on exit — but only on a
 hard (`kill -9`, `taskkill /F`, power loss), the resolver may be left pointing
 at `127.0.0.1` with nothing listening.
 
-Fix: start the client again and stop it gracefully, or restore DNS by hand
-(`networksetup -setdnsservers <service> …` on macOS, edit `/etc/resolv.conf`
+Fix: open the desktop app (it runs `--restore-dns` on launch whenever an
+elevated helper is already live and no client is running, which restores the
+journal or resets a leftover `127.0.0.1` to automatic/DHCP DNS), start the
+client again and stop it gracefully, or restore DNS by hand
+(`networksetup -setdnsservers <service> empty` on macOS, edit `/etc/resolv.conf`
 on Linux, adapter DNS settings / `netsh` on Windows). To manage DNS yourself
 from the start, run with `--no-set-dns`.
 

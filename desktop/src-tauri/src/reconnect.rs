@@ -74,9 +74,11 @@ fn watch(app: tauri::AppHandle) {
             "disconnected" => {
                 // No client running: if a crashed run left a DNS restore
                 // journal behind, heal the resolver now — promptless, through
-                // the elevated helper. Done before (and independently of) any
-                // reconnect, so DNS comes back even when the user isn't
-                // reconnecting or every reconnect attempt fails.
+                // the elevated helper. (App launch also heals via
+                // `init_privileges` even without a journal, when DNS is still
+                // 127.0.0.1.) Done before (and independently of) any reconnect,
+                // so DNS comes back even when the user isn't reconnecting or
+                // every reconnect attempt fails.
                 maybe_restore_dns(&app, &mut next_dns_restore);
 
                 let Some(profile) = active.clone() else {
@@ -125,7 +127,9 @@ fn watch(app: tauri::AppHandle) {
 /// If a run died without restoring the system resolver, its journal is still
 /// sitting next to the client binary — ask the elevated helper to run
 /// `shadowvpn-client --restore-dns` to heal DNS. No-ops (cheaply) when there
-/// is no journal; attempts are spaced by [`DNS_RESTORE_RETRY`].
+/// is no journal; attempts are spaced by [`DNS_RESTORE_RETRY`]. App launch
+/// (`init_privileges`) heals even without a journal when DNS is still
+/// 127.0.0.1.
 ///
 /// Only ever goes through a live helper: with the helper gone, restoring
 /// would raise a credential prompt out of nowhere, and the next `apply` in

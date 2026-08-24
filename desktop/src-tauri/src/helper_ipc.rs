@@ -50,9 +50,11 @@ pub enum Cmd {
     },
     /// Stop the helper's client child (graceful where the OS allows it).
     Disconnect,
-    /// Run the client binary with `--restore-dns` to heal the system resolver
-    /// from the journal a crashed run left behind. Refused while a client
-    /// child is running (the live client owns the resolver configuration).
+    /// Run the client binary with `--restore-dns` to heal the system resolver:
+    /// apply the journal a crashed run left behind, or — if there is no
+    /// journal but DNS is still `127.0.0.1` — reset to automatic/DHCP.
+    /// Refused while a client child is running (the live client owns the
+    /// resolver configuration).
     RestoreDns,
     /// Stop the client child if any, remove the port file, and exit.
     Shutdown,

@@ -86,12 +86,14 @@ async fn main() -> Result<()> {
 
     let args = ClientArgs::parse();
 
-    // Journal-only recovery mode: put the resolver back after a run that died
-    // without cleaning up (typically invoked by the desktop app's elevated
-    // helper), then exit without bringing up a tunnel.
+    // Recovery mode: put the resolver back after a run that died without
+    // cleaning up (typically invoked by the desktop app's elevated helper
+    // on launch). Restores from the journal when one exists; otherwise
+    // resets a leftover 127.0.0.1 to automatic/DHCP DNS. Then exit
+    // without bringing up a tunnel.
     if args.restore_dns {
-        if !shadowvpn::policy::dnsconf::restore_from_journal()? {
-            info!("no DNS restore journal found; nothing to do");
+        if !shadowvpn::policy::dnsconf::restore_stale()? {
+            info!("system DNS did not need restoring");
         }
         return Ok(());
     }

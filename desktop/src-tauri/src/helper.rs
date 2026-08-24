@@ -536,8 +536,19 @@ fn spawn_elevated_helper(
 /// happens at the first connect), and a pending approval means the user
 /// should not ALSO get a password dialog. Everything else falls through to
 /// the classic one-prompt `ensure`.
-#[tauri::command]
+///
+/// After the helper is (or already was) live, a leftover system resolver
+/// pointing at `127.0.0.1` — or a restore journal a crashed run left behind
+/// — is healed via `RestoreDns`. Never prompts on its own; skipped when no
+/// helper is reachable or a client is still running.
+#[tauri::command(async)]
 pub fn init_privileges(app: tauri::AppHandle) -> Result<bool, String> {
+    let result = init_privileges_inner(&app);
+    restore_dns_best_effort(&app);
+    result
+}
+
+fn init_privileges_inner(app: &tauri::AppHandle) -> Result<bool, String> {
     let settings_info = settings::get_settings(app.clone())?;
     let Some(bin) = settings_info.resolved_client_bin else {
         // No client binary yet (fresh install without bundle) — nothing to
@@ -567,8 +578,35 @@ pub fn init_privileges(app: tauri::AppHandle) -> Result<bool, String> {
             }
         }
     }
-    ensure(&app, &bin)?;
+    ensure(app, &bin)?;
     Ok(true)
+}
+
+/// If a helper is live and no client is running, ask it to heal a resolver
+/// left pointing at `127.0.0.1` (or apply a leftover journal). Never
+/// prompts: a missing helper is a silent skip, same as `maybe_restore_dns`.
+fn restore_dns_best_effort(app: &tauri::AppHandle) {
+    if crate::runner::current_status(app).state != "disconnected" {
+        return;
+    }
+    match ping(app) {
+        None => return,
+        Some(resp) if resp.running == Some(true) => return,
+        Some(_) => {}
+    }
+    match call(app, Cmd::RestoreDns) {
+        Ok(r) if r.ok => {}
+        Ok(r) => {
+            eprintln!(
+                "[helper] DNS restore at startup failed: {}",
+                r.error
+                    .unwrap_or_else(|| "unknown helper error".to_string())
+            );
+        }
+        Err(e) => {
+            eprintln!("[helper] DNS restore at startup failed: {e}");
+        }
+    }
 }
 
 // --- Settings-surface commands for the macOS daemon -------------------------
@@ -608,7 +646,7 @@ pub fn daemon_info() -> DaemonInfo {
 
 /// Register the launchd daemon; when macOS wants explicit consent, jump the
 /// user straight to System Settings > Login Items. Returns the new status.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn daemon_install() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
@@ -626,7 +664,7 @@ pub fn daemon_install() -> Result<String, String> {
     Err("the privileged daemon is only supported on macOS".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn daemon_uninstall() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {

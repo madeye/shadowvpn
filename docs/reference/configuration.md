@@ -76,7 +76,7 @@ and `peer_ip` to request an assignment; setting only one is an error.
 
 | CLI flag        | Meaning |
 |-----------------|---------|
-| `--restore-dns` | restore the system resolver from the journal left by a run that did not exit cleanly, then exit (no tunnel is brought up). Used by the desktop app to heal DNS after a crashed client. |
+| `--restore-dns` | restore the system resolver from the journal left by a run that did not exit cleanly, or reset a leftover `127.0.0.1` to automatic/DHCP DNS, then exit (no tunnel is brought up). Used by the desktop app on launch to heal DNS after a crashed client. |
 
 ## Full examples
 
