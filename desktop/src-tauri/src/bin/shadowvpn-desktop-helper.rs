@@ -180,6 +180,9 @@ fn admin_gid() -> libc::gid_t {
 /// Mask `0o027` = group-write + other rwx. Group-read (`0o040`) is allowed:
 /// the macOS daemon publishes `root:admin` `0640` so admin-group users can
 /// command it. `0o047` is the wrong mask here — that is group-*read*.
+/// Unix-only at runtime (`read_token` checks mode under `cfg(unix)`); compiled
+/// for tests on every OS.
+#[cfg(any(unix, test))]
 fn token_mode_too_open(mode: u32) -> bool {
     mode & 0o027 != 0
 }
