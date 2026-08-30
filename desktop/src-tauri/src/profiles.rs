@@ -78,7 +78,8 @@ pub struct ProfileConfig {
     pub geoip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geoip_country: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Ignored. Legacy OS-resolver takeover; kept so old profiles still parse.
+    #[serde(default, skip_serializing)]
     pub set_dns: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prewarm: Option<Vec<String>>,

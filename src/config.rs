@@ -47,9 +47,8 @@ pub const DEFAULT_CIPHER: &str = "chacha20-poly1305";
 /// Default TUN netmask (a /24).
 pub const DEFAULT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
-/// Default address the split-DNS proxy listens on. Port 53 so the client can
-/// point the system resolver at it automatically (the client needs root for the
-/// TUN anyway, and nothing else binds `127.0.0.1:53` by default).
+/// Default address the optional split-DNS UDP stub listens on. Host DNS is
+/// intercepted on the TUN (UDP/53); the OS resolver is not rewritten.
 pub const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:53";
 
 /// Default domestic / direct DNS upstream (114DNS).
@@ -303,9 +302,9 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geoip_country: Option<String>,
 
-    /// Whether to point the system resolver at the proxy automatically
-    /// (default `true` in gfwlist/chinadns mode).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Ignored. Legacy OS-resolver takeover; DNS is intercepted on the TUN.
+    /// Kept so old configs still parse (`deny_unknown_fields`).
+    #[serde(default, skip_serializing)]
     pub set_dns: Option<bool>,
 
     /// Domains to pre-resolve into the cache on startup. Absent uses a built-in
@@ -615,15 +614,6 @@ pub struct ClientArgs {
     #[arg(long = "geoip-country")]
     pub geoip_country: Option<String>,
 
-    /// Point the system resolver at the split-DNS proxy (the default in
-    /// gfwlist/chinadns mode).
-    #[arg(long = "set-dns")]
-    pub set_dns: bool,
-
-    /// Do NOT modify the system resolver; configure DNS yourself.
-    #[arg(long = "no-set-dns")]
-    pub no_set_dns: bool,
-
     /// Restore the system resolver from the journal left by a run that did
     /// not exit cleanly, or reset a leftover 127.0.0.1 to automatic/DHCP
     /// DNS, then exit (no tunnel is brought up). Used by the desktop app
@@ -816,15 +806,6 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
                 .and_then(|d| bundled_geoip(mode, chnroute.is_some(), d))
         });
 
-    // `--no-set-dns` wins over `--set-dns`; otherwise file value; default on.
-    let set_dns = if args.no_set_dns {
-        false
-    } else if args.set_dns {
-        true
-    } else {
-        file.set_dns.unwrap_or(true)
-    };
-
     // Pre-warm: `--no-prewarm` disables; else the file list, else the built-in.
     let prewarm = if args.no_prewarm {
         Vec::new()
@@ -874,7 +855,6 @@ fn resolve_policy(args: &ClientArgs, file: &FileConfig) -> Result<PolicyConfig, 
             .clone()
             .or_else(|| file.geoip_country.clone())
             .unwrap_or_else(|| DEFAULT_GEOIP_COUNTRY.to_string()),
-        set_dns,
         prewarm,
         cache_file,
         dns_timeout: Duration::from_millis(file.dns_timeout_ms.unwrap_or(DEFAULT_DNS_TIMEOUT_MS)),
@@ -1393,8 +1373,6 @@ mod tests {
                 chnroute: None,
                 geoip: None,
                 geoip_country: None,
-                set_dns: false,
-                no_set_dns: false,
                 restore_dns: false,
                 no_prewarm: false,
                 cache_file: None,
@@ -1476,15 +1454,6 @@ mod tests {
         let cfg = base.clone().resolve().expect("resolve full");
         assert_eq!(cfg.policy.mode, Mode::Full);
         assert_eq!(cfg.policy.dns_listen.to_string(), "127.0.0.1:53");
-        assert!(cfg.policy.set_dns, "set_dns defaults to on");
-
-        // --no-set-dns wins; --set-dns forces on.
-        let mut nd = base.clone();
-        nd.no_set_dns = true;
-        assert!(!nd.resolve().unwrap().policy.set_dns);
-        let mut sd = base.clone();
-        sd.set_dns = true;
-        assert!(sd.resolve().unwrap().policy.set_dns);
 
         // prewarm defaults to the built-in list; --no-prewarm empties it.
         assert!(!cfg.policy.prewarm.is_empty());
@@ -1611,12 +1580,14 @@ mod tests {
             "password": "pw",
             "cipher": "aes-256-gcm",
             "tun_ip": "10.1.0.2",
-            "peer_ip": "10.1.0.1"
+            "peer_ip": "10.1.0.1",
+            "set_dns": true
         }"#;
         let fc: FileConfig = serde_json::from_str(json).expect("parse");
         assert_eq!(fc.server.as_deref(), Some("1.2.3.4:8388"));
         assert_eq!(fc.cipher.as_deref(), Some("aes-256-gcm"));
         assert_eq!(fc.tun_ip, Some(Ipv4Addr::new(10, 1, 0, 2)));
+        assert_eq!(fc.set_dns, Some(true));
     }
 
     #[test]

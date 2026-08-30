@@ -68,6 +68,10 @@ const ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shared slot so `run` can drop/recreate the installer when the assigned IPv4 changes.
 type InstallerSlot = Arc<Mutex<Option<Arc<RouteInstaller>>>>;
 
+/// Shared slot so the TUN→net path can intercept UDP/53 once policy/Magic DNS
+/// has built a [`shadowvpn::policy::Resolver`].
+type DnsResolverSlot = Arc<Mutex<Option<Arc<shadowvpn::policy::Resolver>>>>;
+
 /// Plaintext payload of a keepalive datagram: a `0x00` marker byte followed by
 /// the client's 4-byte tunnel IP. At 5 bytes it is smaller than any real IP
 /// packet header, so the server can distinguish/drop it cheaply; the announced
@@ -260,6 +264,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
     // is known (a cache counts). Recreated below if the server hands out a new IP.
     let mut policy_handle = None;
     let installer_slot: InstallerSlot = Arc::new(Mutex::new(None));
+    let dns_slot: DnsResolverSlot = Arc::new(Mutex::new(None));
     let mut _route_guard = None;
     let mut subnet_guard = None;
     let mut hinted_routing = false;
@@ -272,6 +277,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
             direct_src,
             &mut policy_handle,
             &installer_slot,
+            &dns_slot,
             &mut _route_guard,
             Arc::clone(&peers),
         )
@@ -302,6 +308,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         Arc::clone(&master_key),
         obfuscator.clone(),
         Arc::clone(&assigned_ok),
+        Arc::clone(&dns_slot),
     ));
 
     let mut down = tokio::spawn(net_to_tun(
@@ -405,6 +412,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
                 &mut keep_tick,
                 &mut policy_handle,
                 &installer_slot,
+                &dns_slot,
                 &mut _route_guard,
                 &mut subnet_guard,
                 &mut hinted_routing,
@@ -509,15 +517,17 @@ async fn tun_to_net(
     master_key: Arc<[u8]>,
     obfuscator: Option<Arc<Obfuscator>>,
     assigned_ok: Arc<AtomicBool>,
+    dns: DnsResolverSlot,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
     // Reader: pull IP packets off the TUN device and hand each to the processor.
+    let tun_reader = Arc::clone(&tun);
     let reader = tokio::spawn(async move {
         // Plaintext buffer sized for the largest IP packet we might read.
         let mut buf = vec![0u8; MAX_IP_PACKET];
         loop {
-            let n = tun
+            let n = tun_reader
                 .recv(&mut buf)
                 .await
                 .context("failed to read from TUN device")?;
@@ -535,12 +545,38 @@ async fn tun_to_net(
         }
     });
 
-    // Processor: encrypt, obfuscate, and send to the server.
+    // Processor: intercept DNS, otherwise encrypt, obfuscate, and send.
+    let tun_reply = Arc::clone(&tun);
     let processor = tokio::spawn(async move {
         // Consecutive transient send failures (see `is_transient_udp_error`):
         // warn once when a burst starts, then stay quiet until it clears.
         let mut send_failures: u64 = 0;
         while let Some(pkt) = rx.recv().await {
+            // User-mode DNS intercept: IPv4 UDP/53 is answered by the split-DNS
+            // / Magic DNS resolver and written back to TUN, never encrypted.
+            // The resolver's own tunneled upstream queries (tracked by source
+            // port) still take the encrypt path so they reach the real server.
+            if let Some(q) = shadowvpn::policy::classify(&pkt) {
+                let resolver = dns.lock().unwrap().clone();
+                if let Some(resolver) = resolver {
+                    if !resolver.owns_source_port(q.src_port) {
+                        let tun = Arc::clone(&tun_reply);
+                        tokio::spawn(async move {
+                            match resolver.resolve(&q.payload).await {
+                                Some(resp) => {
+                                    let reply = shadowvpn::policy::build_reply(&q, &resp);
+                                    if let Err(e) = tun.send(&reply).await {
+                                        warn!("DNS intercept: failed to write reply to TUN: {e}");
+                                    }
+                                }
+                                None => debug!("DNS intercept: no answer for query"),
+                            }
+                        });
+                        continue;
+                    }
+                }
+            }
+
             let n = pkt.len();
 
             // Encrypt this IP packet into one on-wire datagram. A crypto failure
@@ -854,6 +890,7 @@ async fn start_policy_and_installer(
     direct_src: std::net::IpAddr,
     policy_handle: &mut Option<shadowvpn::policy::PolicyHandle>,
     installer_slot: &InstallerSlot,
+    dns_slot: &DnsResolverSlot,
     route_guard: &mut Option<mesh::InstallerGuard>,
     peers: Arc<PeerTable>,
 ) -> Result<()> {
@@ -865,18 +902,18 @@ async fn start_policy_and_installer(
                 cfg.policy.mode.name()
             );
         }
-        *policy_handle = Some(
-            shadowvpn::policy::spawn(
-                &cfg.policy,
-                iface_name,
-                cfg.tun.ip,
-                server_ip,
-                direct_src,
-                peers,
-            )
-            .await
-            .context("failed to start DNS proxy")?,
-        );
+        let handle = shadowvpn::policy::spawn(
+            &cfg.policy,
+            iface_name,
+            cfg.tun.ip,
+            server_ip,
+            direct_src,
+            peers,
+        )
+        .await
+        .context("failed to start DNS proxy")?;
+        *dns_slot.lock().unwrap() = Some(Arc::clone(&handle.resolver));
+        *policy_handle = Some(handle);
     }
     if cfg.accept_routes && installer_slot.lock().unwrap().is_none() {
         let installer = Arc::new(
@@ -891,7 +928,11 @@ async fn start_policy_and_installer(
 
 /// Abort the DNS-proxy task and wait for it to exit so `dns_listen` is released
 /// before a replacement `spawn` (dropping the JoinHandle would detach it).
-async fn shutdown_policy(handle: &mut Option<shadowvpn::policy::PolicyHandle>) {
+async fn shutdown_policy(
+    handle: &mut Option<shadowvpn::policy::PolicyHandle>,
+    dns_slot: &DnsResolverSlot,
+) {
+    *dns_slot.lock().unwrap() = None;
     if let Some(mut old) = handle.take() {
         old.task.abort();
         let _ = (&mut old.task).await;
@@ -930,6 +971,7 @@ async fn handle_assign_reply(
     keep_tick: &mut Option<tokio::time::Interval>,
     policy_handle: &mut Option<shadowvpn::policy::PolicyHandle>,
     installer_slot: &InstallerSlot,
+    dns_slot: &DnsResolverSlot,
     route_guard: &mut Option<mesh::InstallerGuard>,
     subnet_guard: &mut Option<SubnetRouteGuard>,
     hinted_routing: &mut bool,
@@ -1000,7 +1042,7 @@ async fn handle_assign_reply(
             reply.tun_ip
         );
         // JoinHandle drop would detach the proxy and leave 127.0.0.1:53 bound.
-        shutdown_policy(policy_handle).await;
+        shutdown_policy(policy_handle, dns_slot).await;
         if cfg.accept_routes {
             *installer_slot.lock().unwrap() = None;
             *route_guard = None;
@@ -1014,6 +1056,7 @@ async fn handle_assign_reply(
         direct_src,
         policy_handle,
         installer_slot,
+        dns_slot,
         route_guard,
         peers,
     )

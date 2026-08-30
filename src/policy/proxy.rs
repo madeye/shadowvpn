@@ -24,8 +24,9 @@
 //! Adding addresses to the route set is abstracted behind [`IpSink`] so the
 //! routing logic can be unit-tested without root.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -91,12 +92,19 @@ pub struct Resolver {
     cache: Arc<cache::DnsCache>,
     /// Source address to bind direct (local-upstream) queries to, and the source
     /// for tunneled (remote-upstream) queries. Defaults to unspecified, letting
-    /// the OS choose. On Windows these are pinned to the physical and tun
-    /// addresses respectively, because with the tun up the OS otherwise
-    /// mis-selects the tun as the source for the direct query (sending the
-    /// domestic lookup through the tunnel, so it returns foreign answers).
+    /// the OS choose. Production pins these to the physical and tun addresses
+    /// respectively, so a tun `/32` installed to attract host DNS does not
+    /// steal the resolver's own direct queries (and so tunneled queries still
+    /// enter the tun).
     local_bind: IpAddr,
     remote_bind: IpAddr,
+    /// Physical interface name to bind direct queries to (`SO_BINDTODEVICE` /
+    /// `IP_BOUND_IF`). `None` in tests and when the iface cannot be resolved.
+    direct_device: Option<String>,
+    /// Source ports of in-flight upstream DNS sockets. TUN packets from these
+    /// ports are the resolver's own tunneled queries and must not be intercepted
+    /// (that would recurse into [`Resolver::resolve`]).
+    inflight: Arc<Mutex<HashSet<u16>>>,
     /// Magic DNS overlay. When set, peer names are answered locally before
     /// any cache or upstream lookup.
     magic: Option<MagicDns>,
@@ -135,6 +143,8 @@ impl Resolver {
             cache,
             local_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             remote_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            direct_device: None,
+            inflight: Arc::new(Mutex::new(HashSet::new())),
             magic: None,
         }
     }
@@ -147,13 +157,28 @@ impl Resolver {
     }
 
     /// Pin the source addresses used for direct (`local`) and tunneled (`remote`)
-    /// upstream queries. Needed on Windows so the direct query egresses the
-    /// physical link rather than being mis-routed through the tun; elsewhere the
-    /// defaults (unspecified) let the OS choose.
+    /// upstream queries. Direct queries bind to the physical source so they do
+    /// not follow a tun host-route installed to attract DNS; tunneled queries
+    /// bind to the tun address so they still enter the tunnel.
     pub fn with_bind_sources(mut self, local_bind: IpAddr, remote_bind: IpAddr) -> Self {
         self.local_bind = local_bind;
         self.remote_bind = remote_bind;
         self
+    }
+
+    /// Bind direct (domestic) upstream sockets to this interface so a tun `/32`
+    /// for the same dest cannot steal them.
+    pub fn with_direct_device(mut self, device: String) -> Self {
+        self.direct_device = Some(device);
+        self
+    }
+
+    /// True when `port` is the source port of an in-flight upstream DNS socket.
+    ///
+    /// The TUN intercept path uses this to pass the resolver's own tunneled
+    /// queries through to encrypt/send instead of answering them locally.
+    pub fn owns_source_port(&self, port: u16) -> bool {
+        self.inflight.lock().unwrap().contains(&port)
     }
 
     /// Resolve one raw DNS query, returning the raw response to relay back, or
@@ -203,7 +228,17 @@ impl Resolver {
         } else {
             self.local_bind
         };
-        let response = match query_upstream(upstream, query, self.timeout, bind).await {
+        let bind_dev = self.direct_dev_for(bind);
+        let response = match query_upstream(
+            upstream,
+            query,
+            self.timeout,
+            bind,
+            bind_dev,
+            &self.inflight,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 debug!("gfwlist: upstream {upstream} failed for {name:?}: {e}");
@@ -234,17 +269,25 @@ impl Resolver {
     async fn decide_chinadns(&self, query: &[u8], name: Option<&str>) -> Option<Decided> {
         // Force-tunnel override: gfwlist names skip the race and go clean-only.
         if name.map(|n| self.gfwlist.matches(n)).unwrap_or(false) {
-            let response =
-                match query_upstream(self.remote, query, self.timeout, self.remote_bind).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        debug!(
-                            "chinadns: forced-tunnel upstream {} failed for {name:?}: {e}",
-                            self.remote
-                        );
-                        return None;
-                    }
-                };
+            let response = match query_upstream(
+                self.remote,
+                query,
+                self.timeout,
+                self.remote_bind,
+                None,
+                &self.inflight,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(
+                        "chinadns: forced-tunnel upstream {} failed for {name:?}: {e}",
+                        self.remote
+                    );
+                    return None;
+                }
+            };
             let tunnel_ips = dns::a_records(&response);
             return Some(Decided {
                 response,
@@ -258,15 +301,23 @@ impl Resolver {
         let remote = self.remote;
         let remote_bind = self.remote_bind;
         let timeout = self.timeout;
+        let inflight = Arc::clone(&self.inflight);
         let remote_task = tokio::spawn(async move {
-            query_upstream(remote, &remote_query, timeout, remote_bind)
+            query_upstream(remote, &remote_query, timeout, remote_bind, None, &inflight)
                 .await
                 .ok()
         });
 
-        let local_res = query_upstream(self.local, query, self.timeout, self.local_bind)
-            .await
-            .ok();
+        let local_res = query_upstream(
+            self.local,
+            query,
+            self.timeout,
+            self.local_bind,
+            self.direct_dev_for(self.local_bind),
+            &self.inflight,
+        )
+        .await
+        .ok();
         let local_ips = local_res.as_deref().map(dns::a_records).unwrap_or_default();
 
         // Domestic: trust the local answer and drop the in-flight clean query.
@@ -320,9 +371,28 @@ impl Resolver {
         None
     }
 
+    /// Direct-device bind applies only to sockets using the local (physical)
+    /// source address — never to tunneled upstreams, which must enter the tun.
+    fn direct_dev_for(&self, bind_src: IpAddr) -> Option<&str> {
+        if bind_src == self.local_bind {
+            self.direct_device.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Full-mode forwarder: send everything that isn't Magic DNS to `dns_local`.
     async fn forward_local(&self, query: &[u8]) -> Option<Vec<u8>> {
-        match query_upstream(self.local, query, self.timeout, self.local_bind).await {
+        match query_upstream(
+            self.local,
+            query,
+            self.timeout,
+            self.local_bind,
+            self.direct_dev_for(self.local_bind),
+            &self.inflight,
+        )
+        .await
+        {
             Ok(r) => Some(r),
             Err(e) => {
                 debug!("magic-dns: forward to {} failed: {e}", self.local);
@@ -332,18 +402,46 @@ impl Resolver {
     }
 }
 
+/// Drops an in-flight source port from `inflight` when the upstream socket ends.
+struct PortGuard {
+    inflight: Arc<Mutex<HashSet<u16>>>,
+    port: u16,
+}
+
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.port);
+    }
+}
+
 /// Send a query to one upstream over a fresh ephemeral UDP socket and return the
 /// raw response, bounded by `timeout`.
+///
+/// `bind_dev`, when set, pins the socket to that interface so a tun host-route
+/// for `server` cannot steal the packet. The socket's ephemeral source port is
+/// recorded in `inflight` for the lifetime of the query so TUN intercept can
+/// pass matching packets through.
 async fn query_upstream(
     server: SocketAddr,
     query: &[u8],
     timeout: Duration,
     bind_src: IpAddr,
+    bind_dev: Option<&str>,
+    inflight: &Arc<Mutex<HashSet<u16>>>,
 ) -> Result<Vec<u8>> {
-    let bind: SocketAddr = (bind_src, 0).into();
-    let sock = UdpSocket::bind(bind)
+    let sock = bind_upstream_socket(bind_src, bind_dev)
         .await
         .context("bind upstream DNS socket")?;
+    let _guard = match sock.local_addr() {
+        Ok(addr) if addr.port() != 0 => {
+            inflight.lock().unwrap().insert(addr.port());
+            Some(PortGuard {
+                inflight: Arc::clone(inflight),
+                port: addr.port(),
+            })
+        }
+        _ => None,
+    };
     sock.connect(server)
         .await
         .with_context(|| format!("connect to DNS upstream {server}"))?;
@@ -356,6 +454,84 @@ async fn query_upstream(
         .context("recv DNS response")?;
     buf.truncate(n);
     Ok(buf)
+}
+
+/// Bind an ephemeral UDP socket at `bind_src`, optionally pinned to `bind_dev`.
+async fn bind_upstream_socket(
+    bind_src: IpAddr,
+    bind_dev: Option<&str>,
+) -> std::io::Result<UdpSocket> {
+    let addr: SocketAddr = (bind_src, 0).into();
+    let sock = UdpSocket::bind(addr).await?;
+    if let Some(dev) = bind_dev {
+        if let Err(e) = bind_to_device(&sock, dev) {
+            debug!("DNS upstream: bind to device {dev} failed: {e}");
+        }
+    }
+    Ok(sock)
+}
+
+/// Force outgoing packets onto `dev` so a tun `/32` for the dest cannot steal them.
+fn bind_to_device(sock: &UdpSocket, dev: &str) -> std::io::Result<()> {
+    bind_to_device_imp(sock, dev)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_to_device_imp(sock: &UdpSocket, dev: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let cname = std::ffi::CString::new(dev).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface name has a NUL")
+    })?;
+    let bytes = cname.as_bytes_with_nul();
+    // SAFETY: `sock` is a live UDP socket; SO_BINDTODEVICE reads `bytes` for
+    // `bytes.len()` and does not retain the pointer.
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            bytes.as_ptr().cast(),
+            bytes.len() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn bind_to_device_imp(sock: &UdpSocket, dev: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let cname = std::ffi::CString::new(dev).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface name has a NUL")
+    })?;
+    // SAFETY: `cname` is a valid C string for the duration of the call.
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `sock` is a live UDP socket; IP_BOUND_IF reads a u32 ifindex.
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&idx as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&idx) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn bind_to_device_imp(_sock: &UdpSocket, _dev: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Clear the Windows `SIO_UDP_CONNRESET` behavior on a UDP socket.
@@ -766,5 +942,52 @@ mod tests {
         assert_eq!(dns::a_records(&hit), vec![Ipv4Addr::new(10, 9, 0, 5)]);
         let fwd = r.resolve(&query("example.com")).await.unwrap();
         assert_eq!(dns::a_records(&fwd), vec![Ipv4Addr::new(9, 9, 9, 9)]);
+    }
+
+    #[tokio::test]
+    async fn tracks_in_flight_upstream_source_port() {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_DNS_MSG];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let resp = response(&buf[..n], &[Ipv4Addr::new(9, 9, 9, 9)]);
+            let _ = sock.send_to(&resp, from).await;
+        });
+        let r = Arc::new(Resolver::new(
+            Mode::GfwList,
+            GfwList::from_lines(["blocked.com"]),
+            ChnRoute::default(),
+            addr,
+            addr,
+            Duration::from_secs(2),
+            Arc::new(VecSink::default()),
+            Arc::new(cache::DnsCache::new()),
+        ));
+        let q = query("www.blocked.com");
+        let r2 = Arc::clone(&r);
+        let h = tokio::spawn(async move { r2.resolve(&q).await });
+        let start = std::time::Instant::now();
+        loop {
+            if !r.inflight.lock().unwrap().is_empty() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(1) {
+                panic!("upstream source port was never recorded");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let ports: Vec<u16> = r.inflight.lock().unwrap().iter().copied().collect();
+        assert!(!ports.is_empty());
+        for p in &ports {
+            assert!(r.owns_source_port(*p));
+        }
+        assert!(!r.owns_source_port(1), "unrelated port is not owned");
+        h.await.unwrap().expect("resolved");
+        assert!(
+            r.inflight.lock().unwrap().is_empty(),
+            "port released after query"
+        );
     }
 }

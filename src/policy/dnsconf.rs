@@ -1,42 +1,16 @@
-//! Point the system resolver at the split-DNS proxy — and put it back on exit.
+//! Restore the system resolver after an older client rewrote it.
 //!
-//! For policy routing to take effect, name lookups must go through the proxy
-//! (that is what installs the per-destination routes). [`apply`] configures the
-//! OS resolver to do that and returns a [`DnsGuard`] that restores the previous
-//! configuration when dropped:
+//! Current clients intercept DNS on the TUN and do **not** point the OS
+//! resolver at `127.0.0.1`. [`restore_stale`] (`--restore-dns`) heals leftovers:
 //!
-//! * **macOS** — `networksetup -setdnsservers <primary-service> <proxy-ip>`,
-//!   remembering and restoring the service's previous servers.
-//! * **Linux** — rewrite `/etc/resolv.conf` to `nameserver <proxy-ip>`,
-//!   remembering the previous file (or symlink) and restoring it.
-//! * **Windows** — `netsh interface ipv4 set dnsservers <primary-iface> static
-//!   <proxy-ip>`, remembering whether the interface used DHCP or a static list
-//!   and restoring it.
+//! * If a journal ([`JOURNAL_FILE_NAME`], next to the binary) exists, apply it
+//!   (the original nameservers). A journal that recorded only `127.0.0.1` is
+//!   treated as empty/DHCP so a poisoned snapshot cannot wedge the resolver.
+//! * Else if the resolver is pointing only at `127.0.0.1`, reset to
+//!   automatic/DHCP DNS (`networksetup` / remove leftover `/etc/resolv.conf` /
+//!   `netsh`).
 //!
-//! The OS resolver can only point at an address, not a port, so this is only
-//! applied when the proxy listens on port 53; otherwise it is skipped with a
-//! warning and the operator must configure DNS themselves.
-//!
-//! # Crash recovery (the restore journal)
-//!
-//! The pre-`apply` configuration is persisted to a journal file
-//! ([`JOURNAL_FILE_NAME`], next to the running binary — same convention as the
-//! DNS cache) *before* the resolver is touched, and removed again after a
-//! successful restore. If the process dies without restoring (SIGKILL, a
-//! panic-abort, power loss), the journal survives and the original
-//! configuration is recovered by whichever of these happens first:
-//!
-//! * the next [`apply`] (e.g. the desktop app auto-reconnecting) restores the
-//!   journal *before* reading the "previous" configuration — without this, the
-//!   dead run's proxy address would be recorded as the value to restore,
-//!   wedging DNS permanently even across later clean exits;
-//! * [`restore_stale`] (the client's `--restore-dns` flag), which the
-//!   desktop app runs through its elevated helper on every launch (and
-//!   whenever the reconnect watcher sees a leftover journal with no client
-//!   running). If the journal is missing but the resolver is still pointing
-//!   only at `127.0.0.1` — a leftover proxy with nothing listening —
-//!   [`restore_stale`] falls back to automatic/DHCP DNS rather than leaving
-//!   the host unable to resolve.
+//! The desktop app runs this through its elevated helper on launch.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -104,13 +78,10 @@ impl Drop for DnsGuard {
 
 /// Point the system resolver at `proxy` (the proxy's listen address).
 ///
-/// `direct_src` is the host's physical source address (the local IP of the
-/// socket connected to the server); on Windows it identifies the interface whose
-/// DNS to reconfigure. Ignored on other platforms.
-///
-/// Returns `Ok(None)` (with a warning) if the port is not 53, since the OS
-/// resolver cannot target a custom port. On success the returned guard restores
-/// the prior configuration on drop.
+/// Unused on the connect path: DNS is intercepted on the TUN. Kept so leftover
+/// journals from older clients still deserialize and [`restore_stale`] can
+/// put the original resolver back.
+#[allow(dead_code)]
 pub fn apply(proxy: IpAddr, port: u16, direct_src: IpAddr) -> Result<Option<DnsGuard>> {
     if port != 53 {
         warn!(

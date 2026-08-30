@@ -65,20 +65,15 @@ the same name gets `name-aabb`, where `aabb` is the first four hex digits of
 its `node_id` (auto-assign) or the last octet of its tunnel IPv4 (static).
 The rename is logged.
 
-## DNS takeover
+## DNS intercept
 
-The stub listens on `dns_listen` (default `127.0.0.1:53`).
+Host DNS is intercepted on the TUN (IPv4 UDP/53). Magic names are answered
+from the local peer table; everything else follows the mode's split-DNS
+logic (or, in full mode, is forwarded to `dns_local`). The OS resolver is
+not rewritten.
 
-- **gfwlist / chinadns** — Magic DNS is answered first, then the existing
-  split-DNS logic. The system resolver is already pointed at the proxy.
-- **full mode** — the client starts a **forwarding** stub: Magic names are
-  local, everything else goes to `dns_local`. `set_dns` (default on) points
-  the system resolver at that stub, the same way policy modes do.
-
-This is a behaviour change for full mode: with default Magic DNS the client
-now takes over the system resolver. Opt out with `--no-magic-dns` (restore
-today's full-mode behaviour) or `--no-set-dns` (leave the stub on
-`127.0.0.1:53` and configure DNS yourself).
+An optional UDP stub still binds `dns_listen` (default `127.0.0.1:53`) so
+operators can query it directly. Opt out of Magic DNS with `--no-magic-dns`.
 
 `--nat` servers ignore name adverts. Clients still start the stub if Magic
 DNS is on, but the table stays empty.

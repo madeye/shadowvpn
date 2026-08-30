@@ -27,6 +27,7 @@ pub mod dns;
 pub mod dnsconf;
 pub mod geoip;
 pub mod gfwlist;
+pub mod intercept;
 pub mod proxy;
 pub mod route;
 
@@ -34,6 +35,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use intercept::{attract_destinations, build_reply, classify, DnsQuery};
 pub use proxy::{chinadns_decision, Decision, IpSink, Resolver};
 
 /// Which policy-routing strategy the client should run.
@@ -137,9 +139,6 @@ pub struct PolicyConfig {
     pub geoip: Option<PathBuf>,
     /// ISO 3166-1 alpha-2 country code selected from the GeoIP database.
     pub geoip_country: String,
-    /// Whether to point the system resolver at the proxy automatically (and
-    /// restore it on exit). Only effective when `dns_listen` uses port 53.
-    pub set_dns: bool,
     /// Domains to pre-resolve into the cache on startup (empty = disabled).
     pub prewarm: Vec<String>,
     /// Where to persist the DNS cache across restarts (`None` = don't persist).
@@ -157,9 +156,9 @@ pub struct PolicyConfig {
 pub struct PolicyHandle {
     /// The DNS proxy serve loop; resolves only on a fatal socket error.
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Shared resolver used by the UDP stub and by TUN DNS intercept.
+    pub resolver: std::sync::Arc<Resolver>,
     _guard: route::RouteGuard,
-    /// Restores the system resolver on drop (when auto-DNS was applied).
-    _dns_guard: Option<dnsconf::DnsGuard>,
     /// Persists the DNS cache to disk on drop (when a cache file is configured).
     _cache_guard: Option<CacheGuard>,
 }
@@ -176,13 +175,16 @@ impl Drop for CacheGuard {
     }
 }
 
-/// Start policy routing and the split-DNS proxy.
+/// Start policy routing and the split-DNS resolver.
 ///
 /// Loads the mode's data file, builds the [`route::TunRouter`] (seeding a route
-/// for the clean DNS upstream so it is reached through the tunnel), and spawns
-/// the proxy on `dns_listen`. The returned [`PolicyHandle`] owns the teardown
-/// guard, so keep it alive for as long as policy routing should remain in
-/// effect. Works on Linux, macOS, and Windows.
+/// for the clean DNS upstream so it is reached through the tunnel, plus host
+/// routes that attract public resolver IPs onto the TUN), and spawns the
+/// optional UDP stub on `dns_listen`. DNS queries that appear on the TUN as
+/// IPv4 UDP/53 are intercepted in user-mode by the same [`Resolver`]. The
+/// returned [`PolicyHandle`] owns the teardown guard, so keep it alive for as
+/// long as policy routing should remain in effect. Works on Linux, macOS, and
+/// Windows.
 pub async fn spawn(
     cfg: &PolicyConfig,
     tun_name: &str,
@@ -282,6 +284,26 @@ pub async fn spawn(
         }
     }
 
+    // Attract host DNS onto the TUN without rewriting the OS nameserver to
+    // 127.0.0.1: /32 routes for well-known public resolvers, configured
+    // upstreams, and the host's current non-loopback nameservers.
+    let extra_dns = [cfg.dns_local.ip(), cfg.dns_remote.ip()]
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(v4),
+            _ => None,
+        });
+    let attract = intercept::attract_destinations(extra_dns);
+    log::info!(
+        "DNS intercept: attracting {} resolver IP(s) onto the tun",
+        attract.len()
+    );
+    for ip in attract {
+        if let Err(e) = router.add_route(ip) {
+            log::debug!("DNS attract {ip}/32: {e}");
+        }
+    }
+
     // Shared DNS cache, pre-loaded from disk if persistence is enabled.
     let dns_cache = Arc::new(cache::DnsCache::new());
     if let Some(path) = cfg.cache_file.as_ref() {
@@ -306,8 +328,15 @@ pub async fn spawn(
         sink,
         Arc::clone(&dns_cache),
     );
-    #[cfg(windows)]
+    // Pin direct queries to the physical source (and, on Unix, the physical
+    // interface) so they do not follow a tun /32 installed to attract host
+    // DNS. Pin tunneled queries to the tun address so they take the tunnel.
     let resolver = resolver.with_bind_sources(direct_src, IpAddr::V4(tun_ip));
+    let resolver = if let Some(dev) = intercept::interface_name_for_ip(direct_src) {
+        resolver.with_direct_device(dev)
+    } else {
+        resolver
+    };
     let resolver = if magic_on {
         resolver.with_magic(peers, cfg.magic_dns_suffix.clone())
     } else {
@@ -321,32 +350,18 @@ pub async fn spawn(
         .with_context(|| format!("binding DNS proxy on {}", cfg.dns_listen))?;
     if policy_on {
         log::info!(
-            "policy routing active (mode={}); DNS proxy on {}",
+            "policy routing active (mode={}); DNS intercept on TUN, UDP stub on {}",
             cfg.mode.name(),
             cfg.dns_listen
         );
     }
     if magic_on {
         log::info!(
-            "magic DNS active (suffix={}); DNS proxy on {}",
+            "magic DNS active (suffix={}); DNS intercept on TUN, UDP stub on {}",
             cfg.magic_dns_suffix,
             cfg.dns_listen
         );
     }
-
-    // Point the system resolver at the proxy (and restore it on exit) unless the
-    // operator opted out; otherwise just tell them how to do it themselves.
-    let dns_guard = if cfg.set_dns {
-        dnsconf::apply(cfg.dns_listen.ip(), cfg.dns_listen.port(), direct_src)
-            .context("configuring the system resolver")?
-    } else {
-        log::info!(
-            "point this host's resolver at {} (e.g. nameserver {}) to use policy routing",
-            cfg.dns_listen,
-            cfg.dns_listen.ip()
-        );
-        None
-    };
 
     // Pre-warm common domains in the background so their first real lookup is hot.
     // Full-mode Magic DNS is a forwarder, not a policy cache — skip.
@@ -360,11 +375,11 @@ pub async fn spawn(
         path: path.clone(),
     });
 
-    let task = tokio::spawn(proxy::serve(listener, resolver));
+    let task = tokio::spawn(proxy::serve(listener, Arc::clone(&resolver)));
     Ok(PolicyHandle {
         task,
+        resolver,
         _guard: route::RouteGuard::new(router),
-        _dns_guard: dns_guard,
         _cache_guard: cache_guard,
     })
 }

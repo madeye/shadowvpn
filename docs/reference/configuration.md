@@ -67,7 +67,6 @@ and `peer_ip` to request an assignment; setting only one is an error.
 | `chnroute`      | `--chnroute`    | China CIDR file (chinadns mode)                            | —                    |
 | `geoip`         | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it (takes precedence over `chnroute`) | auto-discovers a bundled `GeoLite2-Country.mmdb` |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database       | `CN`                 |
-| `set_dns`       | `--set-dns` / `--no-set-dns` | point the system resolver at the proxy (auto-restored on exit). Also applied in full mode when Magic DNS is on. | `true` (needs `dns_listen` port 53) |
 | `prewarm`       | `--no-prewarm` (disable) | list of domains to pre-resolve into the cache on startup | built-in list       |
 | `cache_file`    | `--cache-file` / `--no-cache-persist` | persist the DNS cache across restarts     | `dns-cache.json` (next to the binary) |
 | `dns_timeout_ms` | *(config only)* | upstream DNS query timeout in milliseconds                | `3000`               |

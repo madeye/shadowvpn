@@ -349,9 +349,8 @@ Joined peers resolve by hostname — Tailscale-like Magic DNS, no control plane.
 Each client announces a name (OS hostname, or `hostname` / `--hostname`); the
 server grants it (collisions become `name-aabb`) and pushes the map. The
 client stub answers `A`/`AAAA` for `laptop` and `laptop.svpn`. On by default
-in learning mode; `--no-magic-dns` restores the old behaviour. Full mode now
-starts a forwarding stub and, with default `set_dns`, takes over the system
-resolver (same as gfwlist/chinadns). See the
+in learning mode; `--no-magic-dns` restores the old behaviour. Host DNS is
+intercepted on the TUN (IPv4 UDP/53); the OS resolver is not rewritten. See the
 [Magic DNS guide](https://madeye.github.io/shadowvpn/guide/magic-dns).
 
 ---
@@ -669,15 +668,10 @@ sudo ./target/release/shadowvpn-client -c client.json \
   --gfwlist /etc/shadowvpn/gfwlist.txt
 ```
 
-Policy routing only takes effect for names resolved **through** the proxy (that's
-what installs the routes), so the system resolver must point at it. By default
-the client does this for you: on startup it points the OS resolver at the proxy
-(`networksetup` on macOS, `/etc/resolv.conf` on Linux) and **restores the
-previous setting on exit** — including on Ctrl-C / `SIGTERM`, which it handles for
-a clean shutdown. Pass `--no-set-dns` to manage DNS yourself instead. Automatic
-setup only applies when `dns_listen` uses port 53 (the OS resolver can't target a
-custom port) — which is the default, so it works out of the box; if you move the
-proxy to another port, point your resolver at it manually.
+Policy routing only takes effect for names resolved **through** the split-DNS
+resolver (that's what installs the routes). Host DNS is intercepted on the TUN
+(IPv4 UDP/53 to any destination, including public resolvers such as `8.8.8.8`);
+the client does **not** rewrite the OS nameserver to `127.0.0.1`.
 
 Relevant config / flags (all client-only; CLI overrides JSON):
 
@@ -691,7 +685,6 @@ Relevant config / flags (all client-only; CLI overrides JSON):
 | `chnroute`    | `--chnroute`    | China CIDR file (chinadns mode)                           | —                    |
 | `geoip`       | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it     | —                    |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database    | `CN`                 |
-| `set_dns`     | `--set-dns` / `--no-set-dns` | point the system resolver at the proxy (auto-restored on exit) | `true` (needs `dns_listen` port 53) |
 | `prewarm`     | `--no-prewarm`  | pre-resolve common domains into the cache on startup        | built-in list        |
 | `cache_file`  | `--cache-file` / `--no-cache-persist` | persist the DNS cache across restarts        | `dns-cache.json` (next to the binary) |
 
@@ -830,7 +823,8 @@ src/
     cache.rs      TTL-respecting DNS answer cache
     proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
     route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE / IP Helper API)
-    dnsconf.rs    point the system resolver at the proxy (networksetup / resolv.conf / netsh)
+    intercept.rs  user-mode DNS intercept on TUN (IPv4 UDP/53)
+    dnsconf.rs    restore leftover OS resolver (older builds that rewrote DNS)
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
   bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
 docs/

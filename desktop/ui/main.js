@@ -76,7 +76,6 @@
   // (from get_settings). Shown as the effective path when the matching field is
   // left blank, so the user sees the real file the client auto-discovers.
   let bundledPaths = { gfwlist: null, chnroute: null, geoip: null };
-  const fSetDns = document.getElementById("f-set_dns");
 
   const fDnsTimeoutMs = document.getElementById("f-dns_timeout_ms");
   const fPrewarmDisable = document.getElementById("f-prewarm_disable");
@@ -128,6 +127,7 @@
     "chnroute",
     "geoip",
     "geoip_country",
+    // Legacy OS-resolver takeover; omitted on save (TUN intercept instead).
     "set_dns",
     "dns_timeout_ms",
     "cache_file",
@@ -321,8 +321,6 @@
     fChnroute.value = config.chnroute || "";
     fGeoip.value = config.geoip || "";
     fGeoipCountry.value = config.geoip_country || "";
-    // set_dns only applies in gfwlist/chinadns; leave it off when routing is untouched.
-    fSetDns.checked = isPolicyMode(config.mode) && config.set_dns !== false;
 
     fDnsTimeoutMs.value =
       config.dns_timeout_ms != null ? String(config.dns_timeout_ms) : "";
@@ -605,12 +603,6 @@
       chnroute: strOrUndef(fChnroute),
       geoip: strOrUndef(fGeoip),
       geoip_country: strOrUndef(fGeoipCountry),
-      // Omit set_dns unless a policy mode is on (client default is unused in full/off).
-      set_dns: isPolicyMode(fMode.value)
-        ? fSetDns.checked
-          ? undefined
-          : false
-        : undefined,
       dns_timeout_ms: intOrUndef(fDnsTimeoutMs),
       cache_file: strOrUndef(fCacheFile),
     });

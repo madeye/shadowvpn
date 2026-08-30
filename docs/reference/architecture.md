@@ -59,7 +59,8 @@ src/
     cache.rs      TTL-respecting DNS answer cache
     proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
     route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE / IP Helper API)
-    dnsconf.rs    point the system resolver at the proxy (networksetup / resolv.conf / netsh)
+    intercept.rs  user-mode DNS intercept on TUN (IPv4 UDP/53)
+    dnsconf.rs    restore leftover OS resolver (older builds that rewrote DNS)
   bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
   bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
 docs/             this documentation site (VitePress)

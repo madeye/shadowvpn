@@ -67,18 +67,13 @@ sudo ./target/release/shadowvpn-client -c client.json \
 
 ## System DNS handling
 
-Policy routing only takes effect for names resolved **through** the proxy
-(that's what installs the routes), so the system resolver must point at it. By
-default the client does this for you: on startup it points the OS resolver at
-the proxy (`networksetup` on macOS, `/etc/resolv.conf` on Linux, `netsh` on
-Windows) and **restores the previous setting on exit** — including on Ctrl-C /
-`SIGTERM`, which it handles for a clean shutdown. Pass `--no-set-dns` to
-manage DNS yourself instead.
-
-Automatic setup only applies when `dns_listen` uses port 53 (the OS resolver
-can't target a custom port) — which is the default, so it works out of the
-box; if you move the proxy to another port, point your resolver at it
-manually.
+Policy routing only takes effect for names resolved **through** the split-DNS
+resolver (that's what installs the routes). Host DNS is intercepted on the TUN:
+IPv4 UDP packets to port 53 are answered in user-mode and are not encrypted to
+the server. The client does **not** rewrite the OS nameserver (`networksetup` /
+`/etc/resolv.conf` / `netsh`). Public resolver IPs are attracted onto the TUN
+with host routes so lookups still reach intercept without pointing the stub
+resolver at `127.0.0.1`.
 
 ## Configuration
 
@@ -94,7 +89,6 @@ All client-only; CLI overrides JSON:
 | `chnroute`      | `--chnroute`    | China CIDR file (chinadns mode)                            | —                    |
 | `geoip`         | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it      | —                    |
 | `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database       | `CN`                 |
-| `set_dns`       | `--set-dns` / `--no-set-dns` | point the system resolver at the proxy (auto-restored on exit) | `true` (needs `dns_listen` port 53) |
 | `prewarm`       | `--no-prewarm`  | pre-resolve common domains into the cache on startup       | built-in list        |
 | `cache_file`    | `--cache-file` / `--no-cache-persist` | persist the DNS cache across restarts | `dns-cache.json` (next to the binary) |
 

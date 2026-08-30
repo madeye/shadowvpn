@@ -1,8 +1,10 @@
 #!/bin/sh
 # Client entry point for the policy-routing E2E test.
 #
-# Starts the ShadowVPN client with policy routing (mode from $MODE), points the
-# system resolver at the built-in split-DNS proxy, then connects to two domains:
+# Starts the ShadowVPN client with policy routing (mode from $MODE). DNS is
+# intercepted on the TUN (the client does not rewrite resolv.conf to 127.0.0.1);
+# the test points the stub resolver at 8.8.8.8 so queries hit that intercept,
+# then connects to two domains:
 #
 #   blocked.com -> should be TUNNELED  -> echo server sees the SERVER's address
 #   safe.com    -> should go DIRECT    -> echo server sees the CLIENT's address
@@ -45,16 +47,14 @@ ping -c 1 -W 1 10.9.0.1 >/dev/null 2>&1 || {
     exit 1
 }
 
-# The client points the system resolver at its split-DNS proxy automatically
-# (set_dns defaults on). Verify it actually rewrote /etc/resolv.conf rather than
-# doing it ourselves — this exercises the auto-DNS feature end to end.
+# DNS is intercepted on the TUN. Do not require (or treat as success) a
+# nameserver 127.0.0.1 rewrite — Docker's stub is 127.0.0.11 and the client
+# no longer takes over the OS resolver. Point at 8.8.8.8 so queries hit the
+# /32 the client attracts onto the tun.
 sleep 1
-echo "[client] /etc/resolv.conf after client startup:"
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+echo "[client] /etc/resolv.conf for TUN intercept:"
 sed 's/^/[client]   /' /etc/resolv.conf
-grep -q '^nameserver[[:space:]]\+127\.0\.0\.1' /etc/resolv.conf || {
-    echo "[client] FAIL: client did not point the resolver at its proxy" >&2
-    exit 1
-}
 
 probe() {
     # $1 = hostname; print the source address the echo server observed.

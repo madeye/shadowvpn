@@ -74,8 +74,9 @@ Pick a specific config (e.g. for policy routing) with `-Config`:
 
 ## Stop
 
-Press **Ctrl-C** in the window. The client shuts down gracefully — it restores
-the system resolver, removes the per-destination routes, and saves the DNS
-cache. Avoid `taskkill /F` / Task Manager: a forced kill skips that cleanup and
-can leave DNS pointed at the proxy (`127.0.0.1`); if that happens, reset it with
-`Set-DnsClientServerAddress -InterfaceAlias <name> -ServerAddresses <your,dns>`.
+Press **Ctrl-C** in the window. The client shuts down gracefully — it removes
+the per-destination routes and saves the DNS cache. Current clients do not
+rewrite the OS resolver. A leftover `127.0.0.1` nameserver is from an older
+build; reset it with
+`Set-DnsClientServerAddress -InterfaceAlias <name> -ServerAddresses <your,dns>`
+or `shadowvpn-client --restore-dns`.

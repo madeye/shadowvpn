@@ -53,26 +53,23 @@ release zip already ships the right one).
 
 In policy-routing mode the client points the system resolver at its local
 split-DNS proxy and restores the previous setting on exit — but only on a
-*graceful* exit (Ctrl-C / `SIGTERM` / service stop). If the process is killed
-hard (`kill -9`, `taskkill /F`, power loss), the resolver may be left pointing
-at `127.0.0.1` with nothing listening.
+*graceful* exit (Ctrl-C / `SIGTERM` / service stop). Current clients no longer
+rewrite the OS resolver (DNS is intercepted on the TUN). A leftover
+`127.0.0.1` nameserver is from an **older** build that did take over DNS.
 
 Fix: open the desktop app (it runs `--restore-dns` on launch whenever an
 elevated helper is already live and no client is running, which restores the
-journal or resets a leftover `127.0.0.1` to automatic/DHCP DNS), start the
-client again and stop it gracefully, or restore DNS by hand
-(`networksetup -setdnsservers <service> empty` on macOS, edit `/etc/resolv.conf`
-on Linux, adapter DNS settings / `netsh` on Windows). To manage DNS yourself
-from the start, run with `--no-set-dns`.
+journal or resets a leftover `127.0.0.1` to automatic/DHCP DNS), or restore
+DNS by hand (`networksetup -setdnsservers <service> empty` on macOS, edit
+`/etc/resolv.conf` on Linux, adapter DNS settings / `netsh` on Windows).
 
 ## Policy routing doesn't split anything
 
-- Routes are only installed for names resolved **through the proxy**. If
-  something else overwrote your resolver (DHCP renew, VPN software, manual
-  change), the policy never sees the queries. Check the system resolver points
-  at `dns_listen` (default `127.0.0.1:53`).
-- Automatic resolver setup only happens when `dns_listen` uses **port 53**.
-  On a custom port you must point the resolver at the proxy yourself.
+- Routes are only installed for names resolved **through TUN intercept** (IPv4
+  UDP/53). If host DNS never reaches the TUN (loopback stub with no hijacked
+  upstream, or a resolver the client did not attract), the policy never sees
+  the queries. Check that lookups go to a public resolver IP that has a `/32`
+  on the tun (for example `8.8.8.8`).
 - Long-lived connections opened *before* a route existed keep using their old
   path until they reconnect.
 - In `chinadns` mode, a domain the domestic resolver answers with an in-China
