@@ -175,6 +175,15 @@ fn admin_gid() -> libc::gid_t {
     }
 }
 
+/// True if `st_mode` (file-type bits included) is too open for a helper token.
+///
+/// Mask `0o027` = group-write + other rwx. Group-read (`0o040`) is allowed:
+/// the macOS daemon publishes `root:admin` `0640` so admin-group users can
+/// command it. `0o047` is the wrong mask here — that is group-*read*.
+fn token_mode_too_open(mode: u32) -> bool {
+    mode & 0o027 != 0
+}
+
 fn read_token(path: &Path) -> Option<String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -194,9 +203,9 @@ fn read_token(path: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // World-readable/writable or group-writable: leaked or hijackable.
+        // World-accessible or group-writable: leaked or hijackable.
         // Group-readable is intentional for the macOS daemon (root:admin 0640).
-        if meta.permissions().mode() & 0o047 != 0 {
+        if token_mode_too_open(meta.permissions().mode()) {
             return None;
         }
     }
@@ -664,6 +673,20 @@ fn respond(line: &str, args: &Args, slot: &ChildSlot) -> (Response, bool) {
     }
 }
 
+/// Drop a leftover port file so the GUI does not probe a port this process
+/// will never serve. A stale file can point at an unrelated local listener
+/// (macOS `rapportd` reused the last daemon port), and Connect would then
+/// wait the full helper I/O timeout for a protocol that never comes.
+fn discard_stale_port_file(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn abort_helper(port_file: &Path, msg: impl std::fmt::Display) -> ! {
+    eprintln!("shadowvpn-desktop-helper: {msg}");
+    discard_stale_port_file(port_file);
+    std::process::exit(2);
+}
+
 fn main() {
     #[cfg(target_os = "macos")]
     let daemon_mode = std::env::var_os("SHADOWVPN_HELPER_DAEMON").is_some_and(|v| v == "1");
@@ -676,6 +699,7 @@ fn main() {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("shadowvpn-desktop-helper (daemon): {e}");
+                discard_stale_port_file(Path::new(helper_ipc::DAEMON_PORT_FILE));
                 std::process::exit(2);
             }
         }
@@ -691,38 +715,31 @@ fn main() {
         }
     };
     // The GUI writes the token file before requesting elevation; refuse to
-    // serve without it rather than running open.
+    // serve without it rather than running open. (The macOS daemon also
+    // lands here if its own 0640 token is mistaken for "too open".)
     if read_token(&args.token_file).is_none() {
-        eprintln!(
-            "shadowvpn-desktop-helper: token file {} missing or empty",
-            args.token_file.display()
+        abort_helper(
+            &args.port_file,
+            format!("token file {} missing or empty", args.token_file.display()),
         );
-        std::process::exit(2);
     }
 
     let listener = match TcpListener::bind(("127.0.0.1", 0)) {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!("shadowvpn-desktop-helper: cannot bind 127.0.0.1: {e}");
-            std::process::exit(2);
-        }
+        Err(e) => abort_helper(&args.port_file, format!("cannot bind 127.0.0.1: {e}")),
     };
     let port = match listener.local_addr() {
         Ok(a) => a.port(),
-        Err(e) => {
-            eprintln!("shadowvpn-desktop-helper: cannot read bound port: {e}");
-            std::process::exit(2);
-        }
+        Err(e) => abort_helper(&args.port_file, format!("cannot read bound port: {e}")),
     };
     // O_NOFOLLOW like every other GUI-controlled path this root process
     // writes: a symlink planted at the port-file path must not let an
     // unprivileged user truncate an arbitrary root-owned file.
     if let Err(e) = write_nofollow(&args.port_file, format!("{port}\n").as_bytes()) {
-        eprintln!(
-            "shadowvpn-desktop-helper: cannot write port file {}: {e}",
-            args.port_file.display()
+        abort_helper(
+            &args.port_file,
+            format!("cannot write port file {}: {e}", args.port_file.display()),
         );
-        std::process::exit(2);
     }
 
     let slot: ChildSlot = Arc::new(Mutex::new(None));
@@ -839,6 +856,50 @@ mod write_path_tests {
         )
         .unwrap_err();
         assert!(err.contains("outside"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn token_mode_allows_0600_and_0640_including_file_type_bits() {
+        assert!(!token_mode_too_open(0o600));
+        assert!(!token_mode_too_open(0o640));
+        assert!(!token_mode_too_open(0o100600));
+        assert!(!token_mode_too_open(0o100640));
+    }
+
+    #[test]
+    fn token_mode_rejects_world_access_and_group_write() {
+        assert!(token_mode_too_open(0o644), "world-readable");
+        assert!(token_mode_too_open(0o100644), "S_IFREG|0644");
+        assert!(token_mode_too_open(0o660), "group-writable");
+        assert!(token_mode_too_open(0o666), "world + group writable");
+        assert!(token_mode_too_open(0o604), "world-readable, no group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_token_accepts_0600_and_daemon_0640() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = uniq_dir();
+        let path = root.join("helper.token");
+        fs::write(&path, "abc123\n").unwrap();
+        for mode in [0o600u32, 0o640] {
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(mode);
+            fs::set_permissions(&path, perms).unwrap();
+            assert_eq!(
+                read_token(&path).as_deref(),
+                Some("abc123"),
+                "mode {mode:#o}"
+            );
+        }
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+        assert!(
+            read_token(&path).is_none(),
+            "world-readable token must be rejected"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

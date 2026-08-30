@@ -95,6 +95,11 @@ impl Response {
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Generous enough to cover a graceful-stop wait inside the helper (10s).
 pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Liveness probes must fail fast: a stale port file can point at an
+/// unrelated local listener (macOS `rapportd` reused the daemon's last port),
+/// and waiting [`IO_TIMEOUT`] on that socket is what made Connect hang.
+pub const PING_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
+pub const PING_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One request/response round-trip on a fresh connection.
 pub fn call(port: u16, req: &Request) -> Result<Response, String> {
@@ -109,8 +114,19 @@ pub fn call_with_io_timeout(
     req: &Request,
     io_timeout: Duration,
 ) -> Result<Response, String> {
+    call_with_timeouts(port, req, CONNECT_TIMEOUT, io_timeout)
+}
+
+/// Round-trip with caller-chosen connect and I/O deadlines. Pings use the
+/// short [`PING_CONNECT_TIMEOUT`] / [`PING_TIMEOUT`] pair.
+pub fn call_with_timeouts(
+    port: u16,
+    req: &Request,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<Response, String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+    let stream = TcpStream::connect_timeout(&addr, connect_timeout)
         .map_err(|e| format!("cannot reach helper on 127.0.0.1:{port}: {e}"))?;
     let _ = stream.set_read_timeout(Some(io_timeout));
     let _ = stream.set_write_timeout(Some(io_timeout));
@@ -128,4 +144,40 @@ pub fn call_with_io_timeout(
         .read_line(&mut resp_line)
         .map_err(|e| format!("helper read failed: {e}"))?;
     serde_json::from_str(&resp_line).map_err(|e| format!("bad helper response: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Instant;
+
+    #[test]
+    fn ping_timeout_does_not_wait_full_io_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            // Accept and hold the connection without ever sending a line —
+            // the stale-port / rapportd case.
+            let Ok((_stream, _)) = listener.accept() else {
+                return;
+            };
+            thread::sleep(Duration::from_secs(60));
+        });
+        let req = Request {
+            token: "x".into(),
+            cmd: Cmd::Ping,
+        };
+        let start = Instant::now();
+        let err = match call_with_timeouts(port, &req, PING_CONNECT_TIMEOUT, PING_TIMEOUT) {
+            Err(e) => e,
+            Ok(_) => panic!("ping unexpectedly succeeded against a silent listener"),
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "ping hung for {elapsed:?}: {err}"
+        );
+    }
 }

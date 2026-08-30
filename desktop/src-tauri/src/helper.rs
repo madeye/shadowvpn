@@ -86,7 +86,23 @@ fn call_endpoint(app: &tauri::AppHandle, ep: Endpoint, cmd: Cmd) -> Result<Respo
 }
 
 fn ping_endpoint(app: &tauri::AppHandle, ep: Endpoint) -> Option<Response> {
-    call_endpoint(app, ep, Cmd::Ping).ok().filter(|r| r.ok)
+    // Short deadlines: a stale daemon port file can point at an unrelated
+    // listener, and the general 30s IO_TIMEOUT would freeze Connect / the
+    // reconnect watcher (which holds AppState.lock across this ping).
+    let (port_path, token_path) = endpoint_files(app, ep).ok()?;
+    let port = read_port_at(&port_path)?;
+    let token = read_token_at(&token_path)?;
+    helper_ipc::call_with_timeouts(
+        port,
+        &Request {
+            token,
+            cmd: Cmd::Ping,
+        },
+        helper_ipc::PING_CONNECT_TIMEOUT,
+        helper_ipc::PING_TIMEOUT,
+    )
+    .ok()
+    .filter(|r| r.ok)
 }
 
 /// First endpoint (daemon before session helper) that answers a ping with
